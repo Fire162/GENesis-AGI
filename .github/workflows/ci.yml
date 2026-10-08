@@ -1131,6 +1131,8 @@ jobs:
         # Unit-root guard adds 5 controls for the backend's neutral cwd exception.
         # Other edited files retain counts. Floor: 24500 + 84 = 24584;
         # no new skip sites.
-        # Guarded CBM removal: new uninstall file90 cases; other edited test
-        # files retain collection counts. Floor24584+90=24674; no added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24674
+        # Guarded CBM removal: new uninstall file90 cases.
+        # The exact inert-observation exception belongs with uninstall; two
+        # negative controls keep unrelated raw spawns fenced. No added skips.
+        # Floor24584+90+2=24676; reconcile again after parent integration.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24676
