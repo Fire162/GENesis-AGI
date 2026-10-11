@@ -3,21 +3,27 @@
 Every Camoufox launch passes this module's answer as ``executable_path``. Without
 it camoufox resolves the engine itself, and from 0.5 on that resolution deletes a
 pre-0.5 engine and downloads the pinned one (about 1.3 GB) inside the tool call
-(camoufox 0.5.7 ``pkgman.camoufox_path``). With an explicit path camoufox never
-reaches that code: fonts, properties and the version all resolve beside the
-binary (``utils.launch_options``).
+(camoufox 0.5.7 ``pkgman.camoufox_path``). With an explicit path camoufox 0.5.7+
+never reaches that code: fonts, properties and the version all resolve beside the
+binary (``utils.launch_options``). camoufox 0.4 still asks ``camoufox_path`` for
+its root engine on every launch, which empties the cache and downloads again when
+the root is outside the package's supported range, so the resolver applies that
+same range check to the root (``pkgman.Version.is_supported``).
 
 The selection is camoufox's own, read without side effects:
 - camoufox < 0.5: the root engine in the cache, the binary launched today;
 - camoufox >= 0.5.7: the installed engine the package pin names
   (``browser_pin.load_pin`` / ``matches``, ``multiversion.list_installed``);
-- ``CAMOUFOX_EXECUTABLE_PATH``, upstream's documented override, wins when set.
+- ``CAMOUFOX_EXECUTABLE_PATH``, upstream's documented override, wins when set on
+  camoufox >= 0.5.7, the first release that has it. Before that it is ignored, as
+  upstream ignores it: 0.4 reads the root engine whatever path it is given, and
+  0.5.3-0.5.6 have neither the override nor a browser pin, so they are refused.
 
 A user's ``camoufox set`` choice is deliberately not honoured, and nothing here
 calls camoufox's path functions, ``camoufox set`` or ``fetch``. camoufox is only
-imported inside ``_pinned_engine``: importing any camoufox module imports
-playwright, which genesis-server never loads; it asks through
-``python -m genesis.browser.engine --json`` instead.
+imported inside the resolver's functions, never at module level: importing any
+camoufox module imports playwright, which genesis-server never loads; it asks
+through ``python -m genesis.browser.engine --json`` instead.
 """
 
 from __future__ import annotations
@@ -47,6 +53,12 @@ LAUNCH_FILE = "camoufox-bin"
 COMPAT_FLAG = ".0.5_FLAG"
 PACKAGE_HINT = "install the Genesis `browser` extra"
 _TELL = "tell the user; operator step, with no browser open: "
+# Files camoufox reads beside an explicit executable_path on every launch, raising
+# when one is missing: properties.json (utils._load_properties) and, from 0.5.7 on
+# Linux, fontconfig/<os>/fonts.conf or the older fontconfigs/<os>/
+# (utils.get_env_vars). Genesis passes no os=, so camoufox may pick any of the three.
+_FONTCONFIG_OSES = ("linux", "macos", "windows")
+_READS_FONTCONFIG = sys.platform.startswith("linux")
 
 
 @dataclass(frozen=True)
@@ -110,12 +122,25 @@ def _q(path: object) -> str:
     return shlex.quote(str(path))
 
 
-def _operator_step() -> str:
+def _operator_step(*, legacy: bool = False, remove_first: bool = False) -> str:
     """What to tell the user. Run by an operator with no browser open, never from a
-    session: every session's MCP server shares the engine cache and the venv."""
+    session: every session's MCP server shares the engine cache and the venv.
+    ``legacy``: the installed camoufox is < 0.5, whose fetch empties the whole cache
+    before installing (pkgman ``cleanup()``). ``remove_first``: 0.4's fetch does
+    nothing when the root already holds the latest release (``is_updated_needed``),
+    and both its fetch and remove crash on an unreadable version.json (the updater
+    catches only FileNotFoundError). Without version.json, fetch reinstalls."""
     root = camoufox_install_dir()
     flag = ""
-    if (root / "version.json").exists() and not (root / COMPAT_FLAG).exists():
+    if legacy:
+        if (root / "browsers").exists():
+            flag = (
+                f"note that camoufox 0.4's fetch deletes everything in {_q(root)} first, "
+                "including the newer engines under browsers/; then "
+            )
+        if remove_first:
+            flag += f"`rm -f {_q(root / 'version.json')}`, then "
+    elif (root / "version.json").exists() and not (root / COMPAT_FLAG).exists():
         flag = (
             f"`touch {_q(root / COMPAT_FLAG)}` (without it camoufox 0.5's fetch deletes the "
             "pre-0.5 engine there), then "
@@ -139,10 +164,30 @@ def _repair_step(binary: Path, problem: str, kind: str) -> str:
         return f"{_TELL}`chmod -R 755 {_q(binary.parent)}`"
     if kind == "versioned":
         return f"{_TELL}remove `{_q(binary.parent)}`, then {_operator_step().removeprefix(_TELL)}"
-    return _operator_step()  # pre-0.5: its fetch replaces the root engine
+    return _operator_step(legacy=True, remove_first=True)  # pre-0.5: the root engine
 
 
-def _engine_problem(binary: Path, *, need_version_json: bool = True) -> str | None:
+def _properties_readable(raw: bytes) -> bool:
+    """Whether camoufox can load this properties.json: it parses it with orjson (a
+    camoufox dependency; stricter than json about a BOM or NaN) and indexes each
+    entry's ``property`` (utils._load_properties)."""
+    try:
+        import orjson
+
+        data = orjson.loads(raw)
+    except ImportError:
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return False
+    except ValueError:  # orjson.JSONDecodeError is a ValueError
+        return False
+    return isinstance(data, list) and all(isinstance(e, dict) and "property" in e for e in data)
+
+
+def _engine_problem(
+    binary: Path, *, need_version_json: bool = True, need_fontconfig: bool = True
+) -> str | None:
     """Why ``binary`` cannot be launched, or None. Stateless file checks only."""
     if not binary.is_file():
         return f"no {binary.name} at {binary.parent}"
@@ -158,12 +203,28 @@ def _engine_problem(binary: Path, *, need_version_json: bool = True) -> str | No
         return f"no application.ini beside {binary}"
     if not any(line.startswith("Version=") and line[8:].strip() for line in ini.splitlines()):
         return f"application.ini beside {binary} names no Version"
+    try:
+        raw = (binary.parent / "properties.json").read_bytes()
+    except FileNotFoundError:
+        return f"no properties.json beside {binary}"
+    except OSError:
+        return f"properties.json beside {binary} is unreadable"
+    if not _properties_readable(raw):
+        return f"properties.json beside {binary} is unreadable"
+    if need_fontconfig and _READS_FONTCONFIG:
+        for os_dir in _FONTCONFIG_OSES:
+            confs = (binary.parent / d / os_dir / "fonts.conf" for d in ("fontconfig", "fontconfigs"))
+            if not any(c.is_file() for c in confs):
+                return f"no fontconfig/{os_dir}/fonts.conf beside {binary}"
     return None
 
 
 def _check(binary: Path, label: str, kind: str) -> EngineStatus:
-    # Upstream does not require version.json beside an explicitly given binary.
-    problem = _engine_problem(binary, need_version_json=kind != "override")
+    # Upstream does not require version.json beside an explicitly given binary, and
+    # camoufox 0.4 never checks the fontconfig it points at.
+    problem = _engine_problem(
+        binary, need_version_json=kind != "override", need_fontconfig=kind != "legacy"
+    )
     if problem:
         return EngineStatus(
             INVALID, f"{label}: {problem}; {_repair_step(binary, problem, kind)}", binary
@@ -171,24 +232,66 @@ def _check(binary: Path, label: str, kind: str) -> EngineStatus:
     return EngineStatus(READY, label, binary)
 
 
-def _pinned_engine(version: str) -> EngineStatus:
-    files = _dist_files("camoufox")
-    if files is not None and "camoufox/browser_pin.py" not in files:
+def _broken_package(version: str, what: str, exc: Exception) -> EngineStatus:
+    logger.warning("camoufox %s %s", version, what, exc_info=True)
+    return EngineStatus(
+        INVALID,
+        f"camoufox {version} {what}: {exc!r}; tell the user; "
+        f"operator step: reinstall it ({PACKAGE_HINT})",
+    )
+
+
+def _legacy_engine(version: str) -> EngineStatus:
+    binary = camoufox_install_dir() / LAUNCH_FILE
+    if not binary.exists() and not (binary.parent / "version.json").exists():
+        return EngineStatus(
+            NOT_INSTALLED,
+            f"no Camoufox engine at {binary.parent}; {_operator_step(legacy=True)}",
+        )
+    label = f"Camoufox (camoufox {version})"
+    status = _check(binary, label, "legacy")
+    if not status.ready:
+        return status
+    try:
+        from camoufox.pkgman import Version
+    except Exception as exc:  # noqa: BLE001 - a broken package, not a broken cache
+        return _broken_package(version, "cannot be imported", exc)
+    try:
+        supported = Version.from_path(binary.parent).is_supported()
+    except Exception as exc:  # noqa: BLE001 - upstream reading the root; never raise
         return EngineStatus(
             INVALID,
-            f"camoufox {version} predates the browser pin (0.5.7); "
-            f"tell the user; operator step: install camoufox>=0.5.7,<0.6 or <0.5",
+            f"{label}: version.json beside {binary} is unreadable ({exc!r}); "
+            f"{_operator_step(legacy=True, remove_first=True)}",
+            binary,
         )
+    if not supported:
+        return EngineStatus(
+            INVALID,
+            f"{label}: the engine at {binary.parent} is outside the versions camoufox "
+            f"{version} supports, and launching it would delete the cache and download "
+            f"another; {_operator_step(legacy=True)}",
+            binary,
+        )
+    return status
+
+
+def _pinned_engine(version: str) -> EngineStatus:
     try:
         from camoufox import browser_pin, multiversion
-
+    except Exception as exc:  # noqa: BLE001 - a broken package, not a broken cache
+        return _broken_package(version, "cannot be imported", exc)
+    try:
         pin = browser_pin.load_pin()
-        if pin is None:
-            return EngineStatus(
-                INVALID,
-                f"camoufox {version} carries no browser pin; tell the user; "
-                "operator step: install camoufox>=0.5.7,<0.6",
-            )
+    except Exception as exc:  # noqa: BLE001 - the package's own pin file
+        return _broken_package(version, "has an unreadable browser pin", exc)
+    if pin is None:
+        return EngineStatus(
+            INVALID,
+            f"camoufox {version} carries no browser pin; tell the user; "
+            "operator step: install camoufox>=0.5.7,<0.6",
+        )
+    try:
         matching = [
             iv
             for iv in multiversion.list_installed()
@@ -233,20 +336,28 @@ def resolve_camoufox_engine() -> EngineStatus:
             f"playwright is not installed; tell the user; operator step: {PACKAGE_HINT}",
         )
 
-    override = os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "").strip()
-    if override:
-        return _check(Path(os.path.abspath(override)), "CAMOUFOX_EXECUTABLE_PATH", "override")
-
     match = re.match(r"(\d+)\.(\d+)", version)
     if not match:
         return EngineStatus(INVALID, f"cannot read the camoufox version {version!r}")
     if (int(match[1]), int(match[2])) < (0, 5):
-        binary = camoufox_install_dir() / LAUNCH_FILE
-        if not binary.exists() and not (binary.parent / "version.json").exists():
-            return EngineStatus(
-                NOT_INSTALLED, f"no Camoufox engine at {binary.parent}; {_operator_step()}"
-            )
-        return _check(binary, f"Camoufox (camoufox {version})", "legacy")
+        return _legacy_engine(version)
+    # 0.5.7 brought both the browser pin and CAMOUFOX_EXECUTABLE_PATH; 0.5.3-0.5.6
+    # have neither, so they are refused before the override is read.
+    files = _dist_files("camoufox")
+    if files is not None:
+        predates_pin = "camoufox/browser_pin.py" not in files
+    else:  # an installer that wrote no RECORD: the release number decides
+        patch = re.match(r"\d+\.\d+\.(\d+)", version)
+        predates_pin = (int(match[1]), int(match[2]), int(patch[1]) if patch else 0) < (0, 5, 7)
+    if predates_pin:
+        return EngineStatus(
+            INVALID,
+            f"camoufox {version} predates the browser pin (0.5.7); "
+            f"tell the user; operator step: install camoufox>=0.5.7,<0.6 or <0.5",
+        )
+    override = os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "").strip()
+    if override:
+        return _check(Path(os.path.abspath(override)), "CAMOUFOX_EXECUTABLE_PATH", "override")
     return _pinned_engine(version)
 
 

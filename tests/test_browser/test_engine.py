@@ -35,13 +35,53 @@ def cache(tmp_path, monkeypatch):
     return root
 
 
-def _versions(monkeypatch, *, camoufox="0.4.11", playwright="1.58.0", files=None):
+def _versions(
+    monkeypatch, *, camoufox="0.4.11", playwright="1.58.0", files=None, legacy_supported=True
+):
     found = {"camoufox": camoufox, "playwright": playwright}
     monkeypatch.setattr(engine, "_dist_version", lambda name: found.get(name))
     monkeypatch.setattr(engine, "_dist_files", lambda name: files)
+    if camoufox and camoufox.startswith("0.4"):
+        _fake_legacy_pkgman(monkeypatch, supported=legacy_supported)
 
 
-def _engine_dir(d: Path, *, version="135.0.1", version_json=True, ini=True, executable=True):
+def _fake_legacy_pkgman(monkeypatch, *, supported=True):
+    """camoufox 0.4's ``pkgman.Version``: ``from_path`` reads the root version.json,
+    ``is_supported`` is the package's own range check (pkgman.py:106-129)."""
+
+    class Version:
+        def __init__(self, data):
+            self.data = data
+
+        @staticmethod
+        def from_path(path=None):
+            return Version(json.loads((Path(path) / "version.json").read_text()))
+
+        def is_supported(self):
+            return supported
+
+    pkg = types.ModuleType("camoufox")
+    pkgman = types.ModuleType("camoufox.pkgman")
+    pkgman.Version = Version
+    pkg.pkgman = pkgman
+    monkeypatch.setitem(sys.modules, "camoufox", pkg)
+    monkeypatch.setitem(sys.modules, "camoufox.pkgman", pkgman)
+
+
+ALL_OS = ("linux", "macos", "windows")
+
+
+def _engine_dir(
+    d: Path,
+    *,
+    version="135.0.1",
+    version_json=True,
+    ini=True,
+    executable=True,
+    properties=True,
+    fontconfig=ALL_OS,
+    fontconfig_dir="fontconfig",
+):
     d.mkdir(parents=True, exist_ok=True)
     binary = d / "camoufox-bin"
     binary.write_bytes(b"\x7fELF")
@@ -50,6 +90,11 @@ def _engine_dir(d: Path, *, version="135.0.1", version_json=True, ini=True, exec
         (d / "version.json").write_text(json.dumps({"version": version, "release": "beta.24"}))
     if ini:
         (d / "application.ini").write_text(f"[App]\nName=Camoufox\nVersion={version}\n")
+    if properties:
+        (d / "properties.json").write_text("[]")
+    for os_dir in fontconfig:
+        (d / fontconfig_dir / os_dir).mkdir(parents=True, exist_ok=True)
+        (d / fontconfig_dir / os_dir / "fonts.conf").write_text("<fontconfig/>")
     return binary
 
 
@@ -85,7 +130,7 @@ class _InstalledVersion:
 PIN = _BrowserPin("v156.0.1-beta.34", "daijro/camoufox", "official", "156.0.1", "beta.34")
 
 
-def _fake_camoufox(monkeypatch, *, pin=PIN, installed=(), list_raises=None):
+def _fake_camoufox(monkeypatch, *, pin=PIN, installed=(), list_raises=None, pin_raises=None):
     def matches(p, repo_name, version, build):
         return (repo_name.lower(), version, build) == (p.repo_name, p.version, p.build)
 
@@ -96,7 +141,12 @@ def _fake_camoufox(monkeypatch, *, pin=PIN, installed=(), list_raises=None):
 
     pkg = types.ModuleType("camoufox")
     bp = types.ModuleType("camoufox.browser_pin")
-    bp.BrowserPin, bp.load_pin, bp.matches = _BrowserPin, (lambda path=None: pin), matches
+    def load_pin(path=None):
+        if pin_raises is not None:
+            raise pin_raises
+        return pin
+
+    bp.BrowserPin, bp.load_pin, bp.matches = _BrowserPin, load_pin, matches
     mv = types.ModuleType("camoufox.multiversion")
     mv.list_installed = list_installed
     pkg.browser_pin, pkg.multiversion = bp, mv
@@ -314,6 +364,23 @@ def test_import_failure_is_invalid_never_raises(cache, monkeypatch):
     assert status.kind == engine.INVALID
 
 
+@pytest.mark.parametrize("broken", ["unimportable", "missing_submodule"])
+def test_import_failure_names_the_package_not_the_cache(cache, monkeypatch, broken):
+    """A package that cannot be imported is repaired by reinstalling it; telling the
+    user to remove an unreadable engine sends them to the wrong place."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    if broken == "unimportable":
+        monkeypatch.setitem(sys.modules, "camoufox", None)
+    else:
+        monkeypatch.setitem(sys.modules, "camoufox", types.ModuleType("camoufox"))
+        monkeypatch.setitem(sys.modules, "camoufox.browser_pin", None)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert "cannot be imported" in status.detail
+    assert engine.PACKAGE_HINT in status.detail
+    assert "lookup failed" not in status.detail and "remove the unreadable" not in status.detail
+
+
 # ── CAMOUFOX_EXECUTABLE_PATH: upstream's own override, the only one honoured ──
 
 
@@ -326,12 +393,103 @@ def test_override_is_used(cache, monkeypatch, tmp_path):
 
 
 def test_invalid_override_never_falls_through(cache, monkeypatch, tmp_path):
-    _versions(monkeypatch, camoufox="0.4.11")
-    _engine_dir(cache)  # a perfectly good default engine
+    _versions(monkeypatch, camoufox="0.5.7")
+    _fake_camoufox(monkeypatch, installed=[_installed(cache)])  # a perfectly good pinned engine
     monkeypatch.setenv("CAMOUFOX_EXECUTABLE_PATH", str(tmp_path / "nope" / "camoufox-bin"))
     status = engine.resolve_camoufox_engine()
     assert status.kind == engine.INVALID
     assert "CAMOUFOX_EXECUTABLE_PATH" in status.detail
+
+
+def test_override_is_ignored_below_0_5(cache, monkeypatch, tmp_path):
+    """camoufox 0.4 has no CAMOUFOX_EXECUTABLE_PATH, and its launch_options reads the
+    root version.json whatever executable_path is (installed_verstr ->
+    Version.from_path(), pkgman.py:409, utils.py:501), so the root engine is the one
+    to check and launch."""
+    _versions(monkeypatch, camoufox="0.4.11")
+    root_binary = _engine_dir(cache)
+    monkeypatch.setenv("CAMOUFOX_EXECUTABLE_PATH", str(_engine_dir(tmp_path / "custom")))
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.READY and status.path == root_binary
+
+
+def test_override_does_not_stand_in_for_a_missing_root_below_0_5(cache, monkeypatch, tmp_path):
+    _versions(monkeypatch, camoufox="0.4.11")
+    monkeypatch.setenv("CAMOUFOX_EXECUTABLE_PATH", str(_engine_dir(tmp_path / "custom")))
+    assert engine.resolve_camoufox_engine().kind == engine.NOT_INSTALLED
+
+
+# ── files a launch reads beside the binary ────────────────────────────────────
+# camoufox opens properties.json beside an explicit executable_path on every launch
+# (utils._load_properties), and from 0.5 on Linux reads fontconfig/<os>/fonts.conf
+# (or the older fontconfigs/<os>/) beside it, raising when absent (utils.py:313-327).
+# Genesis passes no os=, so <os> is any of linux, macos, windows.
+
+
+@pytest.fixture
+def linux(monkeypatch):
+    monkeypatch.setattr(engine, "_READS_FONTCONFIG", True)
+
+
+def _kind_engine(kind, cache, monkeypatch, tmp_path, **kw):
+    """An engine of ``kind`` built with ``kw``, and the binary the resolver checks."""
+    if kind == "legacy":
+        _versions(monkeypatch, camoufox="0.4.11")
+        return _engine_dir(cache, **kw)
+    _versions(monkeypatch, camoufox="0.5.7")
+    if kind == "versioned":
+        iv = _installed(cache, **kw)
+        _fake_camoufox(monkeypatch, installed=[iv])
+        return iv.path / "camoufox-bin"
+    binary = _engine_dir(tmp_path / "custom", **kw)
+    monkeypatch.setenv("CAMOUFOX_EXECUTABLE_PATH", str(binary))
+    return binary
+
+
+@pytest.mark.parametrize("kind", ["legacy", "versioned", "override"])
+def test_engine_without_properties_json_is_invalid(kind, cache, monkeypatch, tmp_path, linux):
+    _kind_engine(kind, cache, monkeypatch, tmp_path, properties=False)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and "properties.json" in status.detail
+
+
+@pytest.mark.parametrize("kind", ["versioned", "override"])
+@pytest.mark.parametrize("missing", ALL_OS)
+def test_0_5_engine_missing_one_os_fontconfig_is_invalid(
+    kind, missing, cache, monkeypatch, tmp_path, linux
+):
+    have = tuple(o for o in ALL_OS if o != missing)
+    _kind_engine(kind, cache, monkeypatch, tmp_path, fontconfig=have)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert f"{missing}/fonts.conf" in status.detail
+
+
+def test_older_fontconfigs_spelling_is_accepted(cache, monkeypatch, tmp_path, linux):
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path, fontconfig_dir="fontconfigs")
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.READY and status.path == binary
+
+
+def test_legacy_engine_needs_no_fontconfig(cache, monkeypatch, tmp_path, linux):
+    """0.4 sets FONTCONFIG_PATH without checking it exists (utils.py:71)."""
+    binary = _kind_engine("legacy", cache, monkeypatch, tmp_path, fontconfig=())
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.READY and status.path == binary
+
+
+def test_fontconfig_is_not_required_off_linux(cache, monkeypatch, tmp_path):
+    monkeypatch.setattr(engine, "_READS_FONTCONFIG", False)
+    _kind_engine("versioned", cache, monkeypatch, tmp_path, fontconfig=())
+    assert engine.resolve_camoufox_engine().kind == engine.READY
+
+
+def test_corrupt_pinned_engine_missing_assets_is_removed_then_fetched(
+    cache, monkeypatch, tmp_path, linux
+):
+    _kind_engine("versioned", cache, monkeypatch, tmp_path, properties=False)
+    detail = engine.resolve_camoufox_engine().detail
+    assert "remove `" in detail and detail.index("remove") < detail.index("camoufox fetch")
 
 
 def test_blank_override_is_unset(cache, monkeypatch):
@@ -347,6 +505,97 @@ def test_override_does_not_mask_missing_playwright(cache, monkeypatch, tmp_path)
     binary = _engine_dir(tmp_path / "custom")
     monkeypatch.setenv("CAMOUFOX_EXECUTABLE_PATH", str(binary))
     assert engine.resolve_camoufox_engine().kind == engine.PLAYWRIGHT_MISSING
+
+
+@pytest.mark.parametrize("ver", ["0.5.3", "0.5.6"])
+def test_override_is_not_honoured_before_0_5_7(cache, monkeypatch, tmp_path, ver):
+    """CAMOUFOX_EXECUTABLE_PATH first appears in 0.5.7, the release that also ships
+    browser_pin.py (MEASURED: 0 references in the 0.5.3-0.5.6 wheels)."""
+    _versions(monkeypatch, camoufox=ver, files=["camoufox/__init__.py", "camoufox/utils.py"])
+    monkeypatch.setenv("CAMOUFOX_EXECUTABLE_PATH", str(_engine_dir(tmp_path / "custom")))
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and "0.5.7" in status.detail
+
+
+@pytest.mark.parametrize("ver,refused", [("0.5.6", True), ("0.5.7", False), ("0.5.8b1", False)])
+def test_without_a_file_list_the_version_decides_the_pin_cut(cache, monkeypatch, tmp_path, ver, refused):
+    """Some installers write no RECORD, so the file check cannot run."""
+    _versions(monkeypatch, camoufox=ver, files=None)
+    monkeypatch.setenv("CAMOUFOX_EXECUTABLE_PATH", str(_engine_dir(tmp_path / "custom")))
+    status = engine.resolve_camoufox_engine()
+    assert (status.kind == engine.INVALID and "0.5.7" in status.detail) is refused
+
+
+# ── camoufox 0.4 still resolves its root engine itself on every launch ────────
+# Even with an explicit path, 0.4's launch calls get_path() for fonts and add-ons,
+# which goes through camoufox_path(): a root engine outside the package's supported
+# range is deleted with the whole cache and downloaded again (pkgman.py:412-432).
+
+
+def test_legacy_root_outside_the_supported_range_is_invalid(cache, monkeypatch):
+    _versions(monkeypatch, camoufox="0.4.11", legacy_supported=False)
+    _engine_dir(cache)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert "supports" in status.detail and "camoufox fetch" in status.detail
+
+
+def test_legacy_root_with_unreadable_version_json_is_invalid(cache, monkeypatch):
+    _versions(monkeypatch, camoufox="0.4.11")
+    _engine_dir(cache)
+    (cache / "version.json").write_text("{not json")
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and "version.json" in status.detail
+    assert status.detail.index("rm -f") < status.detail.index("camoufox fetch")
+
+
+def test_legacy_camoufox_that_cannot_be_imported_names_the_package(cache, monkeypatch):
+    _versions(monkeypatch, camoufox="0.4.11")
+    _engine_dir(cache)
+    monkeypatch.setitem(sys.modules, "camoufox.pkgman", None)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert "cannot be imported" in status.detail and engine.PACKAGE_HINT in status.detail
+
+
+def test_legacy_file_problem_drops_the_version_record_before_fetch(cache, monkeypatch, linux):
+    """0.4's fetch is a no-op when the root already holds the latest release
+    (CamoufoxUpdate.is_updated_needed, __main__.py:41-56), and both its remove and
+    fetch crash on an unreadable version.json (the constructor catches only
+    FileNotFoundError). Without version.json, fetch reinstalls."""
+    _versions(monkeypatch, camoufox="0.4.11")
+    _engine_dir(cache, properties=False)
+    detail = engine.resolve_camoufox_engine().detail
+    assert f"rm -f {cache / 'version.json'}" in detail
+    assert detail.index("rm -f") < detail.index("camoufox fetch")
+    assert "camoufox remove" not in detail
+
+
+def test_legacy_missing_engine_is_fetched_without_dropping_anything(cache, monkeypatch):
+    _versions(monkeypatch, camoufox="0.4.11")
+    assert "rm -f" not in engine.resolve_camoufox_engine().detail
+
+
+@pytest.mark.parametrize(
+    "content", ["", "[{", "\x00garbage", '{"a": 1}', "[1]", '[{"type": "str"}]']
+)
+def test_unreadable_properties_json_is_invalid(cache, monkeypatch, tmp_path, linux, content):
+    """camoufox json-loads it on every launch (utils._load_properties)."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    (binary.parent / "properties.json").write_text(content)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and "properties.json" in status.detail
+
+
+@pytest.mark.parametrize("exc", [KeyError("repo"), TypeError("x")])
+def test_unreadable_package_pin_names_the_package(cache, monkeypatch, exc):
+    """load_pin catches only a missing or non-JSON file (browser_pin.py:44-58); a pin
+    missing a key raises, and that is the package's fault, not the cache's."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    _fake_camoufox(monkeypatch, pin_raises=exc)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert engine.PACKAGE_HINT in status.detail and "remove the unreadable" not in status.detail
 
 
 # ── the operator hint ─────────────────────────────────────────────────────────
@@ -369,6 +618,30 @@ def test_hint_has_no_flag_step_when_flag_present(cache, monkeypatch):
     (cache / ".0.5_FLAG").touch()
     _fake_camoufox(monkeypatch, installed=[])
     assert ".0.5_FLAG" not in engine.resolve_camoufox_engine().detail
+
+
+def test_legacy_hint_warns_that_0_4_fetch_replaces_the_whole_cache(cache, monkeypatch):
+    """camoufox 0.4's fetch runs cleanup() = shutil.rmtree(INSTALL_DIR) before it
+    installs (pkgman.py:296-322), taking any 0.5 engines under browsers/ with it."""
+    _versions(monkeypatch, camoufox="0.4.11")
+    (cache / "browsers" / "official").mkdir(parents=True)
+    detail = engine.resolve_camoufox_engine().detail
+    assert "browsers" in detail and "deletes" in detail
+    assert detail.index("deletes") < detail.index("camoufox fetch")
+
+
+def test_legacy_hint_has_no_cache_warning_without_browsers(cache, monkeypatch):
+    _versions(monkeypatch, camoufox="0.4.11")
+    assert "deletes" not in engine.resolve_camoufox_engine().detail
+
+
+def test_legacy_repair_step_has_no_0_5_flag_step(cache, monkeypatch, linux):
+    """The flag guards 0.5's fetch; 0.4's fetch deletes the whole cache anyway."""
+    _versions(monkeypatch, camoufox="0.4.11")
+    _engine_dir(cache, properties=False)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and "camoufox fetch" in status.detail
+    assert ".0.5_FLAG" not in status.detail
 
 
 def test_hint_keeps_the_download_off_cc_tmp(cache, monkeypatch):

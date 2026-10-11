@@ -304,6 +304,23 @@ class TestExplicitEngine:
         assert result["error"].startswith("Camoufox is not ready: not installed")
 
     @pytest.mark.asyncio
+    async def test_not_ready_after_a_package_change_says_restart_first(self):
+        """An upgrade under a running session can make the resolver's own camoufox
+        import fail; restarting the session is then the first step, as for any
+        other import failure (packages.import_error_message)."""
+        from genesis.browser import engine, packages
+
+        changed = "Browser packages changed after this session started (camoufox 0.4.11 -> 0.5.8)."
+        with (
+            patch.object(browser, "_get_page",
+                         new=AsyncMock(side_effect=engine.CamoufoxNotReady("cannot be imported"))),
+            patch.object(packages, "packages_changed_message", return_value=changed),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"].startswith(changed)
+        assert "Camoufox is not ready: cannot be imported" in result["error"]
+
+    @pytest.mark.asyncio
     async def test_navigate_reports_changed_packages(self):
         from genesis.browser import packages
 
@@ -3804,10 +3821,19 @@ def _tinyfish_delete():
 
 
 # Stub modules, not patch("camoufox.async_api..."): CI installs neither package,
-# and patching by dotted path imports the real one first (see _connect).
+# and patching by dotted path imports the real one first (see _connect). The
+# resolver is stubbed too: on a box without an engine it refuses the launch.
+@contextlib.contextmanager
 def _stub_camoufox(cm):
+    from genesis.browser import engine
+
     api = MagicMock(AsyncCamoufox=MagicMock(return_value=cm))
-    return patch.dict(sys.modules, {"camoufox": MagicMock(async_api=api), "camoufox.async_api": api})
+    ready = engine.EngineStatus(engine.READY, "Camoufox", Path("/engines/camoufox-bin"))
+    with (
+        patch.dict(sys.modules, {"camoufox": MagicMock(async_api=api), "camoufox.async_api": api}),
+        patch.object(engine, "resolve_camoufox_engine", return_value=ready),
+    ):
+        yield
 
 
 def _stub_playwright(starter):

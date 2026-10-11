@@ -3134,7 +3134,11 @@ async def _impl_browser_navigate(
     except ConnectionError as e:
         return {"error": str(e)}
     except engine.CamoufoxNotReady as e:
-        return {"error": f"Camoufox is not ready: {e}"}
+        # A package changed under this session can be why the resolver's own
+        # camoufox import failed; restarting comes first, as for any import error.
+        changed = packages.packages_changed_message()
+        lead = f"{changed} " if changed else ""
+        return {"error": f"{lead}Camoufox is not ready: {e}"}
     except packages.BrowserPackagesChanged as e:
         return {"error": str(e)}
     except ImportError as e:
