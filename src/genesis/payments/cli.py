@@ -131,9 +131,10 @@ def _cmd_retire(args: argparse.Namespace) -> int:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     status = vs.vault_status()
+    healthy = not status["error"] and all(i["private"] for i in status["files"].values())
     if args.json:
         print(json.dumps(status, indent=2))
-        return 0
+        return 0 if healthy else 1
     print(
         f"vault: {status['path']} ({'initialised' if status['initialised'] else 'not initialised'})"
     )
@@ -143,7 +144,6 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"cards: {status['cards']['active']} active, {status['cards']['retired']} retired")
     for name, info in status["files"].items():
         print(f"  {name}: {info['mode']}{'' if info['private'] else '  NOT PRIVATE'}")
-    healthy = not status["error"] and all(i["private"] for i in status["files"].values())
     return 0 if healthy else 1
 
 
