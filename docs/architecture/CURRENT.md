@@ -1472,7 +1472,12 @@ verified: 637f7f7bb679 2026-10-05
   `executable_path` (camoufox's own read-only selection; never its in-launch
   delete-and-download), also asked by the `browser_automation` capability in a
   subprocess; `packages.py` refuses a launch on browser modules pip replaced
-  under the process. The automation TOOLS live in
+  under the process. `provision.py` (run by `scripts/install_browser_stack.sh`,
+  unit `genesis-browser-stack.service`) installs what the tools launch: the
+  engine the camoufox package pairs with (only from camoufox 0.5.7: 0.4's fetch
+  empties the cache and 0.5.3-0.5.6 have no pin), patchright's
+  Chromium, and their system libraries (`install-deps` through `sudo -n`, else
+  the command is printed). One outcome line; a re-run is a no-op. The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
   TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
   1 h idle reclaim of one layer never touches another (TinyFish included:

@@ -1,0 +1,23 @@
+[Unit]
+Description=Genesis browser stack — install the Camoufox engine, patchright's Chromium and their system libraries
+# No [Install] section: an operator starts this unit (and, once installs enable it,
+# its timer), never login. A run that has nothing to do exits in seconds.
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/install_browser_stack.sh
+# No hang has been observed; this is the project's floor for an unattended step
+# (genesis-development, Timeout Policy). The engine download is about 1.3 GB and
+# a slow link legitimately takes tens of minutes.
+TimeoutStartSec=7200
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+# Writes only under $HOME: the engine cache, Playwright's browser cache, the
+# download temp files (~/tmp, set by the module for its child processes only) and
+# the runner lock. NoNewPrivileges makes `sudo -n` fail, so a missing system
+# library is reported with the command to run instead of being installed here.
+ProtectSystem=strict
+ReadWritePaths=%h
+NoNewPrivileges=true
