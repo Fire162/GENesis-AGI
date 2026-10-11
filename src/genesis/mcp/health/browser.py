@@ -33,6 +33,7 @@ from pathlib import Path
 
 from fastmcp import Context
 
+from genesis.browser import engine, packages
 from genesis.browser.types import BrowserLayer
 from genesis.mcp.health import mcp
 
@@ -377,7 +378,8 @@ async def async_cleanup():
     individually guarded so a crashed Camoufox won't hang cleanup.
     Each cleanup step has a 10s timeout (user-approved) to prevent hanging
     if the Playwright Node.js driver or browser process is stuck. Orphaned
-    processes that survive timeout are caught by the process reaper (hourly at :15).
+    processes that survive timeout are only observed by the process reaper
+    (hourly at :15), which reports them and does not kill them.
     """
     global _active_page, _idle_task
 
@@ -411,7 +413,9 @@ async def async_cleanup():
 async def _ensure_browser():
     """Lazily initialize Camoufox (primary browser) with persistent profile.
 
-    Returns the active page. Raises ImportError if camoufox is not installed.
+    Returns the active page. Raises engine.CamoufoxNotReady when there is no
+    launchable engine, and packages.BrowserPackagesChanged when the browser
+    packages changed under this process.
     In collaborate mode, launches headed on virtual display :99 for VNC sharing.
     Uses anti-detection Firefox by default for all browsing.
 
@@ -427,6 +431,15 @@ async def _ensure_browser():
             logger.warning("Camoufox page is stale — restarting Camoufox")
             await _cleanup_camoufox()
 
+        packages.check_loaded_browser_modules()
+        # Launch an explicit engine: without one camoufox resolves it itself, and
+        # from 0.5 on that deletes a pre-0.5 engine and downloads the pinned one
+        # inside this call. With it, camoufox still may fetch an add-on or its
+        # fingerprint model and write its config, but never touches an engine.
+        status = engine.resolve_camoufox_engine()
+        if not status.ready:
+            raise engine.CamoufoxNotReady(status.detail)
+
         from camoufox.async_api import AsyncCamoufox
 
         _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -435,6 +448,7 @@ async def _ensure_browser():
         os.environ["DISPLAY"] = _VNC_DISPLAY
 
         cm = AsyncCamoufox(
+            executable_path=str(status.path),
             headless=False,
             persistent_context=True,
             user_data_dir=str(_PROFILE_DIR),
@@ -483,6 +497,7 @@ async def _ensure_chromium_fallback():
             logger.warning("Chromium page is stale — restarting Chromium")
             await _cleanup_chromium()
 
+        packages.check_loaded_browser_modules(packages.PLAYWRIGHT_ONLY)
         from playwright.async_api import async_playwright
 
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -657,6 +672,7 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
                 "--user-data-dir=%USERPROFILE%\\chrome-genesis"
             )
 
+        packages.check_loaded_browser_modules(packages.PLAYWRIGHT_ONLY)
         from playwright.async_api import async_playwright
 
         # The attempt is built in locals and published to the globals only once
@@ -910,6 +926,8 @@ async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
             logger.warning("TinyFish session stale — cleaning up")
             await _cleanup_tinyfish()
 
+        # Before the session: it is billed from the moment it is created.
+        packages.check_loaded_browser_modules(packages.PLAYWRIGHT_ONLY)
         from playwright.async_api import async_playwright
 
         from genesis.providers.tinyfish_client import browser_session_create
@@ -3087,8 +3105,12 @@ async def _impl_browser_navigate(
         )
     except ConnectionError as e:
         return {"error": str(e)}
+    except engine.CamoufoxNotReady as e:
+        return {"error": f"Camoufox is not ready: {e}"}
+    except packages.BrowserPackagesChanged as e:
+        return {"error": str(e)}
     except ImportError as e:
-        return {"error": f"Browser not available: {e}. Install with: pip install playwright"}
+        return {"error": packages.import_error_message(e)}
 
     try:
         # Skip goto only when TinyFish session was JUST created with this URL

@@ -51,8 +51,14 @@ def _clear_all_browser_state():
 
 
 @pytest.fixture(autouse=True)
-def _reset_browser_state():
+def _reset_browser_state(monkeypatch):
     """Reset module-level browser state before and after each test."""
+    from genesis.browser import packages
+
+    # The stale-module guard records which browser modules were loaded; a test
+    # that stubs one in sys.modules must not leave its record behind.
+    monkeypatch.setattr(packages, "_loaded", dict(packages._loaded))
+    monkeypatch.setattr(packages, "_last_seen", dict(packages._last_seen))
     _clear_all_browser_state()
     yield
     _clear_all_browser_state()
@@ -113,11 +119,217 @@ class TestEnsureBrowserRecovery:
         mock_cm.__aenter__ = AsyncMock(return_value=mock_browser)
         mock_cm.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("camoufox.async_api.AsyncCamoufox", return_value=mock_cm):
+        from genesis.browser import engine
+
+        ready = engine.EngineStatus(engine.READY, "Camoufox", Path("/engines/camoufox-bin"))
+        with (
+            patch.object(engine, "resolve_camoufox_engine", return_value=ready),
+            patch("camoufox.async_api.AsyncCamoufox", return_value=mock_cm),
+        ):
             result = await browser._ensure_browser()
 
         assert result is new_page
         assert browser._stealth_page is new_page
+
+
+class TestExplicitEngine:
+    """Every Camoufox launch passes the resolved engine as executable_path, and a
+    launch with no launchable engine is refused before anything starts. Without an
+    explicit path camoufox 0.5 resolves the engine itself, deleting a pre-0.5 engine
+    and downloading the pinned one inside the tool call."""
+
+    @staticmethod
+    def _camoufox_stub(ctor):
+        return {"camoufox": MagicMock(), "camoufox.async_api": MagicMock(AsyncCamoufox=ctor)}
+
+    @pytest.mark.asyncio
+    async def test_launch_passes_the_resolved_executable_path(self, tmp_path, monkeypatch):
+        from genesis.browser import engine
+
+        monkeypatch.setattr(browser, "_PROFILE_DIR", tmp_path / "profile")
+        monkeypatch.setenv("DISPLAY", ":0")
+        page = MagicMock()
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=MagicMock(pages=[page]))
+        ctor = MagicMock(return_value=cm)
+        binary = tmp_path / "engines" / "camoufox-bin"
+        ready = engine.EngineStatus(engine.READY, "Camoufox", binary)
+        with (
+            patch.object(engine, "resolve_camoufox_engine", return_value=ready),
+            patch.dict("sys.modules", self._camoufox_stub(ctor)),
+        ):
+            assert await browser._ensure_browser() is page
+        assert ctor.call_args.kwargs["executable_path"] == str(binary)
+
+    @pytest.mark.asyncio
+    async def test_no_engine_refuses_before_anything_starts(self, tmp_path, monkeypatch):
+        from genesis.browser import engine
+
+        profile = tmp_path / "profile"
+        monkeypatch.setattr(browser, "_PROFILE_DIR", profile)
+        monkeypatch.setenv("DISPLAY", ":0")
+        ctor = MagicMock()
+        missing = engine.EngineStatus(engine.NOT_INSTALLED, "Camoufox official 156.0.1-beta.34 is not installed")
+        with (
+            patch.object(engine, "resolve_camoufox_engine", return_value=missing),
+            patch.dict("sys.modules", self._camoufox_stub(ctor)),
+            pytest.raises(engine.CamoufoxNotReady, match="156.0.1-beta.34"),
+        ):
+            await browser._ensure_browser()
+        ctor.assert_not_called()
+        assert not profile.exists()
+        assert os.environ["DISPLAY"] == ":0"
+        assert browser._stealth_cm is None
+
+    @pytest.mark.asyncio
+    async def test_stale_modules_refuse_before_resolving(self, monkeypatch):
+        from genesis.browser import engine, packages
+
+        resolve = MagicMock()
+        ctor = MagicMock()
+        with (
+            patch.object(packages, "check_loaded_browser_modules",
+                         side_effect=packages.BrowserPackagesChanged("Restart this Claude Code session")),
+            patch.object(engine, "resolve_camoufox_engine", resolve),
+            patch.dict("sys.modules", self._camoufox_stub(ctor)),
+            pytest.raises(packages.BrowserPackagesChanged),
+        ):
+            await browser._ensure_browser()
+        resolve.assert_not_called()
+        ctor.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_alive_page_skips_the_checks(self):
+        from genesis.browser import engine, packages
+
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.url = "https://example.com"
+        browser._stealth_page = page
+        with (
+            patch.object(packages, "check_loaded_browser_modules", side_effect=AssertionError),
+            patch.object(engine, "resolve_camoufox_engine", side_effect=AssertionError),
+        ):
+            assert await browser._ensure_browser() is page
+
+    @pytest.mark.asyncio
+    async def test_chromium_refused_on_stale_modules(self):
+        from genesis.browser import packages
+
+        start = MagicMock()
+        stub = {"playwright": MagicMock(), "playwright.async_api": MagicMock(async_playwright=start)}
+        with (
+            patch.object(packages, "check_loaded_browser_modules",
+                         side_effect=packages.BrowserPackagesChanged("Restart")),
+            patch.dict("sys.modules", stub),
+            pytest.raises(packages.BrowserPackagesChanged),
+        ):
+            await browser._ensure_chromium_fallback()
+        start.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_remote_cdp_refused_on_stale_modules(self):
+        from genesis.browser import packages
+
+        start = MagicMock()
+        stub = {"playwright": MagicMock(), "playwright.async_api": MagicMock(async_playwright=start)}
+        with (
+            patch.object(packages, "check_loaded_browser_modules",
+                         side_effect=packages.BrowserPackagesChanged("Restart")),
+            patch.dict("sys.modules", stub),
+            pytest.raises(packages.BrowserPackagesChanged),
+        ):
+            await browser._ensure_remote_cdp("http://127.0.0.1:9222")
+        start.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tinyfish_refused_before_a_paid_session_opens(self):
+        from genesis.browser import packages
+
+        create = AsyncMock()
+        stub = {
+            "playwright": MagicMock(),
+            "playwright.async_api": MagicMock(async_playwright=MagicMock()),
+            "genesis.providers.tinyfish_client": MagicMock(browser_session_create=create),
+        }
+        with (
+            patch.object(packages, "check_loaded_browser_modules",
+                         side_effect=packages.BrowserPackagesChanged("Restart")),
+            patch.dict("sys.modules", stub),
+            pytest.raises(packages.BrowserPackagesChanged),
+        ):
+            await browser._ensure_tinyfish_browser("https://example.com")
+        create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "launch",
+        [
+            lambda: browser._ensure_chromium_fallback(),
+            lambda: browser._ensure_remote_cdp("http://127.0.0.1:9222"),
+            lambda: browser._ensure_tinyfish_browser("https://example.com"),
+        ],
+        ids=["chromium", "remote_cdp", "tinyfish"],
+    )
+    @pytest.mark.asyncio
+    async def test_playwright_layers_check_only_playwright(self, launch):
+        """A camoufox-only upgrade must not refuse a layer that never imports it."""
+        from genesis.browser import packages
+
+        stub = {
+            "playwright": MagicMock(),
+            "playwright.async_api": MagicMock(async_playwright=MagicMock()),
+            "genesis.providers.tinyfish_client": MagicMock(browser_session_create=AsyncMock()),
+        }
+        with (
+            patch.object(packages, "check_loaded_browser_modules",
+                         side_effect=packages.BrowserPackagesChanged("Restart")) as check,
+            patch.dict("sys.modules", stub),
+            pytest.raises(packages.BrowserPackagesChanged),
+        ):
+            await launch()
+        assert check.call_args.args == (packages.PLAYWRIGHT_ONLY,)
+
+    @pytest.mark.asyncio
+    async def test_navigate_reports_a_missing_engine(self):
+        from genesis.browser import engine
+
+        with (
+            patch.object(browser, "_get_page",
+                         new=AsyncMock(side_effect=engine.CamoufoxNotReady("not installed; tell the user"))),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"].startswith("Camoufox is not ready: not installed")
+
+    @pytest.mark.asyncio
+    async def test_navigate_reports_changed_packages(self):
+        from genesis.browser import packages
+
+        with patch.object(browser, "_get_page", new=AsyncMock(
+            side_effect=packages.BrowserPackagesChanged("Restart this Claude Code session"))):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"] == "Restart this Claude Code session"
+
+    @pytest.mark.asyncio
+    async def test_navigate_import_error_without_a_change_says_tell_the_user(self):
+        from genesis.browser import packages
+
+        with (
+            patch.object(packages, "installed_versions", return_value=dict(packages.STARTUP_VERSIONS)),
+            patch.object(browser, "_get_page", new=AsyncMock(side_effect=ImportError("No module named 'camoufox'"))),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"].startswith("Browser not available")
+        assert "tell the user" in result["error"]
+        assert "pip install playwright" not in result["error"]
+
+    def test_guard_baseline_is_taken_when_browser_loads(self):
+        """browser.py imports the guard at module level, so its baseline predates
+        anything that imports playwright later (scrapling, on the first web call)."""
+        import ast
+
+        tree = ast.parse(Path(browser.__file__).read_text())
+        top = [n for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == "genesis.browser"]
+        assert any("packages" in {a.name for a in n.names} for n in top)
 
     @pytest.mark.asyncio
     async def test_cleanup_safe_on_dead_browser(self):
@@ -2822,7 +3034,14 @@ class TestStaleRemoteCleanupCannotTouchTheNextConnection:
         old_pw.chromium.connect_over_cdp = AsyncMock(return_value=old_br)
 
         task = asyncio.create_task(_connect(old_br, mock_pw=old_pw))
-        await asyncio.sleep(0.02)
+
+        async def stuck_in_the_id_lookup():
+            # A fixed delay raced the work ahead of the lookup (the launch
+            # guards read package metadata), so wait for the lookup itself.
+            while not old_tab.context.new_cdp_session.await_count:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(stuck_in_the_id_lookup(), 1)
         task.cancel()  # first cancel: the tab open aborts, shielded cleanup starts
         await asyncio.wait_for(closing.wait(), 1)
         task.cancel()  # second cancel: the caller gives up while cleanup runs

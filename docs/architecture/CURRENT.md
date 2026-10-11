@@ -1464,10 +1464,15 @@ verified: 637f7f7bb679 2026-10-05
   All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
-- **browser/**: profile/state layer only (persistent
+- **browser/**: profile/state layer (persistent
   `~/.genesis/browser-profile`, `BrowserLayer` enum (the navigate result's
   `layer` values, numbered as in `mcp/health/browser.py`), pgrep patterns as
-  the single source of process detection). The automation TOOLS live in
+  the single source of process detection), plus two launch guards:
+  `engine.py` resolves the Camoufox binary every launch passes as
+  `executable_path` (camoufox's own read-only selection; never its in-launch
+  delete-and-download), also asked by the `browser_automation` capability in a
+  subprocess; `packages.py` refuses a launch on browser modules pip replaced
+  under the process. The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
   TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
   1 h idle reclaim of one layer never touches another (TinyFish included:

@@ -184,14 +184,14 @@ profile's cookie store (`~/.genesis/browser-profile`), never Camoufox's.
 `browser_clear_domain` matches by substring (`x.com` also clears
 `netflix.com`) and reports only whether anything was removed.
 
-**Not installed?** If `browser_navigate` returns `Browser not available`, or
-an error saying Camoufox is not installed or telling you to run
-`camoufox fetch`, the browser packages or the Camoufox engine are missing on
-this install: tell the user. The missing-engine case arrives as a raw tool
-error, not a `Browser not available` result, and its text asks for
-`camoufox fetch`; do not follow it. Never run `camoufox fetch` or
-`pip install` from inside a session; every session's MCP server shares the
-engine and the venv.
+**Not installed?** If `browser_navigate` returns `Browser not available` or
+`Camoufox is not ready: …`, the browser packages or the Camoufox engine are
+missing or broken on this install: tell the user, passing on the operator step
+the error names. Never run that step, `camoufox fetch` or `pip install` from
+inside a session; every session's MCP server shares the engine and the venv,
+and the engine download is far larger than a session's temp space. If the
+error says the browser packages changed after this session started, the fix
+is restarting the session, not reinstalling.
 
 ## Verify after every action
 
@@ -388,7 +388,8 @@ under about 20 navigations per task.
 | `Click on '...' failed after it was or may have been sent, so it may already have taken effect` | Not a failed click. Snapshot and check before clicking again. |
 | `Ambiguous selector` | Narrow the selector. |
 | `... timed out after N s. Browser state was reset` | Navigate again; form input is lost. Long fill: see "Long text". A `browser_click` timeout may already have delivered the click: see "Clicking" before clicking again. |
-| `Browser not available`, or an error saying Camoufox is not installed or telling you to run `camoufox fetch` | Browser packages or the Camoufox engine missing on this install; tell the user. Do not run `camoufox fetch`. |
+| `Browser not available` or `Camoufox is not ready: …` | Browser packages or the Camoufox engine missing or broken on this install; tell the user the operator step the error names. Never run it, `camoufox fetch` or `pip install` from a session. |
+| `Browser packages changed after this session started` | The browser packages were upgraded under this session; it must be restarted. Do not reinstall. |
 | `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill, run_js or snapshot: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. `browser_snapshot()` shows the page and re-syncs the URL; if the advisory persists, `browser_run_js("location.href")` (no reload). |
 | `Remote Chrome connection lost` | Chrome closed or machine asleep. Ask the user to restart it with the flag. |
 | `turnstile.status: blocked` | Hand off to the user or stop. See `stealth-browser`. |
