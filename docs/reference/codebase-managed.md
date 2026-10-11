@@ -202,6 +202,10 @@ Only the fixed CBM service/slice fragments and their known persistent/runtime
 enablement locations are removed. Symlinks are unlinked without deleting foreign
 targets; unrelated slices survive. Valid settings can report external retained
 binary/cache/runtime paths, but cannot expand the documented deletion roots.
+Retirement requires the backend to be loaded and disabled, or exactly absent;
+masked, generated, transient and static backend definitions refuse cleanup.
+Retention diagnostics distinguish recursive removal of real roots from unlinking
+a final root symlink, and account for the exact retained runtime `locks` child.
 Unclassifiable diagnostic paths are reported and do not alter deletion authority.
 Both Qdrant binary locations and dangling known unit links are handled; foreign
 symlink targets remain untouched. Failed runtime inventory aborts before deleting

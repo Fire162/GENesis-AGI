@@ -102,7 +102,88 @@ def test_retirement_accepts_proved_nonenabled_state(guard, monkeypatch, state, l
     monkeypatch.setattr(g["subprocess"], "run", lambda *a, **kw: SimpleNamespace(returncode=0, stderr=""))
     monkeypatch.setitem(g, "require_quiescent", lambda unit: None)
     monkeypatch.setitem(g, "show", lambda *a: {"UnitFileState": state, "LoadState": load})
-    guard.retire_managed()
+    if state in ("disabled", ""):
+        guard.retire_managed()
+    else:
+        with pytest.raises(ValueError, match="retirement failed"):
+            guard.retire_managed()
+
+
+@pytest.mark.parametrize("load", ["not-found", "masked", "error", ""])
+def test_disabled_backend_requires_loaded_definition(guard, monkeypatch, load):
+    g = guard.retire_managed.__globals__
+    monkeypatch.setattr(g["subprocess"], "run", lambda *a, **kw: SimpleNamespace(returncode=0, stderr=""))
+    monkeypatch.setitem(g, "require_quiescent", lambda unit: None)
+    monkeypatch.setitem(g, "show", lambda *a: {"UnitFileState": "disabled", "LoadState": load})
+    with pytest.raises(ValueError, match="retirement failed"):
+        guard.retire_managed()
+
+
+@pytest.mark.parametrize("root_name", ["genesis", ".genesis", "data", ".qdrant"])
+@pytest.mark.parametrize("key", ["binary", "cache", "runtime"])
+@pytest.mark.parametrize("layout", ["real", "external-link", "internal-link", "dangling-link"])
+def test_retention_matches_addressed_removal(guard, transaction, monkeypatch, capsys, root_name, key, layout):
+    home = transaction
+    roots = [home / name for name in ("genesis", ".genesis", "data", ".qdrant")]
+    root = home / root_name
+    root.mkdir(exist_ok=True)
+    if layout != "real":
+        shutil.rmtree(root)
+        target = home / ("data" if root_name != "data" else "genesis") if layout == "internal-link" else home / "outside"
+        if layout != "dangling-link":
+            target.mkdir(exist_ok=True)
+        root.symlink_to(target, target_is_directory=True)
+    candidate = root / "artifact"
+    if layout != "dangling-link":
+        candidate.write_text("owned evidence")
+    resolved = candidate.resolve()
+    config = {name: str(home / "unrelated" / name) for name in ("binary", "cache", "runtime")}
+    config[key] = str(candidate)
+    monkeypatch.setitem(guard.report_retained_state.__globals__, "read_settings", lambda *a, **kw: config)
+    guard.report_retained_state()
+    reported = f"Preserved configured {key}: {resolved}" in capsys.readouterr().out
+    # Execute addressed removals as the oracle, rather than repeating the classifier.
+    for addressed in roots:
+        if addressed.name == ".genesis" and addressed.is_dir() and not addressed.is_symlink():
+            for child in addressed.iterdir():
+                if child.name != "locks":
+                    subprocess.run(["/usr/bin/rm", "-rf", "--", str(child)], check=True)
+        else:
+            subprocess.run(["/usr/bin/rm", "-rf", "--", str(addressed)], check=True)
+    assert reported == (resolved.exists() or layout == "dangling-link")
+
+
+@pytest.mark.parametrize("layout", ["locks", "data-to-locks", "locks-to-data", "locks-to-cache", "nested-alias", "home-alias"])
+def test_retention_alias_and_lock_actions(guard, transaction, monkeypatch, capsys, layout):
+    home = transaction
+    locks = home / ".genesis/locks"
+    locks.mkdir(parents=True)
+    data = home / "data"
+    data.mkdir()
+    candidate = locks / "artifact"
+    retained = layout in ("locks", "data-to-locks")
+    if layout == "data-to-locks":
+        data.rmdir()
+        data.symlink_to(locks, target_is_directory=True)
+        candidate = data / "artifact"
+    elif layout in ("locks-to-data", "locks-to-cache"):
+        target = data if layout == "locks-to-data" else home / ".genesis/cache"
+        target.mkdir(exist_ok=True)
+        locks.rmdir()
+        locks.symlink_to(target, target_is_directory=True)
+    elif layout == "nested-alias":
+        (home / "outside-alias").symlink_to(data, target_is_directory=True)
+        candidate = home / "outside-alias/artifact"
+    elif layout == "home-alias":
+        alias = home.parent / "home-alias"
+        alias.symlink_to(home, target_is_directory=True)
+        monkeypatch.setenv("HOME", str(alias))
+        candidate = alias / "data/artifact"
+    candidate.write_text("owned evidence")
+    resolved = candidate.resolve()
+    monkeypatch.setitem(guard.report_retained_state.__globals__, "read_settings", lambda *a, **kw: dict.fromkeys(("binary", "cache", "runtime"), str(candidate)))
+    guard.report_retained_state()
+    assert (f"Preserved configured cache: {resolved}" in capsys.readouterr().out) == retained
 
 
 @pytest.mark.parametrize("key", ["binary", "cache", "runtime"])
@@ -344,6 +425,11 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
         .read_text()
         .replace('"/usr/bin/systemctl"', json.dumps(str(systemctl)))
     )
+    proc = home / "test-proc"
+    proc.mkdir()
+    observer = 'def observed_index_writers(proc: Path = Path("/proc"))'
+    assert helper.count(observer) == 1
+    helper = helper.replace(observer, f"def observed_index_writers(proc: Path = Path({str(proc)!r}))")
     (scripts / "codebase_managed.py").write_text(helper)
     shutil.copy2(ROOT / "scripts/uninstall.sh", scripts / "uninstall.sh")
     for name in ("code_intel_cbm_worker.py", "code_intel_cbm_admission.py"):
@@ -358,7 +444,7 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
         (home / name).mkdir(parents=True)
     (home / ".bashrc").write_text("# preserved\n")
     env = dict(
-        os.environ,
+        LANG="C.UTF-8",
         HOME=str(home),
         PATH=f"{tools}:/usr/bin:/bin",
         CALLS=str(calls),
@@ -375,6 +461,20 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
     ):
         env.pop(key, None)
     return home, scripts, env
+
+
+def test_owned_process_observation_refuses_actual_cleanup(owned_install):
+    home, scripts, env = owned_install
+    process = home / "test-proc/123"
+    process.mkdir()
+    (process / "cmdline").write_bytes(b"node\0/opt/gitnexus/dist/cli/index.js\0analyze\0")
+    (process / "stat").write_text("123 (worker) " + " ".join(["S"] + ["0"] * 18 + ["10"]))
+    (process / "cwd").symlink_to(home / "genesis", target_is_directory=True)
+    result = subprocess.run(["/bin/bash", str(scripts / "uninstall.sh"), "--genesis-only", "--non-interactive"], env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+    assert "writer" in result.stderr
+    assert (home / "genesis").is_dir() and (home / "data").is_dir()
+    assert not (home / "calls").exists()  # observation precedes any systemctl call
 
 
 @pytest.mark.parametrize("settings", ["missing", "malformed", "schema1", "stale"])
