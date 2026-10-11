@@ -97,7 +97,7 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def _ensure_dir(path: Path) -> None:
+def ensure_private_dir(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = os.lstat(path)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
@@ -223,7 +223,7 @@ def init_vault(passphrase: str, path: Path | None = None) -> str:
     check_can_init(path)
     if passphrase_score(passphrase) < MIN_PASSPHRASE_SCORE:
         raise VaultError("the passphrase is too guessable (needs zxcvbn score 4)")
-    _ensure_dir(path)
+    ensure_private_dir(path)
     with _dir_lock(path):
         check_can_init(path)  # another init may have finished while we waited
         identity = x25519.Identity.generate()
