@@ -42,6 +42,10 @@ plain ``git push`` (e.g. ``git push -u origin HEAD``): no other step of any kind
 ``|``/``&``/newline), no redirection, no subshell, no global option between
 ``git`` and ``push`` (``-C``, ``-c``, ``--git-dir``…), no ``VAR=…`` prefix and no
 wrapper. A chained command still asks — run the first push as its own command.
+Two exceptions, both judged by the push guard's ``_is_single_plain_push``: one
+``-C <path>`` naming the literal, symlink-free top of a worktree of the same
+repository as the session's cwd, and an output-only suffix (``2>&1`` and/or a
+pipe into ``tail``/``head`` with a line count).
 It must also be true that:
 
 * the remote git will really push to (pushRemote > pushDefault >
@@ -80,9 +84,10 @@ deny are all outside the key's reach.
 
 **``push_routine`` is the wider, separate switch** (owner ruling 2026-10-06), for
 an install whose sessions push from linked worktrees (``git -C <path> push``,
-which ``push_publish`` never covers) and chain steps. It silences the push
-guard's ROUTINE prompts: a first push in any spelling, close-then-push, a
-re-push with no open PR off the public repo, and a re-push chained with other
+which ``push_publish`` covers only through the worktree-top ``-C <path>``
+exception above) and chain steps. It silences the push guard's ROUTINE prompts:
+a first push in any spelling, close-then-push, a re-push with no open PR off the
+public repo, and a re-push chained with other
 steps. It applies only when EVERY ask the command raised is one of those and
 every push URL is a github.com https repo of the configured owner
 (``github.user``); a raw URL also needs no ``insteadOf`` rule. A ``gh pr create``
