@@ -1,0 +1,353 @@
+"""Tests for the payment-card-number detector.
+
+No card-shaped literal appears in this file. Every number is generated at test
+time (prefix + random body + Luhn check digit), so a later layer that redacts
+card numbers from what Claude reads can never rewrite this file on disk.
+"""
+
+from __future__ import annotations
+
+import random
+
+import pytest
+
+from genesis.security import card_shapes as cs
+
+
+def _luhn_digit(partial: str) -> str:
+    """The check digit that makes ``partial + digit`` pass Luhn."""
+    total = 0
+    for i, ch in enumerate(reversed(partial)):
+        n = int(ch)
+        if i % 2 == 0:  # these positions are doubled once the check digit is appended
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return str((10 - total % 10) % 10)
+
+
+def make_card(prefix: str, length: int, seed: int = 0) -> str:
+    rng = random.Random(f"{prefix}-{length}-{seed}")
+    body = prefix + "".join(rng.choice("0123456789") for _ in range(length - len(prefix) - 1))
+    return body + _luhn_digit(body)
+
+
+def break_luhn(number: str) -> str:
+    last = int(number[-1])
+    return number[:-1] + str((last + 1) % 10)
+
+
+def group(number: str, sizes: tuple[int, ...], sep: str) -> str:
+    parts, i = [], 0
+    for n in sizes:
+        parts.append(number[i : i + n])
+        i += n
+    assert i == len(number)
+    return sep.join(parts)
+
+
+# A Stripe public test number, built from parts so the literal never appears.
+STRIPE_VISA = "4242" * 4
+
+BRANDS = [
+    ("visa-16", "4", 16),
+    ("visa-19", "4", 19),
+    ("mc-51", "51", 16),
+    ("mc-55", "55", 16),
+    ("mc-2221", "2221", 16),
+    ("mc-2720", "2720", 16),
+    ("amex-34", "34", 15),
+    ("amex-37", "37", 15),
+    ("diners-300", "300", 14),
+    ("diners-36", "36", 14),
+    ("discover-6011", "6011", 16),
+    ("discover-65", "65", 19),
+    ("discover-644", "644", 16),
+    ("jcb", "3530", 16),
+    ("unionpay", "62", 17),
+    ("maestro-50", "50", 16),
+]
+
+
+class TestLuhn:
+    def test_generated_numbers_pass(self):
+        for _, prefix, length in BRANDS:
+            assert cs.luhn_ok(make_card(prefix, length))
+
+    def test_broken_check_digit_fails(self):
+        assert not cs.luhn_ok(break_luhn(make_card("4", 16)))
+
+    def test_stripe_number_passes(self):
+        assert cs.luhn_ok(STRIPE_VISA)
+
+
+class TestDetects:
+    @pytest.mark.parametrize("name,prefix,length", BRANDS)
+    def test_unbroken_run(self, name, prefix, length):
+        number = make_card(prefix, length)
+        text = f"pay with {number} please"
+        assert cs.contains_card_number(text), name
+        (span,) = cs.find_card_numbers(text)
+        assert text[span[0] : span[1]] == number
+
+    @pytest.mark.parametrize("sep", [" ", "-", "\u00a0", "\u202f"], ids=["space", "hyphen", "nbsp", "narrow-nbsp"])
+    def test_grouped_4444(self, sep):
+        text = "card: " + group(STRIPE_VISA, (4, 4, 4, 4), sep)
+        assert cs.contains_card_number(text)
+
+    @pytest.mark.parametrize("sep", [" ", "-"])
+    def test_grouped_amex_465(self, sep):
+        number = make_card("37", 15)
+        assert cs.contains_card_number(group(number, (4, 6, 5), sep))
+
+    @pytest.mark.parametrize("sep", [" ", "-"])
+    def test_grouped_diners_464(self, sep):
+        number = make_card("36", 14)
+        assert cs.contains_card_number(group(number, (4, 6, 4), sep))
+
+    @pytest.mark.parametrize("sep", [" ", "-"])
+    def test_grouped_19_digit_44443(self, sep):
+        # The 4-4-4-4 prefix of a 4-4-4-4-3 number must not win and then be
+        # rejected as a run-on: the whole 19-digit number is the match.
+        number = make_card("4", 19)
+        text = group(number, (4, 4, 4, 4, 3), sep)
+        (span,) = cs.find_card_numbers(text)
+        assert text[span[0] : span[1]] == text
+
+    def test_at_string_edges(self):
+        assert cs.contains_card_number(STRIPE_VISA)
+
+    @pytest.mark.parametrize("wrap", ['"{}"', "'{}'", "({})", "[{}]", "`{}`", "={}", ":{}", "{},"])
+    def test_punctuation_neighbours(self, wrap):
+        assert cs.contains_card_number(wrap.format(STRIPE_VISA))
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{V} 12/30",
+            "{V} 123",
+            "{G} 12/30 123",
+            "{G} 123",
+            "{H} 123",
+            "123 {V}",
+            "Step 2 {G}",
+            "{G} 12 30 123",
+            "card {V} exp 12/30 cvv 123",
+        ],
+        ids=[
+            "unbroken+expiry",
+            "unbroken+cvv",
+            "grouped+expiry+cvv",
+            "grouped+cvv",
+            "hyphenated+cvv",
+            "digits-before-unbroken",
+            "step-number-before-grouped",
+            "grouped+spaced-expiry+cvv",
+            "labelled",
+        ],
+    )
+    def test_card_with_neighbouring_numbers(self, template):
+        # The shape a pasted card actually takes: number, then expiry and CVV.
+        number = STRIPE_VISA
+        text = template.format(
+            V=number, G=group(number, (4, 4, 4, 4), " "), H=group(number, (4, 4, 4, 4), "-")
+        )
+        assert cs.contains_card_number(text), template
+
+    @pytest.mark.parametrize(
+        "template",
+        ["{G} 1225", "{G} 1225 123", "1225 {G}", "{H}-0128", "{G} 0631 4242"],
+        ids=["mmyy-after", "mmyy-and-cvv", "mmyy-before", "hyphen-mmyy", "mmyy-then-other"],
+    )
+    def test_spaced_card_with_bare_mmyy_expiry(self, template):
+        # A month-first 4-digit neighbour reads as an expiry, not a list.
+        text = template.format(G=group(STRIPE_VISA, (4, 4, 4, 4), " "),
+                               H=group(STRIPE_VISA, (4, 4, 4, 4), "-"))
+        assert cs.contains_card_number(text)
+
+    @pytest.mark.parametrize(
+        "template",
+        ["1230 {H}", "12/30 {H} 123", "1230-{G}", "{G}-123", "123 {H}-1230"],
+        ids=["space-then-hyphen", "slash-space-hyphen", "hyphen-then-space", "space-then-hyphen-cvv",
+             "mixed-around"],
+    )
+    def test_card_where_the_separator_changes_at_its_edge(self, template):
+        # The token where the separator changes belongs to both chains; the
+        # card's own chain must not start one group short.
+        text = template.format(G=group(STRIPE_VISA, (4, 4, 4, 4), " "),
+                               H=group(STRIPE_VISA, (4, 4, 4, 4), "-"))
+        assert cs.contains_card_number(text)
+
+    def test_amex_followed_by_four_digit_code(self):
+        number = make_card("37", 15)
+        assert cs.contains_card_number(group(number, (4, 6, 5), " ") + " 1234")
+
+    def test_multiple_numbers(self):
+        a, b = make_card("51", 16), make_card("34", 15)
+        assert len(cs.find_card_numbers(f"{a} and {b}")) == 2
+
+
+class TestRejects:
+    def test_luhn_failure(self):
+        assert not cs.contains_card_number(break_luhn(make_card("4", 16)))
+
+    @pytest.mark.parametrize(
+        "prefix,length",
+        [
+            ("4", 13),  # Visa-13 is excluded: it collides with phone numbers
+            ("4", 15),
+            ("51", 15),
+            ("34", 16),
+            ("1", 16),  # no issuer uses 1
+            ("9", 16),
+            ("2220", 16),  # just below the Mastercard 2-series range
+            ("2721", 16),  # just above it
+            ("7", 16),
+        ],
+    )
+    def test_wrong_brand_or_length(self, prefix, length):
+        assert not cs.contains_card_number(make_card(prefix, length))
+
+    def test_inside_longer_digit_run(self):
+        number = make_card("4", 16)
+        assert not cs.contains_card_number("9" + number)
+        assert not cs.contains_card_number(number + "9")
+
+    def test_inside_hex_hash(self):
+        number = make_card("4", 16)
+        assert not cs.contains_card_number(f"deadbeef{number}cafe")
+        assert not cs.contains_card_number(f"a{number}")
+
+    @pytest.mark.parametrize("template", ["2404 {G}", "{H}-9999", "for n in 2404 {G} 2472; do"],
+                             ids=["4-digit-before", "4-digit-after", "shell-loop-list"])
+    def test_spaced_card_beside_another_4_digit_token_reads_as_a_list(self, template):
+        # The measured trade: lists of 4-digit numbers (PR numbers in a shell
+        # loop) are not cards; the cost is a spaced card next to an unrelated
+        # 4-digit number.
+        text = template.format(G=group(STRIPE_VISA, (4, 4, 4, 4), " "),
+                               H=group(STRIPE_VISA, (4, 4, 4, 4), "-"))
+        assert not cs.contains_card_number(text)
+
+    def test_chain_cap_alone_rejects_a_long_chain(self):
+        # No 4-digit neighbour here, so only the chain cap decides.
+        text = "1 2 3 4 5 " + group(STRIPE_VISA, (4, 4, 4, 4), " ") + " 123"
+        assert len(text.split()) > cs._MAX_CHAIN_GROUPS
+        assert not cs.contains_card_number(text)
+
+    def test_long_numeric_table_is_not_a_card(self):
+        # More than _MAX_CHAIN_GROUPS tokens in one chain is a column of
+        # numbers, even when one window of it happens to form a valid card.
+        inner = group(STRIPE_VISA, (4, 4, 4, 4), " ")
+        table = f"1000 2000 3000 {inner} 5000 6000"
+        assert len(table.split()) > cs._MAX_CHAIN_GROUPS
+        assert not cs.contains_card_number(table)
+
+    def test_decimal_fraction(self):
+        # MEASURED: the only false-positive class in 241,499 real transcript
+        # items was digits after a decimal point ("score":0.4…).
+        number = make_card("4", 16)
+        assert not cs.contains_card_number(f'"score":0.{number},')
+        assert not cs.contains_card_number(f"12.{number}")
+
+    def test_mixed_separators(self):
+        number = STRIPE_VISA
+        mixed = f"{number[:4]} {number[4:8]}-{number[8:12]} {number[12:]}"
+        assert not cs.contains_card_number(mixed)
+
+    def test_epoch_milliseconds(self):
+        assert not cs.contains_card_number("ts=1728600000000")
+
+    def test_phone_numbers(self):
+        assert not cs.contains_card_number("+4915112345678")
+        assert not cs.contains_card_number("+1 415 555 0100")
+
+    def test_uuid_and_sha256(self):
+        assert not cs.contains_card_number("550e8400-e29b-41d4-a716-446655440000")
+        assert not cs.contains_card_number(
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        )
+
+    def test_numeric_columns(self):
+        assert not cs.contains_card_number("4096 4096 4096 4096 4096 4096")
+        assert not cs.contains_card_number("total 1234567\n-rw-r--r-- 1 u u 4096 x")
+
+    def test_unicode_digits(self):
+        fullwidth = "".join(chr(0xFF10 + int(c)) for c in STRIPE_VISA)
+        assert not cs.contains_card_number(fullwidth)
+
+    def test_empty_and_none_like(self):
+        assert cs.find_card_numbers("") == []
+        assert not cs.contains_card_number("")
+
+
+class TestRedact:
+    def test_replaces_every_number(self):
+        a, b = make_card("4", 16), make_card("37", 15)
+        out = cs.redact(f"first {a}, second {group(b, (4, 6, 5), ' ')}.")
+        assert a not in out
+        assert out == f"first {cs.REDACTED}, second {cs.REDACTED}."
+
+    def test_leaves_clean_text_identical(self):
+        text = "order 1234567 shipped; ts=1728600000000; id 550e8400-e29b"
+        assert cs.redact(text) == text
+
+    def test_empty(self):
+        assert cs.redact("") == ""
+
+
+class TestCardField:
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {"autocomplete": "cc-number"},
+            {"autocomplete": "billing cc-number"},
+            {"autocomplete": "cc-csc"},
+            {"autocomplete": "cc-exp"},
+            {"autocomplete": "cc-exp-month"},
+            {"autocomplete": "CC-EXP-YEAR"},
+            {"name": "cardnumber"},
+            {"name": "card_number"},
+            {"id": "credit-card-number"},
+            {"name": "cc-num"},
+            {"name": "cvc"},
+            {"id": "cvv2"},
+            {"name": "card_security_code"},
+            {"name": "exp-date"},
+            {"name": "expiry_month"},
+            {"aria_label": "Expiration year"},
+            {"placeholder": "Card number"},
+            {"label": "CVC"},
+            {"name": "cardCvc"},
+            {"id": "cardCvv"},
+            {"name": "encryptedSecurityCode"},
+            {"name": "ccNumber"},
+            {"name": "cardExpiryMonth"},
+        ],
+    )
+    def test_card_fields(self, attrs):
+        assert cs.is_card_field(attrs)
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {},
+            {"name": "email", "autocomplete": "email"},
+            {"name": "security_code", "placeholder": "Code we sent you"},
+            {"name": "otp"},
+            {"name": "experience"},
+            {"name": "export"},
+            {"name": "postal", "autocomplete": "postal-code"},
+            {"autocomplete": "cc-name"},
+            {"name": "discount_code"},
+            {"id": "search"},
+            {"name": "accNumber"},
+            {"name": "securityCode"},
+            {"name": "accountNumber"},
+        ],
+    )
+    def test_not_card_fields(self, attrs):
+        assert not cs.is_card_field(attrs)
+
+    def test_tolerates_non_string_values(self):
+        assert not cs.is_card_field({"name": None, "id": 3, "autocomplete": ["x"]})

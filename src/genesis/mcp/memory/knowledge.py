@@ -18,6 +18,7 @@ from genesis.memory.reference_ops import (
     delete_reference_entry,
 )
 from genesis.security import immunity_shadow
+from genesis.security.card_shapes import contains_card_number
 
 from ..memory import mcp
 from ._scoring import DEFAULT_KB_FLOOR_RATIO, relative_kb_floor
@@ -430,6 +431,23 @@ async def knowledge_status(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _carries_card_number(*fields: object) -> bool:
+    """True if any string in ``fields`` (strings, lists, or dict values) holds a
+    payment card number."""
+    for field in fields:
+        if isinstance(field, str):
+            values: list = [field]
+        elif isinstance(field, dict):
+            values = list(field.values())
+        elif isinstance(field, (list, tuple)):
+            values = list(field)
+        else:
+            continue
+        if any(isinstance(v, str) and contains_card_number(v) for v in values):
+            return True
+    return False
+
+
 def _format_reference_body(
     *,
     kind: str,
@@ -497,7 +515,9 @@ async def reference_store(
     identifier across re-stores to get upsert semantics.
 
     ``value`` is the raw value (password, URL string, IP address, file path,
-    etc.). Stored plaintext in the knowledge_units table.
+    etc.). Stored plaintext in the knowledge_units table, so an entry holding
+    a payment card number in any field is refused (cards belong in the
+    encrypted card vault).
 
     ``description`` is REQUIRED. An IP without "what is this" or a credential
     without "what service" is useless 10 sessions later. Describes the
@@ -525,6 +545,14 @@ async def reference_store(
         raise ValueError("reference_store: identifier is required")
     if not value or not value.strip():
         raise ValueError("reference_store: value is required")
+    # The reference store keeps values in plaintext, so a payment card number
+    # never goes in, whichever field carries it. The refusal does not echo it.
+    if _carries_card_number(identifier, value, description, tags, source):
+        raise ValueError(
+            "reference_store: refused, the entry contains a payment card number. "
+            "Cards are never stored as references; they belong in the encrypted "
+            "card vault."
+        )
 
     body = _format_reference_body(
         kind=kind,
@@ -534,6 +562,14 @@ async def reference_store(
         tags=tags,
         source=source,
     )
+    # The formatted body is exactly what gets stored; check it too, so nothing
+    # the field check above did not walk (nested values, non-strings) slips in.
+    if contains_card_number(body):
+        raise ValueError(
+            "reference_store: refused, the entry contains a payment card number. "
+            "Cards are never stored as references; they belong in the encrypted "
+            "card vault."
+        )
 
     # Tags JSON array for the SQLite row. Include reference markers up front
     # so FTS5 keyword filtering works, then the user-supplied tags.

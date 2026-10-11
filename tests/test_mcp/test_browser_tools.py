@@ -61,6 +61,20 @@ def _reset_browser_state():
     _clear_all_browser_state()
 
 
+@pytest.fixture(autouse=True)
+def _pages_answer_the_card_probe(monkeypatch):
+    """The pages in this file are MagicMocks, which cannot answer the card
+    guard's focus and target probes (awaiting a MagicMock raises, which the
+    guard reads as "unverified" and refuses). Give them a verified non-card
+    answer; TestCardNumberGuards patches the probes per test."""
+    monkeypatch.setattr(
+        browser._card_guard, "focused_card_field", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        browser._card_guard, "target_is_card_field", AsyncMock(return_value=False)
+    )
+
+
 class TestIsPageAlive:
     def test_alive_page(self):
         page = MagicMock()
@@ -4987,7 +5001,7 @@ class TestClickFollowRoundThreeFixes:
         popup = _EventPage("https://f.example")
         clicked = asyncio.Event()
 
-        async def human_type(page, selector, value):
+        async def human_type(page, selector, value, **_kwargs):
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(clicked.wait(), timeout=0.2)
             page.emit("popup", popup)  # the focus click opened a window
@@ -5014,7 +5028,7 @@ class TestClickFollowRoundThreeFixes:
         original = self._fill_page()
         typing, release = asyncio.Event(), asyncio.Event()
 
-        async def human_type(page, selector, value):
+        async def human_type(page, selector, value, **_kwargs):
             typing.set()
             await release.wait()
 
@@ -5147,3 +5161,157 @@ def test_every_page_action_takes_the_page_lock_or_is_named_exempt():
         f"stale exemptions: {sorted(set(_PAGE_ACTION_EXEMPT) - unlocked)}"
     )
     assert all(reason.strip() for reason in _PAGE_ACTION_EXEMPT.values())
+
+
+# ---------------------------------------------------------------------------
+# Card-number guards (fill, press_key, run_js)
+# ---------------------------------------------------------------------------
+
+# Stripe's public test number, built from parts so no card literal is in the file.
+_TEST_CARD = "4242" * 4
+
+
+def _key_page():
+    page = MagicMock()
+    page.url = "https://shop.example/checkout"
+    page.keyboard = MagicMock()
+    page.keyboard.press = AsyncMock()
+    browser._active_page = page
+    return page
+
+
+class TestCardNumberGuards:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "value",
+        [_TEST_CARD, f"{_TEST_CARD[:4]} {_TEST_CARD[4:8]} {_TEST_CARD[8:12]} {_TEST_CARD[12:]}"],
+    )
+    async def test_fill_refuses_a_card_value_before_touching_the_page(self, value):
+        page, calls = _typing_page()
+        with patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_fill("#note", value)
+        assert result == {"error": browser._card_guard.REFUSE_VALUE}
+        assert calls["down"] == 0
+        page.fill.assert_not_awaited()
+        page.click.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fill_refuses_a_card_field_target(self, monkeypatch):
+        page, calls = _typing_page()
+        monkeypatch.setattr(
+            browser._card_guard, "target_is_card_field", AsyncMock(return_value=True)
+        )
+        with patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_fill("#cc-number", "hello")
+        assert result == {"error": browser._card_guard.REFUSE_FIELD}
+        assert calls["down"] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "focused,expected",
+        [(True, "REFUSE_FIELD"), (None, "REFUSE_UNVERIFIED")],
+    )
+    async def test_fill_refuses_when_the_click_left_focus_in_a_card_field(
+        self, monkeypatch, focused, expected
+    ):
+        """The selector named a plain field, but the focusing click landed in a
+        card field (or a frame that could not be checked): nothing is typed."""
+        page, calls = _typing_page()
+        monkeypatch.setattr(
+            browser._card_guard, "focused_card_field", AsyncMock(return_value=focused)
+        )
+        with (
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#wrapper", "hello")
+        assert result == {"error": getattr(browser._card_guard, expected)}
+        page.click.assert_awaited()  # the check ran after the focusing click
+        assert calls["down"] == 0
+
+    @pytest.mark.asyncio
+    async def test_fill_refuses_when_the_target_cannot_be_read(self, monkeypatch):
+        """An unreadable target refuses: the Chromium and TinyFish layers fill
+        atomically, with no post-click focus check to catch a card field."""
+        page, calls = _typing_page()
+        monkeypatch.setattr(
+            browser._card_guard, "target_is_card_field", AsyncMock(return_value=None)
+        )
+        with patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_fill("#bio", "hi")
+        assert result == {"error": browser._card_guard.REFUSE_TARGET_UNVERIFIED}
+        assert calls["down"] == 0
+        page.fill.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_js_refuses_a_card_number_before_logging_it(self, caplog):
+        page = MagicMock()
+        page.url = "https://shop.example"
+        page.evaluate = AsyncMock(return_value=None)
+        browser._active_page = page
+        with caplog.at_level("DEBUG", logger="genesis"):
+            result = await browser._impl_browser_run_js(
+                f"document.querySelector('#cc').value = '{_TEST_CARD}'"
+            )
+        assert result == {"error": browser._card_guard.REFUSE_RUN_JS}
+        page.evaluate.assert_not_awaited()
+        assert _TEST_CARD not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_run_js_runs_ordinary_scripts(self):
+        page = MagicMock()
+        page.url = "https://shop.example"
+        page.evaluate = AsyncMock(return_value="Checkout")
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("document.title")
+        assert result["result"] == "Checkout"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "focused,expected",
+        [(True, "REFUSE_FIELD"), (None, "REFUSE_UNVERIFIED")],
+    )
+    async def test_press_key_refuses_typing_keys_in_a_card_field(
+        self, monkeypatch, focused, expected
+    ):
+        page = _key_page()
+        monkeypatch.setattr(
+            browser._card_guard, "focused_card_field", AsyncMock(return_value=focused)
+        )
+        result = await browser._impl_browser_press_key("4")
+        assert result["error"] == getattr(browser._card_guard, expected)
+        assert result["pressed_before_refusal"] == 0
+        page.keyboard.press.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_press_key_rechecks_focus_before_every_press(self, monkeypatch):
+        """A form that auto-advances can move focus into a card field between
+        presses; the press that would land there is refused."""
+        page = _key_page()
+        monkeypatch.setattr(
+            browser._card_guard,
+            "focused_card_field",
+            AsyncMock(side_effect=[False, False, True]),
+        )
+        with patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep):
+            result = await browser._impl_browser_press_key("4", 5)
+        assert result["error"] == browser._card_guard.REFUSE_FIELD
+        assert result["pressed_before_refusal"] == 2
+        assert page.keyboard.press.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_press_key_allows_navigation_in_a_card_field(self, monkeypatch):
+        page = _key_page()
+        probe = AsyncMock(return_value=True)
+        monkeypatch.setattr(browser._card_guard, "focused_card_field", probe)
+        result = await browser._impl_browser_press_key("Tab", 2)
+        assert result["pressed"] == "Tab"
+        assert page.keyboard.press.await_count == 2
+        probe.assert_not_awaited()  # navigation keys never need the probe
+
+    @pytest.mark.asyncio
+    async def test_press_key_types_into_an_ordinary_field(self):
+        page = _key_page()
+        result = await browser._impl_browser_press_key("a")
+        assert result["pressed"] == "a"
+        page.keyboard.press.assert_awaited_once_with("a")
