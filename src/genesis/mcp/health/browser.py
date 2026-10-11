@@ -34,7 +34,7 @@ from pathlib import Path
 
 from fastmcp import Context
 
-from genesis.browser import engine, packages
+from genesis.browser import engine, packages, profile_backup
 from genesis.browser.types import BrowserLayer
 from genesis.mcp.health import mcp
 
@@ -448,6 +448,8 @@ async def _ensure_browser():
         status = engine.resolve_camoufox_engine()
         if not status.ready:
             raise engine.CamoufoxNotReady(status.detail)
+        # A different engine upgrades the profile on first open; keep the way back.
+        await asyncio.to_thread(profile_backup.backup_camoufox_profile, _PROFILE_DIR, status.path)
 
         from camoufox.async_api import AsyncCamoufox
 
@@ -509,6 +511,9 @@ async def _ensure_chromium_fallback():
         packages.check_loaded_browser_modules(packages.PLAYWRIGHT_ONLY)
         from playwright.async_api import async_playwright
 
+        await asyncio.to_thread(
+            profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, "playwright"
+        )
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
         # Always headed — Xvfb :99 is always running.

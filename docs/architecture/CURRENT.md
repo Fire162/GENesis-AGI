@@ -1472,7 +1472,13 @@ verified: 637f7f7bb679 2026-10-05
   `executable_path` (camoufox's own read-only selection; never its in-launch
   delete-and-download), also asked by the `browser_automation` capability in a
   subprocess; `packages.py` refuses a launch on browser modules pip replaced
-  under the process. The automation TOOLS live in
+  under the process. Before the browser tools launch Camoufox or the Chromium
+  fallback, `profile_backup.py` copies the profile to
+  `<profile>.pre-v<version>-<time>` when a different browser build is about to
+  open it (the profile's own record against the engine's; caches and locks left
+  out; a copy the profile changed under is discarded; never blocks the launch).
+  `scripts/browser.py` launches without a copy. `scripts/disk_hygiene.sh` keeps
+  the newest copy per profile, and the newest per version for 90 days. The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
   TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
   1 h idle reclaim of one layer never touches another (TinyFish included:
