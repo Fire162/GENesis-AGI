@@ -3091,11 +3091,20 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
-          _config_overlay.py]
+          restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
+          env.py, _config_overlay.py]
 verified: ba9dd8a37 2026-10-09
 ```
 
+- **payments/**: the encrypted card vault, virtual cards only.
+  `python -m genesis vault init|add|list|retire|status` (`payments/cli.py`);
+  `vault_store.py` keeps `~/.genesis/payment_vault/` (0700, files 0600): an age
+  X25519 identity sealed under the owner's passphrase (zxcvbn score 4), its
+  public key, and `cards.db`, whose card details exist only as age blobs
+  encrypted to that key. `add` needs no passphrase and requires a merchant
+  scope or `--single-use`; init/add/retire need a TTY and refuse inside a
+  Claude Code session (accident guard). Needs the `payments` extra. No runtime
+  caller yet: nothing decrypts a card, and the directory is not backed up.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;

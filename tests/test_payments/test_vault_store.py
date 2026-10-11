@@ -1,0 +1,398 @@
+"""Tests for the encrypted card vault store.
+
+Only Stripe's public test numbers appear here, built from parts.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sqlite3
+import stat
+from datetime import UTC, datetime
+
+import pytest
+from pyrage import decrypt, x25519
+from pyrage import passphrase as age_passphrase
+
+from genesis.payments import vault_store as vs
+
+PASSPHRASE = "quartz lantern ember noodle 41"
+VISA = "4242" * 4  # Stripe's public test Visa
+AMEX = "3782" + "822463" + "10005"  # Stripe's public test Amex
+FUTURE = f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
+
+
+@pytest.fixture(scope="module")
+def _sealed_vault(tmp_path_factory):
+    """One real init (scrypt costs seconds), copied fresh into each test."""
+    path = tmp_path_factory.mktemp("sealed") / "payment_vault"
+    vs.init_vault(PASSPHRASE, path)
+    return path
+
+
+@pytest.fixture
+def vault(_sealed_vault, tmp_path):
+    path = tmp_path / "payment_vault"
+    shutil.copytree(_sealed_vault, path)
+    os.chmod(path, 0o700)
+    return path
+
+
+def _identity(path):
+    sealed = (path / vs.IDENTITY).read_bytes()
+    return x25519.Identity.from_str(age_passphrase.decrypt(sealed, PASSPHRASE).decode())
+
+
+def _mode(p):
+    return stat.S_IMODE(os.lstat(p).st_mode)
+
+
+def _add(path, number=VISA, **kw):
+    kw.setdefault("label", "test")
+    kw.setdefault("merchant", "shop.example.com")
+    kw.setdefault("single_use", False)
+    return vs.add_card(vs.parse_card(number, FUTURE, "123"), path=path, **kw)
+
+
+class TestInit:
+    def test_layout_and_modes(self, _sealed_vault):
+        path = _sealed_vault
+        assert _mode(path) == 0o700
+        for name in (vs.IDENTITY, vs.RECIPIENT, vs.CARDS):
+            assert _mode(path / name) == 0o600, name
+        assert (path / vs.RECIPIENT).read_text().startswith("age1")
+        assert not list(path.glob(".*.tmp"))
+        # The identity opens with the passphrase and matches the recipient.
+        identity = _identity(path)
+        assert str(identity.to_public()) == (path / vs.RECIPIENT).read_text().strip()
+
+    def test_refuses_a_weak_passphrase_and_creates_nothing(self, tmp_path):
+        path = tmp_path / "v"
+        with pytest.raises(vs.VaultError, match="guessable"):
+            vs.init_vault("password1", path)
+        assert not path.exists()
+
+    def test_refuses_an_initialised_vault(self, vault):
+        before = (vault / vs.IDENTITY).read_bytes()
+        with pytest.raises(vs.VaultError, match="already initialised"):
+            vs.init_vault(PASSPHRASE, vault)
+        assert (vault / vs.IDENTITY).read_bytes() == before
+
+    @pytest.mark.parametrize("killed_at", [vs.RECIPIENT, vs.IDENTITY])
+    def test_a_run_killed_before_the_identity_lands_reads_uninitialised_and_reruns(
+        self, tmp_path, monkeypatch, killed_at
+    ):
+        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: b"sealed:" + data)
+        path = tmp_path / "v"
+        real_replace, real_link = os.replace, os.link
+
+        def dying(real):
+            def call(src, dst):  # killed as this file is about to land
+                if str(dst).endswith(killed_at):
+                    raise KeyboardInterrupt
+                real(src, dst)
+
+            return call
+
+        monkeypatch.setattr(vs.os, "replace", dying(real_replace))
+        monkeypatch.setattr(vs.os, "link", dying(real_link))
+        with pytest.raises(KeyboardInterrupt):
+            vs.init_vault(PASSPHRASE, path)
+        assert not vs.is_initialised(path)
+        monkeypatch.setattr(vs.os, "replace", real_replace)
+        monkeypatch.setattr(vs.os, "link", real_link)
+        vs.init_vault(PASSPHRASE, path)
+        assert vs.is_initialised(path)
+        assert not list(path.glob(".*.tmp"))
+
+    def test_tightens_a_loose_existing_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: b"sealed")
+        path = tmp_path / "v"
+        path.mkdir(mode=0o755)
+        os.chmod(path, 0o755)
+        vs.init_vault(PASSPHRASE, path)
+        assert _mode(path) == 0o700
+
+
+class TestInitRefusals:
+    @pytest.fixture(autouse=True)
+    def _fast_seal(self, monkeypatch):
+        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: b"sealed:" + data)
+
+    def test_scores_a_passphrase_longer_than_72_characters(self, tmp_path):
+        long = " ".join(["quartz lantern ember noodle"] * 3)
+        assert len(long) > 72
+        vs.init_vault(long, tmp_path / "v")
+        assert vs.is_initialised(tmp_path / "v")
+
+    def test_refuses_an_absurdly_long_passphrase(self, tmp_path):
+        with pytest.raises(vs.VaultError, match="longer than"):
+            vs.init_vault("x" * (vs.MAX_PASSPHRASE_LENGTH + 1), tmp_path / "v")
+
+    def test_refuses_to_orphan_existing_cards(self, vault):
+        _add(vault)
+        recipient = (vault / vs.RECIPIENT).read_text()
+        (vault / vs.IDENTITY).unlink()  # e.g. an attempt to "reset the passphrase"
+        with pytest.raises(vs.VaultError, match="1 card"):
+            vs.init_vault(PASSPHRASE, vault)
+        assert (vault / vs.RECIPIENT).read_text() == recipient
+
+    @pytest.mark.parametrize("shape", ["directory", "dangling symlink", "no recipient"])
+    def test_refuses_any_existing_identity(self, vault, shape):
+        (vault / vs.IDENTITY).unlink()
+        if shape == "directory":
+            (vault / vs.IDENTITY).mkdir()
+        elif shape == "dangling symlink":
+            (vault / vs.IDENTITY).symlink_to(vault / "nowhere")
+        else:
+            (vault / vs.IDENTITY).write_bytes(b"x")
+            (vault / vs.RECIPIENT).unlink()
+        with pytest.raises(vs.VaultError, match="incomplete"):
+            vs.init_vault(PASSPHRASE, vault)
+        with pytest.raises(vs.VaultError, match="incomplete"):
+            _add(vault)
+
+    def test_an_identity_that_appears_mid_init_is_never_replaced(self, tmp_path, monkeypatch):
+        path = tmp_path / "v"
+
+        def racing_seal(data, pw):  # another init lands while this one seals
+            (path / vs.IDENTITY).write_bytes(b"theirs")
+            return b"ours"
+
+        monkeypatch.setattr(age_passphrase, "encrypt", racing_seal)
+        with pytest.raises(FileExistsError):
+            vs.init_vault(PASSPHRASE, path)
+        assert (path / vs.IDENTITY).read_bytes() == b"theirs"
+
+
+class TestParseCard:
+    def test_accepts_spaced_and_hyphenated(self):
+        for typed in (
+            VISA,
+            "4242 4242 4242 4242",
+            "4242-4242-4242-4242",
+            "4242\u00a04242\u00a04242\u00a04242",
+        ):
+            card = vs.parse_card(typed, FUTURE, "123")
+            assert card["number"] == VISA and card["brand"] == "visa"
+        assert vs.parse_card(AMEX, FUTURE, "1234")["brand"] == "amex"
+
+    @pytest.mark.parametrize(
+        "number", [VISA[:-1] + "1", "4242" * 3, "1234" * 4, VISA + "x", "٤" * 16, ""]
+    )
+    def test_refuses_a_bad_number_without_echoing_it(self, number):
+        with pytest.raises(vs.VaultError) as exc:
+            vs.parse_card(number, FUTURE, "123")
+        assert "4242" not in str(exc.value)
+
+    def test_expiry(self):
+        year = datetime.now(UTC).year + 2
+        assert vs.parse_card(VISA, f"01/{year}", "123")["exp_year"] == year
+        assert vs.parse_card(VISA, f"12 / {year % 100}", "123")["exp_month"] == 12
+        for bad in ("13/30", "1/30", "12-30", "", "12/3"):
+            with pytest.raises(vs.VaultError, match="MM/YY"):
+                vs.parse_card(VISA, bad, "123")
+        with pytest.raises(vs.VaultError, match="expired"):
+            vs.parse_card(VISA, "01/20", "123")
+
+    def test_security_code_length_by_brand(self):
+        with pytest.raises(vs.VaultError, match="security code"):
+            vs.parse_card(VISA, FUTURE, "1234")
+        with pytest.raises(vs.VaultError, match="security code"):
+            vs.parse_card(AMEX, FUTURE, "123")
+        with pytest.raises(vs.VaultError, match="security code"):
+            vs.parse_card(VISA, FUTURE, "12a")
+
+
+class TestAddAndList:
+    def test_details_exist_only_encrypted(self, vault):
+        ref = _add(vault, name="A Person", postal_code="00000")
+        raw = (vault / vs.CARDS).read_bytes()
+        assert VISA.encode() not in raw
+        [card] = vs.list_cards(vault)
+        assert card["card_ref"] == ref and card["last4"] == VISA[-4:]
+        assert card["brand"] == "visa" and card["status"] == "active"
+        assert "blob" not in card and not any("exp" in k for k in card)
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            (blob,) = conn.execute("SELECT blob FROM cards").fetchone()
+        secret = json.loads(decrypt(blob, [_identity(vault)]))
+        assert secret == {
+            "number": VISA,
+            "exp_month": 12,
+            "exp_year": int(FUTURE[-2:]) + 2000,
+            "v": 1,
+            "cvc": "123",
+            "name": "A Person",
+            "postal_code": "00000",
+        }
+
+    def test_needs_a_scope(self, vault):
+        with pytest.raises(vs.VaultError, match="merchant scope"):
+            _add(vault, merchant=None, single_use=False)
+        assert vs.list_cards(vault) == []
+        _add(vault, merchant=None, single_use=True)
+        assert vs.list_cards(vault)[0]["single_use"] == 1
+
+    def test_merchant_is_a_bare_host(self, vault):
+        _add(vault, merchant=" Shop.Example.COM. ")
+        assert vs.list_cards(vault)[0]["merchant"] == "shop.example.com"
+        for bad in (
+            "https://shop.example.com",
+            "shop",
+            "shop.example.com/pay",
+            "a b.com",
+            "shop.example.com\n.",
+        ):
+            with pytest.raises(vs.VaultError, match="bare host"):
+                _add(vault, merchant=bad)
+
+    def test_refuses_a_card_number_in_the_clear_label(self, vault):
+        with pytest.raises(vs.VaultError, match="label") as exc:
+            _add(vault, label=f"card {VISA}")
+        assert VISA not in str(exc.value)
+        assert vs.list_cards(vault) == []
+
+    def test_refuses_a_card_number_in_the_clear_merchant(self, vault):
+        with pytest.raises(vs.VaultError, match="merchant") as exc:
+            _add(vault, merchant=f"{VISA}.com")
+        assert VISA not in str(exc.value)
+
+    def test_refuses_a_vault_whose_files_are_not_private(self, vault):
+        os.chmod(vault / vs.CARDS, 0o644)
+        with pytest.raises(vs.VaultError, match="not private"):
+            _add(vault)
+
+    @pytest.mark.parametrize("label", ["", "   ", "a\x1b[2Jb", "line\nbreak", "x" * 101])
+    def test_label_must_be_short_and_printable(self, vault, label):
+        with pytest.raises(vs.VaultError, match="printable"):
+            _add(vault, label=label)
+
+    @pytest.mark.parametrize("target", ["dangling", "loose file"])
+    def test_a_symlinked_cards_db_is_refused(self, vault, target):
+        db = vault / vs.CARDS
+        db.unlink()
+        if target == "loose file":
+            victim = vault.parent / "victim.db"
+            victim.write_bytes(b"")
+            db.symlink_to(victim)
+        else:
+            db.symlink_to(vault / "nowhere")
+        with pytest.raises(vs.VaultError):
+            vs.list_cards(vault)
+        with pytest.raises(vs.VaultError):
+            _add(vault)
+
+    def test_garbage_recipient_is_a_vault_error(self, vault):
+        (vault / vs.RECIPIENT).write_text("not a key\n")
+        with pytest.raises(vs.VaultError, match="recipient.txt"):
+            _add(vault)
+        assert vs.list_cards(vault) == []
+
+    def test_formats_are_versioned(self, vault):
+        _add(vault)
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            assert conn.execute("PRAGMA user_version").fetchone() == (1,)
+            (blob,) = conn.execute("SELECT blob FROM cards").fetchone()
+        assert json.loads(decrypt(blob, [_identity(vault)]))["v"] == 1
+
+    def test_a_newer_format_is_refused(self, vault):
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            conn.execute("PRAGMA user_version = 2")
+        with pytest.raises(vs.VaultError, match="format version 2"):
+            vs.list_cards(vault)
+
+    def test_punycode_merchant(self, vault):
+        _add(vault, merchant="shop.xn--p1ai")
+        assert vs.list_cards(vault)[0]["merchant"] == "shop.xn--p1ai"
+
+    def test_needs_an_initialised_vault(self, tmp_path):
+        with pytest.raises(vs.VaultError, match="not initialised"):
+            _add(tmp_path / "none")
+
+    def test_the_table_refuses_an_unscoped_card(self, vault):
+        _add(vault)
+        with sqlite3.connect(vault / vs.CARDS) as conn, pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO cards (card_ref, label, brand, last4, merchant, single_use,"
+                " status, created_at, blob) VALUES ('x', 'l', 'visa', '4242', NULL, 0,"
+                " 'active', 't', x'00')"
+            )
+
+
+class TestRetire:
+    @pytest.mark.parametrize("ref", [VISA, "card_xyz", "card_" + "0" * 12])
+    def test_malformed_or_unknown_ref_is_refused_without_echo(self, vault, ref):
+        _add(vault)
+        with pytest.raises(vs.VaultError) as exc:
+            vs.retire_card(ref, PASSPHRASE, vault)
+        assert VISA not in str(exc.value)
+
+    def test_retire_refuses_a_vault_whose_files_are_not_private(self, vault):
+        ref = _add(vault)
+        os.chmod(vault / vs.CARDS, 0o644)
+        with pytest.raises(vs.VaultError, match="not private"):
+            vs.retire_card(ref, PASSPHRASE, vault)
+        os.chmod(vault / vs.CARDS, 0o600)
+        assert vs.list_cards(vault)[0]["status"] == "active"
+
+    def test_wrong_passphrase_changes_nothing(self, vault):
+        ref = _add(vault)
+        with pytest.raises(vs.VaultError, match="wrong passphrase"):
+            vs.retire_card(ref, "not it", vault)
+        assert vs.list_cards(vault)[0]["status"] == "active"
+
+    def test_retire_erases_the_blob(self, vault):
+        ref = _add(vault)
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            (blob,) = conn.execute("SELECT blob FROM cards").fetchone()
+        vs.retire_card(ref, PASSPHRASE, vault)
+        [card] = vs.list_cards(vault)
+        assert card["status"] == "retired" and card["retired_at"]
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            assert conn.execute("SELECT blob FROM cards").fetchone() == (None,)
+        # secure_delete: the ciphertext does not linger in a free page.
+        raw = (vault / vs.CARDS).read_bytes()
+        assert blob[:64] not in raw and blob[-64:] not in raw
+        with pytest.raises(vs.VaultError, match="no active card"):
+            vs.retire_card(ref, PASSPHRASE, vault)
+
+
+class TestStatus:
+    def test_counts_and_modes(self, vault):
+        _add(vault)
+        status = vs.vault_status(vault)
+        assert status["initialised"] and status["cards"] == {"active": 1, "retired": 0}
+        assert all(f["private"] for f in status["files"].values())
+        os.chmod(vault / vs.CARDS, 0o644)
+        assert vs.vault_status(vault)["files"][vs.CARDS]["private"] is False
+
+    def test_corrupt_db_is_reported_not_raised(self, vault):
+        (vault / vs.CARDS).write_bytes(b"not a database" * 100)
+        status = vs.vault_status(vault)
+        assert status["cards"] is None and "unreadable" in status["error"]
+        with pytest.raises(vs.VaultError, match="unreadable"):
+            vs.list_cards(vault)
+
+    def test_a_locked_db_says_so_rather_than_damaged(self, vault, monkeypatch):
+        class Locked:
+            def execute(self, *a):
+                raise sqlite3.OperationalError("database is locked")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(vs.sqlite3, "connect", lambda *a, **k: Locked())
+        with pytest.raises(vs.VaultError, match="could not be opened .database is locked"):
+            vs.list_cards(vault)
+
+    def test_no_vault(self, tmp_path):
+        status = vs.vault_status(tmp_path / "none")
+        assert status == {
+            "path": str(tmp_path / "none"),
+            "initialised": False,
+            "cards": {"active": 0, "retired": 0},
+            "files": {},
+            "error": None,
+        }

@@ -1168,4 +1168,7 @@ jobs:
         # +13, test_memory_mcp +6, test_reference_extraction +4,
         # test_output_scanner +3, test_browser_cli_card_guard +4); no added
         # skips. Floor: 25319 + 189 = 25508.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25508
+        # Card vault store and CLI: +78 collected (test_vault_store 51,
+        # test_vault_cli 27; pyrage and zxcvbn are in the test extra, so no
+        # skips). Floor: 25508 + 78 = 25586.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25586
