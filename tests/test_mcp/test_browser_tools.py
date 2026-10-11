@@ -63,6 +63,10 @@ def _reset_browser_state(monkeypatch, tmp_path):
     # point at the live profiles.
     monkeypatch.setattr(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile")
     monkeypatch.setattr(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile")
+    # The Chromium fallback prefers patchright when it is installed; tests run the
+    # same path everywhere, patchright absent unless a test installs a stub.
+    monkeypatch.setattr(browser, "_patchright_installed", lambda: False)
+    monkeypatch.setattr(browser, "_warned_no_patchright", False)
     # The stale-module guard records which browser modules were loaded; a test
     # that stubs one in sys.modules must not leave its record behind.
     monkeypatch.setattr(packages, "_loaded", dict(packages._loaded))
@@ -208,6 +212,92 @@ class TestProfileBackupBeforeLaunch:
         assert order == [("backup", browser._CHROMIUM_PROFILE_DIR, "playwright", True), ("launch",)]
 
 
+class TestPatchrightChromium:
+    """The Chromium fallback runs through patchright, which hides the automation
+    signals plain Playwright leaves, whenever patchright is installed."""
+
+    @staticmethod
+    def _starter(order=None):
+        pw = MagicMock()
+        pw.chromium.launch_persistent_context = AsyncMock(return_value=MagicMock(pages=[_alive_page()]))
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=pw)
+        return starter, pw
+
+    @staticmethod
+    def _stub(name, starter):
+        api = MagicMock(async_playwright=MagicMock(return_value=starter))
+        return patch.dict(sys.modules, {name: MagicMock(async_api=api), f"{name}.async_api": api})
+
+    @pytest.mark.asyncio
+    async def test_patchright_is_used_when_installed(self, monkeypatch):
+        from genesis.browser import packages, profile_backup
+
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        backup = MagicMock()
+        monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+        guard = MagicMock()
+        monkeypatch.setattr(packages, "check_loaded_browser_modules", guard)
+        starter, pw = self._starter()
+        with self._stub("patchright", starter):
+            await browser._ensure_chromium_fallback()
+        starter.start.assert_awaited_once()
+        assert backup.call_args.args == (browser._CHROMIUM_PROFILE_DIR, "patchright")
+        assert guard.call_args.args == (("patchright",),)  # patchright never imports playwright
+        kw = pw.chromium.launch_persistent_context.call_args.kwargs
+        assert kw["no_viewport"] is True and "viewport" not in kw
+
+    @pytest.mark.asyncio
+    async def test_plain_playwright_only_without_patchright(self, monkeypatch, caplog):
+        from genesis.browser import profile_backup
+
+        backup = MagicMock()
+        monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+        starter, _ = self._starter()
+        with self._stub("playwright", starter):
+            await browser._ensure_chromium_fallback()
+        starter.start.assert_awaited_once()
+        assert backup.call_args.args[1] == "playwright"
+        assert "patchright is not installed" in caplog.text
+        assert "install the Genesis `browser` extra" in caplog.text
+        caplog.clear()
+        browser._stealth_page = None
+        await browser._cleanup_chromium()
+        with self._stub("playwright", self._starter()[0]):
+            await browser._ensure_chromium_fallback()
+        assert "patchright is not installed" not in caplog.text  # once per process
+
+    @pytest.mark.asyncio
+    async def test_a_broken_patchright_is_reported_not_swapped(self, monkeypatch):
+        """Switching silently to the detectable Chromium would hide the broken install."""
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        starter, _ = self._starter()
+        with (
+            patch.dict(sys.modules, {"patchright": None, "patchright.async_api": None}),
+            self._stub("playwright", starter),
+            pytest.raises(ImportError),
+        ):
+            await browser._ensure_chromium_fallback()
+        starter.start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_js_runs_in_the_main_world_on_patchright(self):
+        """patchright evaluates in an isolated world by default (isolated_context=True,
+        READ in patchright 1.62.3), where the page's own globals are invisible."""
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=1)
+        type(page).__module__ = "patchright.async_api._generated"
+        assert await browser._evaluate_main_world(page, "1") == 1
+        page.evaluate.assert_awaited_once_with("1", isolated_context=False)
+
+    @pytest.mark.asyncio
+    async def test_run_js_is_unchanged_on_other_pages(self):
+        page = AsyncMock()
+        page.evaluate = AsyncMock(return_value=2)
+        assert await browser._evaluate_main_world(page, "2") == 2
+        page.evaluate.assert_awaited_once_with("2")
+
+
 class TestExplicitEngine:
     """Every Camoufox launch passes the resolved engine as executable_path, and a
     launch with no launchable engine is refused before anything starts. Without an
@@ -340,15 +430,15 @@ class TestExplicitEngine:
     @pytest.mark.parametrize(
         "launch",
         [
-            lambda: browser._ensure_chromium_fallback(),
             lambda: browser._ensure_remote_cdp("http://127.0.0.1:9222"),
             lambda: browser._ensure_tinyfish_browser("https://example.com"),
         ],
-        ids=["chromium", "remote_cdp", "tinyfish"],
+        ids=["remote_cdp", "tinyfish"],
     )
     @pytest.mark.asyncio
     async def test_playwright_layers_check_only_playwright(self, launch):
-        """A camoufox-only upgrade must not refuse a layer that never imports it."""
+        """A camoufox-only upgrade must not refuse a layer that never imports it.
+        (The Chromium fallback also imports patchright: TestPatchrightChromium.)"""
         from genesis.browser import packages
 
         stub = {

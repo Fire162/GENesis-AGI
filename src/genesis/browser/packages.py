@@ -19,8 +19,8 @@ from importlib import metadata
 from genesis.browser.engine import PACKAGE_HINT
 
 BROWSER_DISTS = ("camoufox", "playwright", "patchright")
-# The Chromium fallback, remote CDP and TinyFish import playwright only, so a
-# camoufox upgrade is no reason to refuse them.
+# Remote CDP and TinyFish import playwright only (the Chromium fallback checks the
+# one package it runs), so a camoufox upgrade is no reason to refuse them.
 PLAYWRIGHT_ONLY = ("playwright",)
 
 

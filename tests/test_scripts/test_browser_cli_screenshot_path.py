@@ -29,7 +29,7 @@ _STAMP = re.compile(r"^\d{8}T\d{12}Z$")
 def _load_cli():
     """Import the standalone CLI WITHOUT requiring playwright.
 
-    `scripts/browser.py` imports `playwright.sync_api` at module scope, and CI
+    `scripts/browser.py` once imported `playwright.sync_api` at module scope, and CI
     does not install playwright. Guarding this class with a `skipif` therefore
     meant the CLI half of the fix had ZERO coverage on the one machine that
     gates merges — it was only ever verified on a developer box that happened

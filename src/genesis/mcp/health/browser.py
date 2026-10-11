@@ -491,8 +491,44 @@ async def _ensure_browser():
         return _stealth_page
 
 
+def _patchright_installed() -> bool:
+    # Package metadata, not an import: a half-removed patchright whose metadata
+    # remains still counts as installed, so its import failure is reported.
+    return packages.installed_versions().get("patchright") is not None
+
+
+_warned_no_patchright = False
+
+
+def _chromium_package() -> str:
+    """The package the Chromium fallback runs through: patchright, which hides the
+    automation signals plain Playwright leaves, whenever it is installed."""
+    global _warned_no_patchright
+    if _patchright_installed():
+        return "patchright"
+    if not _warned_no_patchright:
+        _warned_no_patchright = True
+        logger.warning(
+            "patchright is not installed; the Chromium fallback uses plain Playwright, "
+            "which sites can detect. Operator step: %s",
+            engine.PACKAGE_HINT,
+        )
+    return "playwright"
+
+
+def _chromium_async_playwright(package: str):
+    """``async_playwright`` from ``package``. An installed patchright whose import
+    fails is re-raised: switching silently to the detectable Chromium would hide
+    the broken install."""
+    if package == "patchright":
+        from patchright.async_api import async_playwright
+    else:
+        from playwright.async_api import async_playwright
+    return async_playwright
+
+
 async def _ensure_chromium_fallback():
-    """Lazily initialize Playwright Chromium as fallback browser.
+    """Lazily initialize the Chromium fallback browser (patchright when installed).
 
     Use only when Camoufox fails on a specific site. Persistent profile at
     ~/.genesis/browser-profile/ (separate from Camoufox profile).
@@ -508,11 +544,12 @@ async def _ensure_chromium_fallback():
             logger.warning("Chromium page is stale — restarting Chromium")
             await _cleanup_chromium()
 
-        packages.check_loaded_browser_modules(packages.PLAYWRIGHT_ONLY)
-        from playwright.async_api import async_playwright
+        package = _chromium_package()
+        packages.check_loaded_browser_modules((package,))
+        async_playwright = _chromium_async_playwright(package)
 
         await asyncio.to_thread(
-            profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, "playwright"
+            profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
         )
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -526,7 +563,9 @@ async def _ensure_chromium_fallback():
                 headless=False,
                 args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                       "--start-maximized"],
-                viewport={"width": 1280, "height": 720},
+                # patchright's guidance: a fixed viewport is a fingerprint; the
+                # page follows the (maximized) window instead.
+                no_viewport=True,
             )
         except BaseException:
             # Stop the driver this launch started; left running, the next
@@ -3778,6 +3817,20 @@ async def _impl_browser_snapshot() -> dict:
         return {"error": f"Snapshot failed: {e}"}
 
 
+def _is_patchright_page(page) -> bool:
+    return type(page).__module__.startswith("patchright")
+
+
+async def _evaluate_main_world(page, expression: str):
+    """``page.evaluate`` in the page's own JavaScript world. patchright evaluates
+    in an isolated world by default (``isolated_context=True``), where the page's
+    own globals are invisible; browser_run_js is the DevTools console, so it asks
+    for the main world on patchright pages. DOM reads elsewhere work in either."""
+    if _is_patchright_page(page):
+        return await page.evaluate(expression, isolated_context=False)
+    return await page.evaluate(expression)
+
+
 async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
@@ -3797,7 +3850,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
             return refused
         try:
             logger.info("browser_run_js: %s", expression[:200])
-            result = await page.evaluate(expression)
+            result = await _evaluate_main_world(page, expression)
             _update_remote_url()  # JS may cause navigation
             return {"result": result, "url": page.url}
         except Exception as e:
