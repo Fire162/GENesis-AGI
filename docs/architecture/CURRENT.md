@@ -1479,7 +1479,13 @@ verified: 637f7f7bb679 2026-10-05
   out; a copy the profile changed under is discarded; never blocks the launch).
   `scripts/browser.py` copies too. The Chromium fallback and that CLI run
   through patchright when installed. `scripts/disk_hygiene.sh` keeps
-  the newest copy per profile, and the newest per version for 90 days. The automation TOOLS live in
+  the newest copy per profile, and the newest per version for 90 days.
+  `provision.py` (run by `scripts/install_browser_stack.sh`,
+  unit `genesis-browser-stack.service`) installs what the tools launch: the
+  engine the camoufox package pairs with (only from camoufox 0.5.7: 0.4's fetch
+  empties the cache and 0.5.3-0.5.6 have no pin), patchright's
+  Chromium, and their system libraries (`install-deps` through `sudo -n`, else
+  the command is printed). One outcome line; a re-run is a no-op. The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
   TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
   1 h idle reclaim of one layer never touches another (TinyFish included:
