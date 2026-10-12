@@ -1049,4 +1049,9 @@ jobs:
         # +116 (new), test_memory_mcp +7, test_browser_tools +4, test_reference_extraction
         # +4, test_browser_cli_card_guard +4 (new), test_output_scanner +3,
         # test_capability_shadow_wiring +1; no added skips. Floor: 25548 + 139 = 25687.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25687
+        # Peer execution replacement: measured collection against 806b12cd0:
+        # peer_segments new90 + peer_rework new60 + native controls new4;
+        # observability/test_spans 16 ->38 (+22). Net176; floor25687 ->25863.
+        # Native CLI controls skip on runners without Claude. Keep the ceiling
+        # unchanged until the actual CI junit report establishes their delta.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25863
