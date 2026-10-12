@@ -1066,4 +1066,9 @@ jobs:
         # peer_rework 60, native controls 4, test_spans 22) lands on different
         # files than main's smb/deploy-backup deltas above, so no overlap.
         # Floor: 25718 + 176 = 25894.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25894
+        # test_peer_native.py's 4 cases (2 mode x 2 auth) skipif-skip when the
+        # `claude` executable is absent, which it is in this job (#3241 Codex
+        # P1): raise the ceiling 104 -> 108 for these intentional skips. The
+        # build/review session runs them on its own pin; CI does not install
+        # the native CLI, by design (see the test file's own docstring).
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 108 --min-collected 25894
