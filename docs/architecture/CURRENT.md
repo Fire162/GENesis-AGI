@@ -3109,7 +3109,8 @@ verified: ba9dd8a37 2026-10-09
   `vault_store.py` keeps `~/.genesis/payment_vault/` (0700, files 0600): an age
   X25519 identity sealed under the owner's passphrase (zxcvbn score 4), its
   public key, and `cards.db`, whose card details exist only as age blobs
-  encrypted to that key. `add` needs no passphrase and requires a merchant
+  encrypted to that key; cards.db also records the sealed key's sha256, checked
+  (with no passphrase) before any add, so a damaged key is refused. `add` needs no passphrase and requires a merchant
   scope or `--single-use`; init/add/retire need a TTY and refuse inside a
   coding agent's session, Claude Code or Codex (accident guard). Needs the `payments` extra. No runtime
   caller yet: nothing decrypts a card, and the directory is not backed up.

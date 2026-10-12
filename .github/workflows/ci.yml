@@ -1056,7 +1056,7 @@ jobs:
         # tests/test_scripts/test_codebase_managed_config.py +1,
         # tests/test_scripts/test_session_doors.py +6. No added skips.
         # Floor: 25687 + 1 + 3 + 1 + 6 = 25698.
-        # Card vault store and CLI (#3194): +120 collected, measured with
-        # --collect-only (test_vault_store 84, test_vault_cli 36, both new; pyrage
-        # and zxcvbn are in the test extra, so no skips). Floor: 25698 + 120 = 25818.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25818
+        # Card vault store and CLI (#3194): +128 collected, measured with
+        # --collect-only (test_vault_store 92, test_vault_cli 36, both new; pyrage
+        # and zxcvbn are in the test extra, so no skips). Floor: 25698 + 128 = 25826.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25826
