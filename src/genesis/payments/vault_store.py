@@ -150,13 +150,20 @@ def _read_regular(name: str, dir_fd: int, limit: int | None = None) -> bytes:
 
 @contextmanager
 def _dir_lock(path: Path):
-    """Hold an exclusive lock on the vault directory (one init at a time).
+    """Hold an exclusive lock on the vault directory (one writer at a time).
 
-    Yields the directory's file descriptor. Init writes through it, so every
-    file it publishes lands in the directory it locked even if another
-    directory is moved onto the path meanwhile.
+    Yields the directory's file descriptor. Init, add and retire write through
+    it, so everything they touch lands in the directory they locked even if
+    another directory is moved onto the path meanwhile.
     """
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise VaultError(
+            "the vault is not initialised; run `python -m genesis vault init`"
+        ) from None
+    except OSError as exc:
+        raise VaultError(f"the vault directory cannot be opened ({exc.strerror})") from None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield fd
@@ -164,7 +171,25 @@ def _dir_lock(path: Path):
         os.close(fd)
 
 
-_RECIPIENT_TEXT = re.compile(r"age1[0-9a-z]+")
+# An age X25519 recipient: "age1" plus 58 Bech32 characters (32 key bytes and
+# a 6-character checksum). The checksum is verified below in the stdlib, so a
+# corrupted key is caught even where pyrage is not installed.
+_BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_RECIPIENT_TEXT = re.compile(rf"age1[{_BECH32}]{{58}}")
+
+
+def _bech32_ok(text: str) -> bool:
+    """BIP-173 Bech32 checksum (age uses Bech32, not Bech32m)."""
+    hrp, data = text[:3], [_BECH32.index(c) for c in text[4:]]
+    chk = 1
+    for value in [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + data:
+        top = chk >> 25
+        chk = (chk & 0x1FFFFFF) << 5 ^ value
+        for i, gen in enumerate((0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)):
+            chk ^= gen if (top >> i) & 1 else 0
+    return chk == 1
+
+
 # What `age_passphrase.encrypt` writes first: the header and a scrypt stanza.
 _SEALED_HEADER = b"age-encryption.org/v1\n-> scrypt "
 
@@ -177,7 +202,7 @@ def _recipient_text(path: Path) -> str:
         raise VaultError(f"recipient.txt cannot be read ({exc.strerror})") from None
     except UnicodeDecodeError:
         text = ""
-    if not _RECIPIENT_TEXT.fullmatch(text):
+    if not (_RECIPIENT_TEXT.fullmatch(text) and _bech32_ok(text)):
         raise VaultError(
             "recipient.txt does not hold a valid age public key; restore the vault from backup"
         )
@@ -204,7 +229,7 @@ def _check_identity(path: Path) -> None:
     pyrage 1.4.0). A file cut anywhere fails this, before a card is sealed to
     a key whose secret half is gone.
     """
-    dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         data = _read_regular(IDENTITY, dfd, 4096)
     except OSError as exc:
@@ -270,6 +295,12 @@ def _db(path: Path):
     conn = None
     try:
         conn = sqlite3.connect(f"file:{quote(str(db))}?mode=rw", uri=True)
+        # SQLite follows symlinks (its nofollow=1 URI flag does not refuse one
+        # here: MEASURED on 3.45.1), so check the file opened is still the
+        # regular file checked above, not something swapped in since.
+        opened = os.stat(db)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise VaultError("cards.db changed while it was being opened; try again")
         conn.execute("PRAGMA secure_delete = ON")
         shape = _shape(conn)
         if shape != "vault":
@@ -537,14 +568,42 @@ def add_card(
     from pyrage import encrypt
 
     path = path or vault_dir()
-    check_ready(path)
     merchant = check_entry(label, merchant, single_use)
-    recipient = _read_recipient(path)
-    secret = {"v": BLOB_VERSION}
-    secret.update({k: card[k] for k in ("number", "exp_month", "exp_year", "cvc")})
-    secret.update(name=name, postal_code=postal_code)
-    blob = encrypt(json.dumps(secret).encode(), [recipient])
-    ref = "card_" + secrets.token_hex(6)
+    with _dir_lock(path) as dfd:
+        _pin(path, dfd)  # the checks below read the locked directory, not a later one
+        check_ready(path)
+        pinned = _pin(path, dfd)
+        recipient = _read_recipient(pinned)
+        secret = {"v": BLOB_VERSION}
+        secret.update({k: card[k] for k in ("number", "exp_month", "exp_year", "cvc")})
+        secret.update(name=name, postal_code=postal_code)
+        try:
+            blob = encrypt(json.dumps(secret).encode(), [recipient])
+        except Exception as exc:  # noqa: BLE001 - never a raw library error, never a value
+            raise VaultError(f"the card could not be encrypted ({type(exc).__name__})") from None
+        ref = "card_" + secrets.token_hex(6)
+        _insert_card(pinned, ref, card, label, merchant, single_use, blob)
+    return ref
+
+
+def _pin(path: Path, dfd: int) -> Path:
+    """The locked directory, if it is still the one at ``path``, as a path through its fd.
+
+    Everything read or written after the checks goes through this path, so a
+    vault directory moved onto ``path`` meanwhile is never mixed with the one
+    that was checked: the key and the database always come from one directory.
+    """
+    try:
+        live = os.lstat(path)
+    except OSError as exc:
+        raise VaultError(f"the vault directory cannot be checked ({exc.strerror})") from None
+    held = os.fstat(dfd)
+    if (live.st_dev, live.st_ino) != (held.st_dev, held.st_ino):
+        raise VaultError("the vault directory was replaced during the operation; try again")
+    return Path(f"/proc/self/fd/{dfd}")
+
+
+def _insert_card(path, ref, card, label, merchant, single_use, blob) -> None:
     with _db(path) as conn, conn:
         conn.execute(
             "INSERT INTO cards (card_ref, label, brand, last4, merchant, single_use, status,"
@@ -560,7 +619,6 @@ def add_card(
                 blob,
             ),
         )
-    return ref
 
 
 def list_cards(path: Path | None = None) -> list[dict]:
@@ -623,9 +681,15 @@ def verify_passphrase(passphrase: str, path: Path | None = None) -> None:
 def retire_card(card_ref: str, passphrase: str, path: Path | None = None) -> None:
     """Mark a card retired and clear its encrypted blob. Needs the passphrase."""
     path = path or vault_dir()
-    check_ready(path)
-    check_active_card(card_ref, path)
-    verify_passphrase(passphrase, path)
+    with _dir_lock(path) as dfd:
+        _pin(path, dfd)  # the checks below read the locked directory, not a later one
+        check_ready(path)
+        check_active_card(card_ref, path)
+        verify_passphrase(passphrase, path)
+        _retire_row(_pin(path, dfd), card_ref)
+
+
+def _retire_row(path: Path, card_ref: str) -> None:
     with _db(path) as conn, conn:
         cur = conn.execute(
             "UPDATE cards SET status = 'retired', retired_at = ?, blob = NULL"

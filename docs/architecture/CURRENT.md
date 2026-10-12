@@ -3111,7 +3111,7 @@ verified: ba9dd8a37 2026-10-09
   public key, and `cards.db`, whose card details exist only as age blobs
   encrypted to that key. `add` needs no passphrase and requires a merchant
   scope or `--single-use`; init/add/retire need a TTY and refuse inside a
-  Claude Code session (accident guard). Needs the `payments` extra. No runtime
+  coding agent's session, Claude Code or Codex (accident guard). Needs the `payments` extra. No runtime
   caller yet: nothing decrypts a card, and the directory is not backed up.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
