@@ -1071,4 +1071,7 @@ jobs:
         # P1): raise the ceiling 104 -> 108 for these intentional skips. The
         # build/review session runs them on its own pin; CI does not install
         # the native CLI, by design (see the test file's own docstring).
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 108 --min-collected 25894
+        # Peer status-isolation regression tests (#3241 Codex P2s): 4 new
+        # cases in test_peer_segments.py (90 -> 94), no skips.
+        # Floor: 25894 + 4 = 25898.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 108 --min-collected 25898

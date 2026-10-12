@@ -3200,8 +3200,10 @@ class CCInvoker:
             await self._notify_status_change(err)
             raise err
 
-        # Success — notify recovery if we were previously in error state
-        if self._last_was_error:
+        # Success — notify recovery if we were previously in error state.
+        # Peer-only: a peer success on its own routed provider never implies
+        # the owner's Claude account recovered.
+        if self._last_was_error and invocation.peer_segment is None:
             await self._notify_status_change(None)
         await self._fire_downgrade_callback(output)
         # Silent-cap detection: a non-error, non-rate-limited return that reached
@@ -3820,7 +3822,11 @@ class CCInvoker:
                     err = CCRateLimitError(
                         "CC rate limited (stream event)", raw_event=rate_limit_raw
                     )
-                    await self._notify_status_change(err)
+                    # Peer-only: a rate_limit_event from a peer's own routed
+                    # provider (anthropic_base_url) says nothing about the
+                    # owner's Claude account — never let it set RATE_LIMITED.
+                    if invocation.peer_segment is None:
+                        await self._notify_status_change(err)
                     await self._fire_downgrade_callback(output)
                     return output
                 # Empty/no response — rate limit prevented a real answer
@@ -3828,7 +3834,8 @@ class CCInvoker:
                     "CC rate limited (stream event)" if invocation.peer_segment is not None else output.text or "CC rate limited (stream event)",
                     raw_event=rate_limit_raw,
                 )
-                await self._notify_status_change(err)
+                if invocation.peer_segment is None:
+                    await self._notify_status_change(err)
                 if oversized_dropped:
                     # A rate-limit error is the one that reaches roster failover,
                     # so this is the branch where a replay costs a SECOND live
@@ -3865,8 +3872,9 @@ class CCInvoker:
                     "the result carried no text — the answer was almost certainly one of them",
                 )
 
-            # Success — notify recovery if previously errored
-            if self._last_was_error:
+            # Success — notify recovery if previously errored. Peer-only: see
+            # the non-streaming success path above.
+            if self._last_was_error and invocation.peer_segment is None:
                 await self._notify_status_change(None)
             await self._fire_downgrade_callback(output)
             # Silent-cap detection: reaching here means is_error=False AND no
@@ -3935,8 +3943,10 @@ class CCInvoker:
                 f"peer session ended without a result (exit={proc.returncode})"
             )
 
-        # No result event — treat collected text as response (success path)
-        if self._last_was_error:
+        # No result event — treat collected text as response (success path).
+        # Peer-only: a returncode-0 peer stream with no result event still
+        # reaches here; see the non-streaming success path above.
+        if self._last_was_error and invocation.peer_segment is None:
             await self._notify_status_change(None)
         output = CCOutput(
             session_id="",

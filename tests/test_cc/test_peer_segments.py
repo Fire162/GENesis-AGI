@@ -717,3 +717,160 @@ async def test_owner_stream_without_result_is_unchanged_by_peer_exit_rule(monkey
     assert not output.is_error
     assert output.text == "partial"
     assert output.exit_code == -9
+
+
+def _stream_peer_events(invoker, monkeypatch, events, returncode=0):
+    # Same launch-mechanics monkeypatches as _stream_without_result, but feeds
+    # an arbitrary event stream (e.g. a rate_limit_event) instead of a single
+    # partial-text line with no result.
+    monkeypatch.setattr(PeerSegment, "launch_args", lambda self, args, env, cwd, props: self.scope_args(props) + args)
+    monkeypatch.setattr(invoker_module.roster, "apply_active", lambda inv: (inv, ""))
+    monkeypatch.setattr(invoker_module, "inflight", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(invoker_module, "set_oom_score_adj", lambda *args: None)
+    monkeypatch.setattr(invoker_module, "process_group_alive", lambda proc: False)
+    monkeypatch.setattr(invoker_module, "kill_process_group", lambda proc: None)
+    monkeypatch.setattr(invoker, "_network_preflight", AsyncMock())
+    monkeypatch.setattr(invoker, "verify_allowlist_enforceable", AsyncMock())
+    monkeypatch.setattr(invoker, "_build_env", lambda inv: {})
+    monkeypatch.setattr(invoker, "_apply_login_fallback", AsyncMock(side_effect=lambda env, inv: env))
+    monkeypatch.setattr(invoker, "_launch_env", lambda env, inv: env)
+    monkeypatch.setattr(invoker, "_with_cost_semantics", AsyncMock(side_effect=lambda output: output))
+    monkeypatch.setattr(PeerSegment, "stop_and_drain", AsyncMock())
+    monkeypatch.setattr(invoker_module, "_settings_env_pins", lambda *args: {})
+    data = b"\n".join(json.dumps(event).encode() for event in events) + b"\n"
+    proc = MagicMock(pid=42002, returncode=returncode)
+    proc.wait = AsyncMock(return_value=returncode)
+    proc.stdin.drain = AsyncMock()
+    proc.stdout = asyncio.StreamReader()
+    proc.stdout.feed_data(data)
+    proc.stdout.feed_eof()
+    proc.stderr = asyncio.StreamReader()
+    proc.stderr.feed_eof()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
+
+
+async def test_peer_success_cannot_clear_the_owner_cli_limited_state(
+    peer_invocation, monkeypatch
+):
+    # A returncode-0 peer stream with no result event is the success path
+    # that reuses collected text (test_clean_peer_stream_without_result_keeps_
+    # collected_text). If the owner's CLI is currently marked limited, that
+    # unrelated peer success must never clear it.
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    _stream_without_result(invoker, monkeypatch, 0)
+    invoker._last_was_error = True
+    notify = AsyncMock()
+    monkeypatch.setattr(invoker, "_notify_status_change", notify)
+    output = await invoker.run_streaming(peer_invocation)
+    assert not output.is_error
+    notify.assert_not_awaited()
+    assert invoker._last_was_error is True
+
+
+async def test_peer_rate_limit_event_cannot_mark_the_owner_rate_limited(
+    peer_invocation, monkeypatch
+):
+    # A rate_limit_event is a signal from the PEER's own routed provider
+    # (anthropic_base_url), not the owner's Claude account. Neither the
+    # with-content nor the empty-response branch may set RATE_LIMITED.
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "peer reply"}]}},
+        {"type": "rate_limit_event", "info": {}},
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "peer reply",
+            "session_id": "s1",
+            "total_cost_usd": 0.0,
+            "duration_ms": 10,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
+        },
+    ]
+    _stream_peer_events(invoker, monkeypatch, events)
+    notify = AsyncMock()
+    monkeypatch.setattr(invoker, "_notify_status_change", notify)
+    output = await invoker.run_streaming(peer_invocation)
+    assert output.text == "peer reply"
+    notify.assert_not_awaited()
+
+
+async def test_peer_rate_limit_event_with_empty_response_cannot_mark_owner_rate_limited(
+    peer_invocation, monkeypatch
+):
+    from genesis.cc.exceptions import CCRateLimitError
+
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "rate_limit_event", "info": {}},
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "",
+            "session_id": "s1",
+            "total_cost_usd": 0.0,
+            "duration_ms": 10,
+            "usage": {"input_tokens": 1, "output_tokens": 0},
+            "modelUsage": {},
+        },
+    ]
+    _stream_peer_events(invoker, monkeypatch, events)
+    notify = AsyncMock()
+    monkeypatch.setattr(invoker, "_notify_status_change", notify)
+    with pytest.raises(CCRateLimitError):
+        await invoker.run_streaming(peer_invocation)
+    notify.assert_not_awaited()
+
+
+async def test_peer_non_streaming_success_cannot_clear_the_owner_cli_limited_state(
+    peer_invocation, monkeypatch
+):
+    # The non-streaming run() path's own recovery block (same class of bug as
+    # the streaming sites above): a peer success on its own routed provider
+    # must never clear an owner CLI-limited state.
+    monkeypatch.setattr(PeerSegment, "launch_args", lambda self, args, env, cwd, props: self.scope_args(props) + args)
+    monkeypatch.setattr(invoker_module.roster, "apply_active", lambda inv: (inv, ""))
+    monkeypatch.setattr(invoker_module, "inflight", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(invoker_module, "set_oom_score_adj", lambda *args: None)
+    monkeypatch.setattr(invoker_module, "process_group_alive", lambda proc: False)
+    monkeypatch.setattr(invoker_module, "kill_process_group", lambda proc: None)
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    monkeypatch.setattr(invoker, "_network_preflight", AsyncMock())
+    monkeypatch.setattr(invoker, "verify_allowlist_enforceable", AsyncMock())
+    monkeypatch.setattr(invoker, "_build_env", lambda inv: {})
+    monkeypatch.setattr(invoker, "_apply_login_fallback", AsyncMock(side_effect=lambda env, inv: env))
+    monkeypatch.setattr(invoker, "_launch_env", lambda env, inv: env)
+    monkeypatch.setattr(invoker, "_with_cost_semantics", AsyncMock(side_effect=lambda output: output))
+    monkeypatch.setattr(PeerSegment, "stop_and_drain", AsyncMock())
+    monkeypatch.setattr(invoker_module, "_settings_env_pins", lambda *args: {})
+    invoker._last_was_error = True
+    notify = AsyncMock()
+    monkeypatch.setattr(invoker, "_notify_status_change", notify)
+
+    result_line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "peer reply",
+            "session_id": "sess-peer-1",
+            "total_cost_usd": 0.0,
+            "duration_ms": 10,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
+        }
+    )
+    proc = MagicMock(pid=42003, returncode=0)
+    proc.communicate = AsyncMock(return_value=(result_line.encode(), b""))
+    proc.wait = AsyncMock(return_value=0)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
+
+    output = await invoker.run(peer_invocation)
+    assert not output.is_error
+    notify.assert_not_awaited()
+    assert invoker._last_was_error is True
