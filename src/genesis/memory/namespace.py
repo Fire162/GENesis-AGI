@@ -24,10 +24,27 @@ def is_namespaced_id(memory_id: str) -> bool:
     return len(memory_id) == 36 and memory_id[14] == "8"
 
 
+# An owner deletion waits for a writer that holds this ID across its whole
+# pipeline (embedding chain, vector upsert, SQLite writes), so the SQLite busy
+# timeout is the wrong bound for it. Five minutes covers the embedding fallback
+# chain at its per-request timeouts; on expiry the deletion still records its
+# permanent identity tombstone and an open delete intent that the reconcile lane
+# completes, so expiry delays removal and loses nothing.
+DELETE_LOCK_WAIT_S = 300.0
+
+
+class NamespaceLockBusy(TimeoutError):
+    """Raised only while ACQUIRING a per-ID lock, never from the locked body."""
+
+
 @asynccontextmanager
-async def write_lock(path: Path, memory_id: str):
-    """Kernel-owned per-ID lock; cancellation/crash cannot strand a lease."""
+async def write_lock(path: Path, memory_id: str, *, timeout: float | None = None):
+    """Kernel-owned per-ID lock; cancellation/crash cannot strand a lease.
+
+    ``timeout`` bounds acquisition only (default: the SQLite busy timeout).
+    """
     path = Path(path)
+    wait = db_busy_timeout_ms() / 1000 if timeout is None else timeout
     if str(uuid.UUID(memory_id)) != memory_id or uuid.UUID(memory_id).version != 8:
         raise ValueError("invalid namespaced memory ID")
     directory = path.parent / ".memory-namespace-locks"
@@ -38,13 +55,16 @@ async def write_lock(path: Path, memory_id: str):
         0o600,
     )
     try:
-        async with asyncio.timeout(db_busy_timeout_ms() / 1000):
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    await asyncio.sleep(0.05)
+        try:
+            async with asyncio.timeout(wait):
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(0.05)
+        except TimeoutError as exc:
+            raise NamespaceLockBusy(f"namespaced memory {memory_id} is busy") from exc
         yield
     finally:
         # Never unlink: another process may already have opened the same inode.
@@ -182,17 +202,36 @@ async def mark_deleted(path: Path, memory_id: str) -> None:
         )
 
 
+async def defer_busy_deletion(db, path: Path, memory_id: str) -> dict:
+    """Owner deletion that could not get the writer lock in time.
+
+    The identity tombstone lands now, so no re-offer or in-flight retry can
+    complete this ID; the open delete intent makes the reconcile lane finish the
+    removal, exactly like a delete deferred by an unreachable vector store.
+    """
+    from genesis.memory.delete_tombstones import enqueue_tombstone
+
+    await mark_deleted(path, memory_id)
+    tombstoned = await enqueue_tombstone(db, memory_id=memory_id, reason="namespace_writer_busy")
+    return {"deferred": True, "tombstoned": tombstoned, "metadata": False, "fts5": False}
+
+
+async def database_path(db) -> Path:
+    """The file behind a connection; namespaced effects need a lockable path."""
+    rows = await (await db.execute("PRAGMA database_list")).fetchall()
+    path = next((row[2] for row in rows if row[1] == "main" and row[2]), None)
+    if path is None:
+        raise ValueError("namespaced memory requires a file-backed database")
+    return Path(path)
+
+
 @asynccontextmanager
 async def recovery_guard(db, memory_id: str):
     """Ordinary recovery is unchanged; namespaced recovery joins writer locks."""
     if not is_namespaced_id(memory_id):
         yield True
         return
-    rows = await (await db.execute("PRAGMA database_list")).fetchall()
-    path = next((row[2] for row in rows if row[1] == "main" and row[2]), None)
-    if path is None:
-        raise ValueError("namespaced recovery requires a file-backed database")
-    async with write_lock(Path(path), memory_id):
+    async with write_lock(await database_path(db), memory_id):
         row = await (
             await db.execute("SELECT status FROM memory_namespaces WHERE memory_id=?", (memory_id,))
         ).fetchone()

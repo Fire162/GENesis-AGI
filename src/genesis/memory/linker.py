@@ -9,6 +9,7 @@ from qdrant_client import QdrantClient
 
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links
+from genesis.memory.namespace import is_namespaced_id
 from genesis.memory.types import LinkRecord
 from genesis.qdrant.collections import search
 
@@ -99,6 +100,8 @@ class MemoryLinker:
                 continue
             if score < similarity_threshold:
                 continue
+            if is_namespaced_id(str(target_id)):
+                continue  # peer memories take no automatic links (crud refuses them)
             if len(links) >= max_links:
                 break
 

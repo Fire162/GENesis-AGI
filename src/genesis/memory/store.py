@@ -16,6 +16,7 @@ from genesis.db.crud import pending_embeddings
 from genesis.db.crud._id_resolve import AMBIGUOUS as _AMBIGUOUS
 from genesis.db.crud._id_resolve import NOT_FOUND as _NOT_FOUND
 from genesis.db.crud._id_resolve import PASSTHROUGH as _PASSTHROUGH
+from genesis.db.crud._id_resolve import normalize_id
 from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
@@ -106,6 +107,7 @@ class SupersedeUnresolved(Exception):
         self.raw_id = raw_id
         # "not_found" | "ambiguous" | "self_supersede" | "successor_deprecated"
         # | "successor_expired" | "successor_vanished" | "successor_deleting"
+        # | "successor_shifted"
         self.reason = reason
         # Whether a deprecation for this pair had ALREADY committed when this
         # was raised. The message asserts the durable state, so it must not
@@ -133,11 +135,19 @@ class SupersedeUnresolved(Exception):
         # States only what was CHECKED. The old wording claimed the old memory
         # "is still live in recall", which for `not_found` is exactly the thing
         # resolution just failed to establish.
-        outcome = (
-            "the deprecation had already committed; its mirror is still outstanding"
-            if committed
-            else "no deprecation was performed"
-        )
+        if reason == "successor_shifted":
+            # The old memory IS deprecated (by an earlier call, to the first
+            # candidate); this call changed nothing. Saying "no deprecation was
+            # performed" would read as "the old memory is live".
+            outcome = (
+                "this call changed nothing: the old memory is already superseded "
+                "by the first match, its recorded successor, which this handle "
+                "names and which no longer resolves; retry with full ids"
+            )
+        elif committed:
+            outcome = "the deprecation had already committed; its mirror is still outstanding"
+        else:
+            outcome = "no deprecation was performed"
         super().__init__(f"{role}={raw_id!r} is {reason}{detail}; {outcome}")
 
 
@@ -152,8 +162,9 @@ class SupersedeIncomplete(Exception):
       search can keep surfacing the superseded memory until repaired.
     * ``"link"`` — the ``succeeded_by`` graph edge was not created.
 
-    Retrying the same ``supersede()`` call is SAFE and is also the repair:
-    the SQLite UPDATE is idempotent, the Qdrant payload write is idempotent,
+    Retrying ``supersede()`` with the FULL ids this exception carries is SAFE
+    and is also the repair (a short handle is re-resolved on retry, and may no
+    longer name the same memory): the SQLite UPDATE is idempotent, the Qdrant payload write is idempotent,
     and an already-created link is tolerated. The retry takes ``supersede()``'s
     REPAIR PATH, which skips successor validation precisely so the guarantee
     holds even if the successor expired or was deprecated in the meantime —
@@ -171,8 +182,26 @@ class SupersedeIncomplete(Exception):
         super().__init__(
             f"supersede {old_id!r} -> {new_id!r} half-finished: the SQLite "
             f"deprecation committed, but the {stage} update failed; retrying "
-            "the same call is safe and completes the remainder"
+            "with these exact ids is safe and completes the remainder"
         )
+
+
+def _is_committed_supersession(meta: dict | None) -> bool:
+    """True when *meta* records an explicit supersession that already committed.
+
+    The supersede repair path keys on this: such a row owes only its mirrors,
+    so a retry completes it without re-validating the successor. A row the
+    dream cycle retired also carries ``superseded_by``, but consolidation wrote
+    it, not an earlier supersede call, so it must take the ordinary validated
+    path. Treating it as a committed supersession would redirect an
+    unresolvable ``new_id`` to the dream successor and report success.
+    """
+    return bool(
+        meta
+        and meta["deprecated"]
+        and meta["superseded_by"]
+        and meta.get("dream_cycle_run_id") is None
+    )
 
 
 class MemoryStore:
@@ -688,6 +717,10 @@ class MemoryStore:
             durability=durability,
             expires_at=expires_at,
             preference_domain=preference_domain,
+            # A namespaced repair re-runs the pipeline with THIS attempt's
+            # values; FTS and the vector payload are replaced, so metadata must
+            # be too, or the stores disagree on tags/wing/confidence.
+            replace=dedup_namespace is not None,
         )
 
         # Mechanical code anchors (entity layer) — regex-only, every write
@@ -722,6 +755,11 @@ class MemoryStore:
             # Queue for later embedding — preserve provenance so the recovery
             # worker can reconstruct the full Qdrant payload.
             # Subsystem writes are FTS5-only permanently, never queue.
+            if dedup_namespace is not None:
+                # A namespaced repair re-runs under the same reserved ID: replace
+                # an earlier attempt's job so at most one row (carrying this
+                # attempt's snapshot) is ever queued for the memory.
+                await pending_embeddings.delete_by_memory(self._db, memory_id=memory_id)
             await pending_embeddings.create(
                 self._db,
                 id=str(uuid.uuid4()),
@@ -802,8 +840,8 @@ class MemoryStore:
         SQLite deprecation committed but a mirror (the Qdrant payload, the
         ``succeeded_by`` link) did not. This path RAISES it rather than
         swallowing it the way ``store(supersedes=...)`` must, because here the
-        caller named both ids and retrying the same call is both safe and the
-        repair. Both ids are locked (sorted order) from validation through the
+        caller named both ids and retrying with the full ids is both safe and
+        the repair (a short handle is re-resolved, and may name another row). Both ids are locked (sorted order) from validation through the
         mirror writes, so a concurrent delete or supersession of the successor
         cannot slip between the check and the write.
 
@@ -821,7 +859,9 @@ class MemoryStore:
         old_id = await self._resolve_supersede_target(old_handle)
         try:
             new_id = await self._resolve_supersede_target(new_handle, role="new_id")
-        except SupersedeUnresolved:
+        except SupersedeUnresolved as exc:
+            if exc.reason != "not_found":
+                raise
             # A committed supersession still owes its mirror, and that debt does
             # NOT depend on the successor still resolving. Resolution runs
             # before the repair-path check below, so without this the documented
@@ -831,7 +871,12 @@ class MemoryStore:
             # `integrity.py` counts `deprecated_divergence` but nothing repairs
             # it. Recover the successor from the row that already committed.
             existing = await memory_crud.get_metadata(self._db, old_id)
-            if not (existing and existing["deprecated"] and existing["superseded_by"]):
+            # Both: an EXPLICIT supersession that committed (a dream retirement
+            # is not one), and the full id the caller named is its successor.
+            if not (
+                _is_committed_supersession(existing)
+                and normalize_id(new_handle) == existing["superseded_by"]
+            ):
                 raise
             new_id = existing["superseded_by"]
         # Self-check BEFORE the locks: sorted() of an equal pair would acquire
@@ -858,8 +903,7 @@ class MemoryStore:
             # skipped for one that is merely being completed.
             existing = await memory_crud.get_metadata(self._db, old_id)
             resuming = (
-                existing is not None
-                and bool(existing["deprecated"])
+                _is_committed_supersession(existing)
                 and existing["superseded_by"] == new_id
             )
             if resuming:
@@ -870,6 +914,44 @@ class MemoryStore:
                     timestamp or datetime.now(UTC).isoformat()
                 )
             else:
+                # SHIFTED-PREFIX GUARD. A short handle is resolved against the
+                # rows that exist NOW, not the row it named when the call was
+                # first made. If an earlier supersede of old_id committed to X
+                # (and, e.g., left a mirror outstanding), X then disappeared,
+                # and another memory sharing the caller's prefix took its
+                # place in resolution, a retry of the SAME call would land
+                # here — not on the repair path, because new_id != X — and
+                # silently re-point the committed correction to a memory the
+                # caller never named. The handle still identifies X (it is a
+                # prefix of X, normalized and matched exactly as the resolver
+                # matches it: lowercase, `id:` stripped, LIKE prefix), so it
+                # names two memories: the recorded successor and the live
+                # match. Like an ambiguous handle, it is never guessed; it
+                # gets its own reason because, unlike "ambiguous", the old
+                # memory IS already deprecated (to X) when this raises.
+                #
+                # A dream-retired old row (its successor written by the dream
+                # cycle, not a supersede call) is refused the same way: the
+                # handle still names that successor, and guessing is never safe.
+                #
+                # Deliberately NOT blocked: a caller that names a DIFFERENT
+                # successor by a handle that does not identify X (a full id,
+                # or a prefix X does not share) is re-pointing on purpose, and
+                # that behaviour is unchanged.
+                committed_to = (
+                    existing["superseded_by"]
+                    if existing is not None and existing["deprecated"]
+                    else None
+                )
+                if (
+                    committed_to
+                    and committed_to != new_id
+                    and committed_to.lower().startswith(normalize_id(new_handle))
+                ):
+                    raise SupersedeUnresolved(
+                        new_handle, "successor_shifted", new_id,
+                        candidates=[committed_to, new_id], role="new_id",
+                    )
                 await self._validate_supersede_pair(old_id, new_id)
                 stamp = timestamp or datetime.now(UTC).isoformat()
             await self._mark_superseded(old_id, new_id, stamp, strict=True)
@@ -1066,6 +1148,7 @@ class MemoryStore:
                 link_type="succeeded_by",
                 strength=1.0,
                 created_at=timestamp,
+                allow_namespaced=True,  # explicit owner supersession, not automatic
             )
         except Exception as link_exc:
             # PK collision is fine (link already exists); log unexpected errors
@@ -1117,22 +1200,24 @@ class MemoryStore:
         user just deleted.
         """
         async with memory_id_lock(memory_id):
-            from genesis.memory.namespace import (
-                drain_operation,
-                is_namespaced_id,
-                mark_deleted,
-                write_lock,
-            )
+            from genesis.memory import namespace
 
-            if is_namespaced_id(memory_id):
+            if namespace.is_namespaced_id(memory_id):
                 if self._db.in_transaction:
                     raise ValueError("namespace deletion cannot join an open writer transaction")
                 _, path = await self._anchor_target()
                 if path is None:
                     raise ValueError("namespaced deletion requires a file-backed database")
-                async with write_lock(path, memory_id):
-                    await mark_deleted(path, memory_id)
-                    return await drain_operation(self._delete_locked(memory_id))
+                try:
+                    async with namespace.write_lock(
+                        path, memory_id, timeout=namespace.DELETE_LOCK_WAIT_S
+                    ):
+                        await namespace.mark_deleted(path, memory_id)
+                        return await namespace.drain_operation(self._delete_locked(memory_id))
+                except namespace.NamespaceLockBusy:
+                    # A cross-process writer still holds this ID: tombstone the
+                    # identity now and leave the removal to the reconcile lane.
+                    return await namespace.defer_busy_deletion(self._db, path, memory_id)
             return await self._delete_locked(memory_id)
 
     async def _delete_locked(self, memory_id: str) -> dict:
@@ -1241,3 +1326,40 @@ class MemoryStore:
             )
 
         return results
+
+
+async def delete_without_vector_store(db: aiosqlite.Connection, memory_id: str) -> dict:
+    """Owner delete when no MemoryStore/vector client exists (degraded boot).
+
+    SQLite is all this can touch, so an ``embedded`` memory is refused
+    (``status='unavailable'``): dropping only its rows would orphan the point.
+    Every other row is deleted with the same guarantees as
+    ``MemoryStore.delete``: its queued embedding job goes too (or the recovery
+    worker would rebuild a vector for a deleted memory), and a namespaced ID
+    gets the same permanent identity tombstone under the same writer lock, so
+    a later identical peer offer cannot read the gap as a partial write.
+    """
+    from genesis.memory import namespace
+
+    async def rows(namespace_path):
+        meta = await memory_crud.get_metadata(db, memory_id)
+        if meta and meta["embedding_status"] == "embedded":
+            return {"status": "unavailable"}
+        if namespace_path is not None:
+            await namespace.mark_deleted(namespace_path, memory_id)
+        fts5 = await memory_crud.delete(db, memory_id=memory_id)
+        await memory_crud.delete_metadata(db, memory_id=memory_id)
+        pending = await pending_embeddings.delete_by_memory(db, memory_id=memory_id)
+        return {"status": "partial", "fts5": fts5, "pending_deleted": pending}
+
+    async with memory_id_lock(memory_id):
+        if not namespace.is_namespaced_id(memory_id):
+            return await rows(None)
+        if db.in_transaction:
+            raise ValueError("namespace deletion cannot join an open writer transaction")
+        path = await namespace.database_path(db)
+        try:
+            async with namespace.write_lock(path, memory_id, timeout=namespace.DELETE_LOCK_WAIT_S):
+                return await namespace.drain_operation(rows(path))
+        except namespace.NamespaceLockBusy:
+            return {"status": "deferred", **await namespace.defer_busy_deletion(db, path, memory_id)}

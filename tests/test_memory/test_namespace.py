@@ -304,3 +304,216 @@ async def test_canceled_vector_thread_drains_before_delete_gets_lock(harness, mo
     assert not (await deletion).get("deferred")
     assert vectors.count("knowledge_base").count == 0
     assert await scalar(db, "SELECT status FROM memory_namespaces WHERE memory_id=?", (mid,)) == "deleted"
+
+
+# ── Review round: deletion permanence, repair idempotence, link exclusion ──
+
+
+async def _pending_peer(store, provider, content="Shared exact content"):
+    """A namespaced memory whose embedding never landed: pending, no point."""
+    from genesis.memory.embeddings import EmbeddingUnavailableError
+
+    provider.embed.side_effect = EmbeddingUnavailableError("isolated provider unavailable")
+    mid, _ = await write(store, content)
+    provider.embed.side_effect = None
+    return mid
+
+
+async def test_degraded_delete_tombstones_namespace_and_drops_pending_job(harness):
+    from genesis.memory.store import delete_without_vector_store
+
+    _, db, vectors, store, provider, _ = harness
+    mid = await _pending_peer(store, provider)
+    assert await scalar(db, "SELECT COUNT(*) FROM pending_embeddings WHERE memory_id=?", (mid,)) == 1
+    outcome = await delete_without_vector_store(db, mid)
+    assert outcome["status"] == "partial" and outcome["fts5"]
+    assert await scalar(db, "SELECT status FROM memory_namespaces WHERE memory_id=?", (mid,)) == "deleted"
+    assert await scalar(db, "SELECT COUNT(*) FROM pending_embeddings WHERE memory_id=?", (mid,)) == 0
+    with pytest.raises(ValueError, match="owner restoration"):
+        await write(store)
+    assert await scalar(db, "SELECT COUNT(*) FROM memory_fts WHERE memory_id=?", (mid,)) == 0
+    assert vectors.count("knowledge_base").count == 0
+
+
+async def test_degraded_delete_still_refuses_embedded_rows(harness):
+    from genesis.memory.store import delete_without_vector_store
+
+    _, db, _, store, _, _ = harness
+    mid, _ = await write(store)
+    assert (await delete_without_vector_store(db, mid))["status"] == "unavailable"
+    assert await scalar(db, "SELECT status FROM memory_namespaces WHERE memory_id=?", (mid,)) == "complete"
+    assert await scalar(db, "SELECT COUNT(*) FROM memory_fts WHERE memory_id=?", (mid,)) == 1
+
+
+def test_degraded_dashboard_delete_routes_through_the_tombstoning_helper():
+    from unittest.mock import patch
+
+    from flask import Flask
+
+    from genesis.dashboard.api import blueprint
+
+    app = Flask(__name__)
+    app.register_blueprint(blueprint)
+    rt = MagicMock(is_bootstrapped=True, memory_store=None)
+    helper = AsyncMock(return_value={"status": "deferred", "deferred": True})
+    with (
+        patch("genesis.runtime.GenesisRuntime") as runtime,
+        patch("genesis.memory.store.delete_without_vector_store", helper),
+    ):
+        runtime.instance.return_value = rt
+        resp = app.test_client().delete("/api/genesis/memory/abc")
+    helper.assert_awaited_once_with(rt.db, "abc")
+    assert resp.status_code == 503 and resp.get_json()["status"] == "deferred"
+
+
+async def test_delete_waits_past_busy_timeout_for_cross_process_writer(harness, monkeypatch):
+    import genesis.memory.namespace as module
+
+    path, db, _, store, _, _ = harness
+    mid, _ = await write(store)
+    monkeypatch.setattr(module, "db_busy_timeout_ms", lambda: 50)
+    holding, release = asyncio.Event(), asyncio.Event()
+
+    async def other_writer():
+        # A separate open file description: flock conflicts exactly as a
+        # second process holding this ID across a slow embedding would.
+        async with module.write_lock(path, mid):
+            holding.set()
+            await release.wait()
+
+    holder = asyncio.create_task(other_writer())
+    await asyncio.wait_for(holding.wait(), 5)
+    deletion = asyncio.create_task(store.delete(mid))
+    await asyncio.sleep(0.3)  # six busy timeouts
+    assert not deletion.done()
+    release.set()
+    await holder
+    assert not (await asyncio.wait_for(deletion, 5)).get("deferred")
+    assert await scalar(db, "SELECT status FROM memory_namespaces WHERE memory_id=?", (mid,)) == "deleted"
+    assert await scalar(db, "SELECT COUNT(*) FROM memory_fts WHERE memory_id=?", (mid,)) == 0
+
+
+async def test_delete_that_cannot_get_the_lock_defers_with_durable_tombstones(harness, monkeypatch):
+    import genesis.memory.namespace as module
+    from genesis.memory.delete_tombstones import has_open_tombstone
+
+    path, db, _, store, _, _ = harness
+    mid, _ = await write(store)
+    monkeypatch.setattr(module, "DELETE_LOCK_WAIT_S", 0.05)
+    async with module.write_lock(path, mid):
+        outcome = await store.delete(mid)
+    assert outcome["deferred"] and outcome["tombstoned"]
+    assert await scalar(db, "SELECT status FROM memory_namespaces WHERE memory_id=?", (mid,)) == "deleted"
+    assert await has_open_tombstone(db, memory_id=mid)
+    with pytest.raises(ValueError, match="owner restoration"):
+        await write(store)
+    # The reconcile lane's drain re-runs the delete and completes it.
+    assert not (await store.delete(mid)).get("deferred")
+    assert await scalar(db, "SELECT COUNT(*) FROM memory_fts WHERE memory_id=?", (mid,)) == 0
+    assert not await has_open_tombstone(db, memory_id=mid)
+
+
+async def test_repair_during_outage_keeps_one_pending_job(harness, monkeypatch):
+    import genesis.memory.namespace as module
+    from genesis.memory.embeddings import EmbeddingUnavailableError
+
+    _, db, _, store, provider, _ = harness
+    provider.embed.side_effect = EmbeddingUnavailableError("isolated provider unavailable")
+    real_complete = module.complete
+    monkeypatch.setattr(module, "complete", AsyncMock(side_effect=RuntimeError("after pending write")))
+    with pytest.raises(RuntimeError):
+        await write(store, tags=["first"])
+    monkeypatch.setattr(module, "complete", real_complete)
+    mid = DedupNamespace("muse", "knowledge_base").memory_id("Shared exact content")
+    assert await write(store, tags=["second"]) == (mid, False)
+    rows = await (await db.execute("SELECT tags FROM pending_embeddings WHERE memory_id=?", (mid,))).fetchall()
+    assert len(rows) == 1 and "second" in rows[0][0].split(",")
+
+
+async def test_repair_applies_one_snapshot_across_metadata_fts_and_vector(harness, monkeypatch):
+    import genesis.memory.namespace as module
+
+    _, db, vectors, store, _, _ = harness
+    real_complete = module.complete
+    monkeypatch.setattr(module, "complete", AsyncMock(side_effect=RuntimeError("partial completion")))
+    with pytest.raises(RuntimeError):
+        await write(store, confidence=0.9, wing="memory")
+    monkeypatch.setattr(module, "complete", real_complete)
+    mid, _ = await write(store, confidence=0.7, wing="routing")
+    meta = await (await db.execute("SELECT confidence, wing FROM memory_metadata WHERE memory_id=?", (mid,))).fetchone()
+    assert tuple(meta) == (0.7, "routing")
+    tags = await scalar(db, "SELECT tags FROM memory_fts WHERE memory_id=?", (mid,))
+    assert "wing:routing" in tags and "wing:memory" not in tags
+    payload = vectors.retrieve("knowledge_base", [mid])[0].payload
+    assert (payload["confidence"], payload["wing"]) == (0.7, "routing")
+
+
+async def _owner_and_peer_episodic(store):
+    owner, _ = await store.store_reporting_creation(
+        "Owner episodic note", "owner", origin_class="owner", auto_link=False, wing="memory", room="a",
+    )
+    peer, _ = await store.store_reporting_creation(
+        "Peer episodic note", "peer", wing="routing", room="b",
+        dedup_namespace=DedupNamespace("muse", "episodic_memory"),
+    )
+    return owner, peer
+
+
+async def test_link_sink_refuses_namespaced_endpoints_unless_owner_explicit(harness):
+    from genesis.db.crud import memory_links
+
+    _, db, _, store, _, _ = harness
+    owner, peer = await _owner_and_peer_episodic(store)
+    for source, target in ((owner, peer), (peer, owner)):
+        with pytest.raises(ValueError, match="namespaced"):
+            await memory_links.create(db, source_id=source, target_id=target, link_type="related_to", created_at="2026-01-01T00:00:00+00:00")
+    assert await scalar(db, "SELECT COUNT(*) FROM memory_links") == 0
+    await memory_links.create(db, source_id=owner, target_id=peer, link_type="succeeded_by", created_at="2026-01-01T00:00:00+00:00", allow_namespaced=True)
+    assert await scalar(db, "SELECT COUNT(*) FROM memory_links") == 1
+
+
+async def test_owner_auto_link_skips_peer_neighbours(harness):
+    from genesis.memory.linker import MemoryLinker
+
+    _, db, vectors, store, _, _ = harness
+    owner, peer = await _owner_and_peer_episodic(store)
+    linker = MemoryLinker(qdrant_client=vectors, db=db, similarity_threshold=0.5)
+    assert await linker.auto_link(owner, [0.1] * 1024) == []
+    assert await scalar(db, "SELECT COUNT(*) FROM memory_links") == 0
+
+
+async def test_dream_cycle_never_groups_merges_or_links_peer_points(harness):
+    from genesis.memory.dream_cycle import _cross_wing_scan, _scroll_and_group_sync
+
+    _, db, vectors, store, _, _ = harness
+    owner, peer = await _owner_and_peer_episodic(store)
+    other, _ = await store.store_reporting_creation(
+        "Second owner note", "owner", origin_class="owner", auto_link=False, wing="routing", room="b",
+    )
+    buckets = _scroll_and_group_sync(vectors)
+    grouped = {p["id"] for points in buckets.values() for p in points}
+    assert peer not in grouped and {owner, other} <= grouped
+    findings = await _cross_wing_scan(qdrant=vectors, db=db, buckets=buckets, run_id="t", similarity_threshold=0.5)
+    assert all(peer[:8] not in (f["memory_a"], f["memory_b"]) for f in findings)
+    assert await scalar(db, "SELECT COUNT(*) FROM memory_links WHERE source_id=? OR target_id=?", (peer, peer)) == 0
+
+
+async def test_entity_dedup_candidates_exclude_peer_hits(harness):
+    from genesis.memory.entity_resolution import _find_dedup_candidates_sync
+
+    _, _, vectors, store, _, _ = harness
+    owner, peer = await _owner_and_peer_episodic(store)
+    pairs = _find_dedup_candidates_sync(
+        vectors, [{"id": owner, "payload": {}}], {owner: [0.1] * 1024},
+        threshold=0.5, max_candidates_per_point=5, collection="episodic_memory",
+    )
+    assert all(peer not in (a["id"], b["id"]) for a, b, _ in pairs)
+
+
+async def test_orphan_detection_does_not_count_peer_memories(harness):
+    from genesis.memory.dream_orphan_detection import run_orphan_detection
+
+    _, db, vectors, store, _, _ = harness
+    owner, peer = await _owner_and_peer_episodic(store)
+    report = await run_orphan_detection(qdrant=vectors, db=db, router=MagicMock(), store=MagicMock(), run_id="t", dry_run=True)
+    assert report["orphans_found"] == 1 and report["sample_orphans"] == [owner]
