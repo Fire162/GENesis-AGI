@@ -1069,4 +1069,7 @@ jobs:
         # integration requirement, per the test's own skip reason). No
         # overlap with the files above (new paths). Floor: 25718 + 20 = 25738.
         # Ceiling: 104 + 20 = 124.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25738
+        # Card vault store and CLI (#3194): +151 collected, measured with
+        # --collect-only (test_vault_store 105, test_vault_cli 46, both new; pyrage
+        # and zxcvbn are in the test extra, so no skips). Floor: 25738 + 151 = 25889.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25889
