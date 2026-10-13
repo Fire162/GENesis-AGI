@@ -295,6 +295,111 @@ def test_find_seams_a_missing_real_method_is_not_possible() -> None:
     assert "possible" not in _by_seam(seams)["Host"]
 
 
+def _single_method_seam(seam_sig: str, impl_sigs: dict[str, str]) -> list[str]:
+    """Structural implementers of a one-method seam ``run``, by class name."""
+    classes = [_cls("s.py", "Seam", "class Seam(Protocol)")]
+    methods = [_meth("s.py", "Seam", "run", seam_sig)]
+    for name, sig in impl_sigs.items():
+        classes.append(_cls(f"{name}.py", name, f"class {name}"))
+        methods.append(_meth(f"{name}.py", name, "run", sig))
+    seams, _ = find_seams(classes, methods)
+    return [i["name"] for i in _by_seam(seams)["Seam"]["implementers"]]
+
+
+def test_find_seams_requires_the_inherited_members_of_a_parent_seam() -> None:
+    """A sub-Protocol's contract includes what it inherits from its parent seam."""
+    classes = [
+        _cls("t.py", "Tool", "class Tool(Protocol)"),
+        _cls("t.py", "Embedder", "class Embedder(Tool, Protocol)"),
+        _cls("a.py", "Full", "class Full"),
+        _cls("b.py", "OwnOnly", "class OwnOnly"),
+    ]
+    methods = [
+        _meth("t.py", "Tool", "invoke", "async def invoke(self, req)"),
+        _meth("t.py", "Tool", "check", "async def check(self)"),
+        _meth("t.py", "Embedder", "embed", "async def embed(self, text)"),
+        _meth("t.py", "Embedder", "embed_many", "async def embed_many(self, texts)"),
+        *(
+            _meth("a.py", "Full", n, s)
+            for n, s in [
+                ("invoke", "async def invoke(self, req)"),
+                ("check", "async def check(self)"),
+                ("embed", "async def embed(self, text)"),
+                ("embed_many", "async def embed_many(self, texts)"),
+            ]
+        ),
+        _meth("b.py", "OwnOnly", "embed", "async def embed(self, text)"),
+        _meth("b.py", "OwnOnly", "embed_many", "async def embed_many(self, texts)"),
+    ]
+    seams, _ = find_seams(classes, methods)
+    embedder = _by_seam(seams)["Embedder"]
+    assert embedder["methods"] == ["check", "embed", "embed_many", "invoke"]
+    assert [i["name"] for i in embedder["implementers"]] == ["Full"]
+
+
+def test_find_seams_diamond_takes_the_first_base_like_python() -> None:
+    """D(B, C) inherits B's version of a member both parents declare, as Python's MRO does."""
+    classes = [
+        _cls("s.py", "B", "class B(Protocol)"),
+        _cls("s.py", "C", "class C(Protocol)"),
+        _cls("s.py", "D", "class D(B, C, Protocol)"),
+        _cls("i.py", "Impl", "class Impl"),
+    ]
+    methods = [
+        _meth("s.py", "B", "m", "def m(self, x)"),
+        _meth("s.py", "C", "m", "def m(self, x, y)"),
+        _meth("i.py", "Impl", "m", "def m(self, x)"),
+    ]
+    seams, _ = find_seams(classes, methods)
+    assert [i["name"] for i in _by_seam(seams)["D"]["implementers"]] == ["Impl"]
+
+
+def test_find_seams_does_not_inherit_from_an_ambiguous_parent_name() -> None:
+    """Two unrelated seams named A: B(A) cannot know which one it extends."""
+    classes = [
+        _cls("a.py", "A", "class A(Protocol)"),
+        _cls("u.py", "A", "class A(Protocol)"),
+        _cls("b.py", "B", "class B(A, Protocol)"),
+        _cls("i.py", "Impl", "class Impl"),
+    ]
+    methods = [
+        _meth("a.py", "A", "run", "def run(self)"),
+        _meth("u.py", "A", "zzz", "def zzz(self, q)"),
+        _meth("b.py", "B", "go", "def go(self, q)"),
+        _meth("i.py", "Impl", "go", "def go(self, q)"),
+    ]
+    seams, _ = find_seams(classes, methods)
+    b = _by_seam(seams)["B"]
+    assert b["methods"] == ["go"]
+    assert b["contract_ambiguous"] is True
+    assert [i["name"] for i in b["implementers"]] == ["Impl"]
+
+
+def test_find_seams_an_optional_seam_argument_cannot_be_required_by_the_implementer() -> None:
+    """Callers may omit an argument the seam makes optional, so the implementer must too."""
+    found = _single_method_seam(
+        "def run(self, x=0)",
+        {"Required": "def run(self, x)", "Optional": "def run(self, x=1)"},
+    )
+    assert found == ["Optional"]
+
+
+def test_find_seams_respects_keyword_only_contracts() -> None:
+    """Callers pass the seam's keyword-only arguments by name; implementers must accept them."""
+    found = _single_method_seam(
+        "async def run(self, q, *, mode, retries=1)",
+        {
+            "IgnoresKeywords": "async def run(self, q)",
+            "AcceptsKeywords": "async def run(self, q, *, mode, retries=3)",
+            "AcceptsKwargs": "async def run(self, q, **kw)",
+            "AsPositional": "async def run(self, q, mode=None, retries=1)",
+            "RequiresExtra": "async def run(self, q, *, mode, retries=1, extra)",
+            "RequiresOptional": "async def run(self, q, *, mode, retries)",
+        },
+    )
+    assert sorted(found) == ["AcceptsKeywords", "AcceptsKwargs", "AsPositional"]
+
+
 # ─── load_seams: the view over a real index ──────────────────────────────────
 
 
@@ -398,6 +503,28 @@ async def test_load_seams_unknown_name_is_an_error(tmp_path: Path) -> None:
     assert "error" in view
     assert "NoSuchSeam" in view["error"]
     assert view["complete"] is True  # an indexed tree: the "no" is real
+    assert view["unparsed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_load_seams_with_unparseable_rows_is_not_complete(tmp_path: Path) -> None:
+    """Dropped index rows mean the answer may be missing something: say so."""
+    _write_tree(tmp_path)
+    db = await _indexed_db(tmp_path)
+    try:
+        await db.execute(
+            "UPDATE code_symbols SET signature = 'class SearchProvider((' "
+            "WHERE name = 'SearchProvider'"
+        )
+        view = await load_seams(db)
+        lookup = await load_seams(db, name="SearchProvider")
+    finally:
+        await db.close()
+    assert view["unparsed"] == 1
+    assert view["complete"] is False
+    assert "error" in lookup
+    assert lookup["unparsed"] == 1
+    assert lookup["complete"] is False
 
 
 # ─── the registry list ───────────────────────────────────────────────────────

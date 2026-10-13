@@ -3,10 +3,16 @@
 Computed at query time from the code index. A class implements a seam
 ``nominal``-ly when one of its bases names the seam, and ``structural``-ly when
 it has a call-compatible public method for every public method the seam
-declares. A single-method seam matches on one name, so its structural links are
-``low`` confidence, as is a nominal link to a class name defined in more than one
-module. A Protocol that subclasses a seam is listed as ``extends``, and is never
-a structural implementer.
+declares or inherits from a parent seam. Call-compatible is checked on: same
+async-ness, no more required arguments than the seam, room for each of the
+seam's positional arguments, and the seam's keyword-only names accepted (or
+``**kwargs``). Parameter names of positional arguments, the seam's own
+``*args``/``**kwargs`` and annotations are not checked. A parent seam whose name
+is defined more than once cannot be resolved: nothing is inherited through it,
+and the entry carries ``contract_ambiguous``. A single-method seam matches on
+one name, so its structural links are ``low`` confidence, as is a nominal link
+to a class name defined in more than one module. A Protocol that subclasses a
+seam is listed as ``extends``, and is never a structural implementer.
 
 The index records methods, not attributes. A class that supplies a seam member
 as a class attribute (``name = "x"`` for a ``name`` property) cannot match, so
@@ -21,6 +27,7 @@ in the index, so such an implementer is not found.
 from __future__ import annotations
 
 import ast
+from typing import NamedTuple
 
 import aiosqlite
 
@@ -64,22 +71,55 @@ def _bases(signature: str) -> tuple[list[str], bool]:
     return names, meta or "Protocol" in names or "ABC" in names
 
 
-def _shape(signature: str) -> tuple[bool, int, int, bool]:
-    """(async, required positional, positional, takes *args) of a method."""
+class _Sig(NamedTuple):
+    """A method's call contract (positional counts include ``self``)."""
+
+    is_async: bool
+    required: int
+    positional: int
+    varargs: bool
+    by_name: frozenset[str]  # parameters a caller may pass by keyword
+    kw_only: frozenset[str]
+    kw_required: frozenset[str]
+    varkw: bool
+
+
+def _shape(signature: str) -> _Sig:
     fn = ast.parse(signature + ": ...").body[0]
     a = fn.args
     pos = len(a.posonlyargs) + len(a.args)
-    return isinstance(fn, ast.AsyncFunctionDef), pos - len(a.defaults), pos, a.vararg is not None
+    kw_only = frozenset(k.arg for k in a.kwonlyargs)
+    kw_required = frozenset(
+        k.arg for k, d in zip(a.kwonlyargs, a.kw_defaults, strict=True) if d is None
+    )
+    by_name = frozenset(x.arg for x in a.args) | kw_only
+    is_async = isinstance(fn, ast.AsyncFunctionDef)
+    return _Sig(
+        is_async,
+        pos - len(a.defaults),
+        pos,
+        a.vararg is not None,
+        by_name,
+        kw_only,
+        kw_required,
+        a.kwarg is not None,
+    )
 
 
-def _fits(seam: tuple, impl: tuple) -> bool:
-    """Whether a call shaped like the seam's method can reach the implementer's."""
-    return impl[0] == seam[0] and impl[1] <= seam[2] and (impl[2] >= seam[2] or impl[3])
+def _fits(seam: _Sig, impl: _Sig) -> bool:
+    """Whether the implementer passes the call checks the module docstring lists."""
+    return (
+        impl.is_async == seam.is_async
+        and impl.required <= seam.required
+        and (impl.positional >= seam.positional or impl.varargs)
+        and (impl.varkw or seam.kw_only <= impl.by_name)
+        and impl.kw_required <= seam.kw_required
+    )
 
 
-def _attribute_like(seam: tuple) -> bool:
+def _attribute_like(seam: _Sig) -> bool:
     """A sync, self-only member (often a property) a class attribute could supply."""
-    return not seam[0] and seam[2] == 1 and not seam[3]
+    return not seam.is_async and seam.positional == 1 and not seam.varargs and not seam.kw_only
 
 
 def find_seams(
@@ -112,14 +152,37 @@ def find_seams(
         except SyntaxError:
             unparsed += 1
     defined: dict[str, int] = {}
-    for _, cls in info:
-        defined[cls] = defined.get(cls, 0) + 1
+    seams_named: dict[str, list[tuple[str, str]]] = {}
+    for key, (_, is_seam, _) in info.items():
+        defined[key[1]] = defined.get(key[1], 0) + 1
+        if is_seam:
+            seams_named.setdefault(key[1], []).append(key)
+
+    def contract(key: tuple[str, str], seen: set, flags: dict) -> dict[str, _Sig]:
+        """The seam's own methods over those it inherits from parent seams.
+
+        Bases are applied last to first, so an earlier base wins as in Python's
+        MRO. A parent name defined by more than one seam cannot be resolved, so
+        nothing is inherited through it and the contract is flagged.
+        """
+        seen.add(key)
+        members: dict[str, _Sig] = {}
+        for base in reversed(info[key][0]):
+            parents = seams_named.get(base, [])
+            if len(parents) > 1:
+                flags["ambiguous"] = True
+            elif parents and parents[0] not in seen:
+                members.update(contract(parents[0], seen, flags))
+        members.update({n: s[0] for n, s in shapes.get(key, {}).items()})
+        return members
+
     order = {"nominal": 0, "extends": 1, "structural": 2}
     out = []
     for key, (_, is_seam, row) in sorted(info.items(), key=lambda kv: (kv[0][1], kv[0][0])):
         if not is_seam or key[1].startswith("_") or (name and key[1] != name):
             continue
-        wanted = {n: s[0] for n, s in shapes.get(key, {}).items()}
+        flags: dict = {}
+        wanted = contract(key, set(), flags)
         found, possible = [], []
         for other, (bases, other_is_seam, _) in info.items():
             if other == key or other[1].startswith("_"):
@@ -154,6 +217,8 @@ def find_seams(
         }
         if not name and len(found) > cap:
             entry["implementers_omitted"] = len(found) - cap
+        if flags.get("ambiguous"):
+            entry["contract_ambiguous"] = True
         if possible:
             entry["possible"] = sorted(possible, key=lambda p: (p["module"], p["name"]))
         out.append(entry)
@@ -176,17 +241,20 @@ async def load_seams(db: aiosqlite.Connection, *, name: str = "") -> dict:
     indexed = (await cursor.fetchone())[0]
     pending = sum(1 for c in classes if c["signature"] is None)
     seams, unparsed = find_seams(classes, methods, name=name)
+    # An index that has never run, or rows that were dropped, is not a
+    # complete answer: an empty result then is not a "no".
+    complete = pending == 0 and indexed > 0 and unparsed == 0
     if name and not seams:
         return {
             "error": f"No seam named {name}",
-            "complete": pending == 0 and indexed > 0,
+            "complete": complete,
             "indexed_modules": indexed,
             "pending_reindex": pending,
+            "unparsed": unparsed,
         }
     return {
         "level": "seams",
-        # An index that has never run is not a complete answer of "no seams".
-        "complete": pending == 0 and indexed > 0,
+        "complete": complete,
         "indexed_modules": indexed,
         "pending_reindex": pending,
         "unparsed": unparsed,
