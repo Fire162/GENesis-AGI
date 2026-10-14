@@ -29,11 +29,28 @@ hole; a closed grammar has none of those to handle::
     Disposition: c102 file issue=#123
     Escalate: no
 
-Rounds that owe more add ``Audit-evidence: <path> <verdict>`` and
-``Premise-check: P1 TRUE <text>`` lines (see ``obligations``). A cited audit
-must have been written after the round started and before the reflection was
-committed. Each of the PR's acceptance points must appear within one Scope
-line that starts ``covered:``.
+Rounds that owe more add ``Audit-evidence: <path> <label>``, or two
+``Premise-check: P1 TRUE <text>`` lines plus ``Premise-evidence: <path>
+SOUND|SOUND-BUT-INFERIOR|BROKEN`` (see ``obligations``). The audit's label is
+free text and unchecked: an audit has no verdict vocabulary to bind it to. The
+premise verdict is bound: it, the reflection's ``Premise:`` and every
+``Premise-check`` claim must restate what the cited file concludes, so a file
+concluding BROKEN forces an escalating reflection. Each cited file must be a regular file of at
+most 1 MiB, written after the round started and before the reflection was
+committed; a relative path is read from the repository the check runs in.
+Cite a copy that nothing else rewrites (``<pr>-round<N>-<kind>.txt``), never
+the review gate's per-worktree evidence file, which the next review replaces.
+A premise-evidence file must carry the canonical ``Design-premise:`` block of
+``.claude/docs/premise-check.md``: the verdict line at column 0, the
+``Expected before checking:`` line directly under it, at least two distinct
+``P<n> <verdict>`` claim lines in an unbroken run, verdict first, and then
+only ``Effect:``, ``Better shape:``, ``PR-shape:``, ``Persisted-state:`` or
+code-fence lines until a blank line or the next ``Design-premise:`` line (the
+block's paragraph is closed). At least one block that has claims must carry
+the Expected line. Each of
+the PR's acceptance points must appear within one Scope line that starts
+``covered:``; that is a substring floor for an honest session, not proof
+that the line covers the point.
 
 ``covered_keys`` is THE coverage check: the commit gate (a later change) calls
 it, and it applies every local rule, so a reflection committed by hand is held
@@ -50,6 +67,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import unicodedata
@@ -96,6 +114,11 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
         None,
     ),
     "Audit-evidence": (re.compile(r"^Audit-evidence: ([!-~]{1,300})(?: ([ -~]{1,300}))?$"), 0, 1),
+    "Premise-evidence": (
+        re.compile(r"^Premise-evidence: ([!-~]{1,300}) (SOUND-BUT-INFERIOR|SOUND|BROKEN)$"),
+        0,
+        1,
+    ),
     "Premise-check": (
         re.compile(rf"^Premise-check: P([1-9][0-9]?) (TRUE|FALSE|UNPROVEN) ({_TEXT})$"),
         0,
@@ -129,8 +152,13 @@ class Reflection:
     decision: str | None = None
     escalate: bool = False
     audit_evidence: str | None = None
+    premise_evidence: str | None = None
+    premise_evidence_verdict: str | None = None
     scopes: list[str] = field(default_factory=list)
     premise_checks: int = 0
+    #: ``Premise-check`` claims by number: what the reflection says the cited
+    #: premise check concluded, bound to that file by ``evidence_problem``.
+    premise_claims: dict[str, str] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -141,14 +169,16 @@ class Reflection:
 def obligations(round_number: int, gate_lane: bool) -> tuple[bool, bool]:
     """``(audit, premise)`` owed by the reflection of this round.
 
-    The review ladder (owner rulings 2026-09-30): the gate lane runs a class
-    audit at round 1 and the premise check at round 2, its terminal round; the
-    ordinary lane audits at round 2 and checks the premise from round 3. The
+    The review ladder: the gate lane runs a class audit at round 1 and the
+    premise check at round 2, its terminal round (owner rulings 2026-09-30).
+    The ordinary lane checks the premise from round 2 and runs the class sweep
+    at round 3, before its terminal round 4 (owner ruling 2026-10-08: rework
+    costs least at round 2, so the premise question comes first there). The
     audit belongs to ITS round; the premise check stays owed after its round.
     """
     if gate_lane:
         return round_number == 1, round_number >= 2
-    return round_number == 2, round_number >= 3
+    return round_number == 3, round_number >= 2
 
 
 def _normalize(text: str) -> str:
@@ -223,12 +253,18 @@ def parse(
     result.scopes = [m.group(1) for m in seen["Scope"]]
     # Distinct premise numbers: one check written twice is still one check.
     result.premise_checks = len({m.group(1) for m in seen["Premise-check"]})
+    for m in seen["Premise-check"]:
+        if result.premise_claims.setdefault(m.group(1), m.group(2)) != m.group(2):
+            result.problems.append(f"'Premise-check: P{m.group(1)}' is given two verdicts")
     if seen["Premise"]:
         result.verdict = seen["Premise"][0].group(1)
     if seen["Decision"]:
         result.decision = seen["Decision"][0].group(1)
     if seen["Audit-evidence"]:
         result.audit_evidence = seen["Audit-evidence"][0].group(1)
+    if seen["Premise-evidence"]:
+        result.premise_evidence = seen["Premise-evidence"][0].group(1)
+        result.premise_evidence_verdict = seen["Premise-evidence"][0].group(2)
     if any(m.group(1) == "yes" for m in seen["Escalate"]) or result.verdict in {
         "BROKEN",
         "SUSPECT",
@@ -273,6 +309,11 @@ def parse(
         result.problems.append(
             f"round {round_number} carries an independent premise check: at least two "
             "'Premise-check: P<n> TRUE|FALSE|UNPROVEN <text>' lines"
+        )
+    if premise_owed and not result.premise_evidence:
+        result.problems.append(
+            f"round {round_number} cites the premise check's output: "
+            "'Premise-evidence: <path> SOUND|SOUND-BUT-INFERIOR|BROKEN'"
         )
     recurring = sorted(set(result.classes) & {_normalize(c) for c in previous_classes})
     if recurring and result.decision == "fix-instances":
@@ -503,39 +544,259 @@ def _parse_when(raw: object) -> datetime | None:
 _COMMIT_CLOCK_SLACK = timedelta(seconds=1)
 
 
-def audit_problem(path: str, round_started: object, made_at: object) -> str | None:
-    """Why a cited audit does not count, or None. Local only: the file must
-    exist, decode, pass the review gate's own adversarial-evidence check, and
-    have been last written inside the window from the round's start to the
-    reflection's commit (``made_at``), so an audit written or changed after
+#: The largest evidence file read. An audit or premise check runs to tens of
+#: kilobytes; anything past this is not one, and an unbounded read of a cited
+#: path is a hang (a device) or memory exhaustion on the hook path.
+EVIDENCE_MAX_BYTES = 1024 * 1024
+
+#: The premise-check block of .claude/docs/premise-check.md ("The output"):
+#: a ``Design-premise:`` line at column 0, then the required ``Expected before
+#: checking:`` line, then the claim lines ``P<n> TRUE|FALSE|UNPROVEN — <claim>``,
+#: verdict FIRST (a short parenthesised qualifier may follow it). A claim's
+#: verdict sits in a fixed slot, so no word in the claim's own text can be read
+#: as it (#3120: the free-text reader misbound them). Each line is matched whole
+#: after trailing whitespace is dropped. A line that opens like a verdict line
+#: but does not match it is refused by its line number, and so is any line in
+#: the block's paragraph that is not one of the block's lines (#3127, #3238).
+_PREMISE_VERDICT_LINE_RE = re.compile(
+    r"Design-premise:[ \t]+(SOUND-BUT-INFERIOR|SOUND|BROKEN)"
+    r"(?:[ \t]+[—–-][ \t]+\S.*)?"
+)
+#: Any column-0 line that opens like a verdict line, in any case, bold or
+#: spacing: it must be a verdict line exactly. An indented or ``>``-quoted one
+#: stays prose, which is how the doc says to quote an example.
+_PREMISE_VERDICT_PREFIX_RE = re.compile(
+    r"[*_]*design[-\u2010\u2011 ]premise[*_]*[ \t]*:", re.IGNORECASE
+)
+#: A heading or list item labelled as the verdict (``## Design-premise: BROKEN``,
+#: ``- Design-premise: SOUND (80%)``) is not a sanctioned quote, so it would
+#: otherwise contradict the block unseen. It is refused when the text after
+#: its colon carries an UPPERCASE verdict token, the grammar's own spelling; a
+#: lowercase question or description ("what would make this sound?") and a bare
+#: section heading stay prose. ``>`` is not a marker here: it is the doc's quote.
+_PREMISE_MARKED_VERDICT_RE = re.compile(
+    r"(?:#{1,6}|[-*+|]|[0-9]+[.)])[ \t]+[*_]*(?i:design[-\u2010\u2011 ]premise)[*_]*[ \t]*:(.*)"
+)
+_PREMISE_VERDICT_TOKEN_RE = re.compile(r"\b(?:SOUND|BROKEN)\b")
+_PREMISE_EXPECTED_LINE_RE = re.compile(r"Expected before checking:[ \t]+\S.*")
+_PREMISE_CLAIM_LINE_RE = re.compile(
+    r"[ \t]*P([1-9][0-9]?) (TRUE|FALSE|UNPROVEN)(?: \([^)\n]*\))?[ \t]+[\u2014\u2013-][ \t]+\S.*"
+)
+#: After the claims, the block paragraph (up to the next blank line or verdict
+#: line) may hold only the doc's trailer lines (and ``Persisted-state:``, which
+#: the architect agent emits right after them) and a code fence. Every other
+#: line in it is refused by its line number: the paragraph is closed, so no
+#: near-miss spelling of a claim or Expected line can be dropped as prose (#3238).
+_PREMISE_TRAILER_RE = re.compile(
+    r"(?:Effect|Better shape|PR-shape|Persisted-state):[ \t]+\S.*|(?:```|~~~)\S*"
+)
+
+
+def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
+    """``(verdict, {claim number: verdict}, problem)`` from a premise-check
+    output in the canonical block. Every column-0 line that opens like
+    ``Design-premise:`` must be a verdict line, and they must all agree; a
+    heading or list item labelled as the verdict that carries an uppercase
+    verdict token is refused. The block paragraph runs from a verdict line to
+    the next blank line or verdict line and is CLOSED: it holds the verdict
+    line, the ``Expected before checking:`` line directly under it,
+    the unbroken run of claim lines, then only ``Effect:``, ``Better shape:``,
+    ``PR-shape:``, ``Persisted-state:`` and code-fence lines. Any other line in it is refused by its
+    line number. The claims are those of the first block that has any; a later
+    block may repeat any of them with the same verdict (claim text is not
+    compared), never add one or change a verdict. At least one block with
+    claims must carry the Expected line (a restating summary need not), and at least two distinct claims are required. Lines are
+    split on newlines only, as the reflection itself is. Outside a block
+    paragraph, text is prose and is not checked."""
+    lines = [line.rstrip() for line in text.split("\n")]
+    verdicts: set[str] = set()
+    first: dict[str, str] | None = None
+    has_expected = False
+    for i, line in enumerate(lines):
+        marked = _PREMISE_MARKED_VERDICT_RE.fullmatch(line)
+        if marked and _PREMISE_VERDICT_TOKEN_RE.search(marked.group(1)):
+            return None, {}, (
+                f"line {i + 1} gives a 'Design-premise:' verdict in a heading or list item; "
+                "write it as a plain column-0 line, or indent or >-quote it if it is not yours"
+            )
+        if not _PREMISE_VERDICT_PREFIX_RE.match(line):
+            continue
+        head = _PREMISE_VERDICT_LINE_RE.fullmatch(line)
+        if head is None:
+            return None, {}, (
+                f"line {i + 1} starts like a 'Design-premise:' line but is not "
+                "'Design-premise: SOUND|SOUND-BUT-INFERIOR|BROKEN[ — <qualifier>]' (plain text)"
+            )
+        verdicts.add(head.group(1))
+        if len(verdicts) > 1:
+            return None, {}, "it names more than one 'Design-premise:' verdict: " + ", ".join(
+                sorted(verdicts)
+            )
+        run: dict[str, str] = {}
+        j = i + 1
+        expected_here = j < len(lines) and bool(_PREMISE_EXPECTED_LINE_RE.fullmatch(lines[j]))
+        if expected_here:
+            j += 1
+        while j < len(lines):
+            claim = _PREMISE_CLAIM_LINE_RE.fullmatch(lines[j])
+            if claim is None:
+                break
+            number, said = claim.group(1), claim.group(2)
+            if run.setdefault(number, said) != said:
+                return None, {}, f"line {j + 1}: claim P{number} carries two different verdicts"
+            j += 1
+        while (
+            j < len(lines) and lines[j].strip() and not _PREMISE_VERDICT_PREFIX_RE.match(lines[j])
+        ):
+            if not _PREMISE_TRAILER_RE.fullmatch(lines[j]):
+                return None, {}, (
+                    f"line {j + 1} is inside the premise block that starts at line {i + 1} but "
+                    "is not one of its lines: a claim "
+                    "'P<n> TRUE|FALSE|UNPROVEN — <claim>' (one line, not wrapped), the "
+                    "Expected line directly under the verdict, Effect:, Better shape:, "
+                    "PR-shape:, Persisted-state: or a code fence. Leave a blank line before any other text"
+                )
+            j += 1
+        has_expected = has_expected or (expected_here and bool(run))
+        if first is None:
+            first = run or None
+        elif any(first.get(number) != said for number, said in run.items()):
+            return None, {}, (
+                f"line {i + 1}: a repeated 'Design-premise:' block must restate the "
+                "first block's claims, never add or change one"
+            )
+    claims = first or {}
+    if not verdicts or len(claims) < 2:
+        return (
+            None,
+            {},
+            "it needs the canonical block of .claude/docs/premise-check.md: a "
+            "'Design-premise: <verdict>' line at column 0 with at least two "
+            "'P<n> TRUE|FALSE|UNPROVEN' claim lines directly under it",
+        )
+    if not has_expected:
+        return None, {}, (
+            "the block needs its 'Expected before checking: <one line>' line directly "
+            "under the 'Design-premise:' line (.claude/docs/premise-check.md)"
+        )
+    return next(iter(verdicts)), claims, None
+
+
+def _read_evidence(path: str, cwd: str) -> tuple[str | None, datetime | None, str | None]:
+    """``(text, mtime, None)`` or ``(None, None, why)``. ``~`` expands; a
+    relative path resolves against ``cwd``, the repository the check is about,
+    never the process's own working directory. Only a regular file of at most
+    ``EVIDENCE_MAX_BYTES`` is read, and the type is taken from the opened
+    descriptor, so a path swapped for a pipe between a check and the open is
+    still refused instead of blocking the read. The mtime is read before the
+    content, so a rewrite in that window keeps the older time: a microsecond
+    race that only the author of the reflection can run."""
+    candidate = Path(os.path.expanduser(path))
+    if not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    try:
+        fd = os.open(candidate, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        return None, None, f"is unreadable ({exc.strerror})"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None, None, "is not a regular file"
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1
+            raw = handle.read(EVIDENCE_MAX_BYTES + 1)
+    except OSError as exc:
+        return None, None, f"is unreadable ({exc.strerror})"
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > EVIDENCE_MAX_BYTES:
+        return None, None, f"is larger than {EVIDENCE_MAX_BYTES} bytes"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, None, "is not valid UTF-8"
+    return text, datetime.fromtimestamp(info.st_mtime, UTC), None
+
+
+def evidence_problem(
+    path: str,
+    *,
+    kind: str,
+    cwd: str,
+    round_started: object,
+    made_at: object,
+    reflection: Reflection | None = None,
+) -> str | None:
+    """Why a cited evidence file does not count, or None. ``kind`` is
+    ``"audit"`` (the review gate's own adversarial-evidence check) or
+    ``"premise"`` (the premise-check block). Local only: the file must be a
+    readable regular file, decode, pass its kind's content check, and have
+    been last written inside the window from the round's start to the
+    reflection's commit (``made_at``), so evidence written or changed after
     the reflection is refused. An unknown end of the window is a refusal,
     never a skipped check. File times can be set by hand, so this binds an
     honest session's evidence to its reflection; it is not proof against
-    tampering."""
-    import review_state  # noqa: PLC0415
+    tampering.
 
-    evidence = Path(os.path.expanduser(path))
-    try:
-        text = evidence.read_bytes().decode("utf-8")
-        mtime = datetime.fromtimestamp(evidence.stat().st_mtime, UTC)
-    except OSError as exc:
-        return f"Audit-evidence is unreadable ({exc.strerror})"
-    except UnicodeDecodeError:
-        return "Audit-evidence is not valid UTF-8"
-    ok, why = review_state._evidence_is_adversarial(text)
-    if not ok:
-        return f"Audit-evidence is not an adversarial audit: {why}"
+    For premise evidence, a ``reflection`` is bound to the file: its
+    ``Premise-evidence`` verdict and its ``Premise:`` must both be the file's
+    verdict, and each of its ``Premise-check`` claims must match the file's
+    claim of that number. The file decides; the reflection only restates it.
+    Claims the reflection does not cite are not compared, but the overall
+    verdict always is.
+    A file concluding BROKEN therefore forces ``Premise: BROKEN``, which
+    escalates."""
+    label = {"audit": "Audit-evidence", "premise": "Premise-evidence"}[kind]
+    text, mtime, why = _read_evidence(path, cwd)
+    if why is not None or text is None or mtime is None:
+        return f"{label} {why}"
+    if kind == "audit":
+        import review_state  # noqa: PLC0415
+
+        ok, why = review_state._evidence_is_adversarial(text)
+        if not ok:
+            return f"{label} is not an adversarial audit: {why}"
+    else:
+        verdict, claims, why = premise_block(text)
+        if why is not None:
+            return f"{label} is not a premise check: {why}"
+        if reflection is not None:
+            if reflection.premise_evidence_verdict != verdict:
+                return (
+                    f"{label} concludes {verdict}, but the reflection cites it as "
+                    f"{reflection.premise_evidence_verdict}"
+                )
+            if reflection.verdict != verdict:
+                return (
+                    f"{label} concludes {verdict}, but the reflection's Premise is "
+                    f"{reflection.verdict}"
+                )
+            for number, said in sorted(reflection.premise_claims.items()):
+                found = claims.get(number)
+                if found != said:
+                    return (
+                        f"Premise-check P{number} says {said}, but {label} "
+                        + (f"says {found}" if found else "has no claim P" + number)
+                    )
     started = _parse_when(round_started)
     if started is None:
-        return "the round's start time is unknown, so the audit's freshness cannot be checked"
+        return f"the round's start time is unknown, so the {kind}'s freshness cannot be checked"
     if mtime < started:
-        return "Audit-evidence predates this round's first review"
+        return f"{label} predates this round's first review"
     made = _parse_when(made_at)
     if made is None:
-        return "the reflection's commit time is unknown, so the audit cannot be bound to it"
+        return f"the reflection's commit time is unknown, so the {kind} cannot be bound to it"
     if mtime > made + _COMMIT_CLOCK_SLACK:
-        return "Audit-evidence was written or changed after the reflection was committed"
+        return f"{label} was written or changed after the reflection was committed"
     return None
+
+
+def audit_problem(path: str, round_started: object, made_at: object, *, cwd: str) -> str | None:
+    """``evidence_problem`` for an ``Audit-evidence`` file."""
+    return evidence_problem(
+        path, kind="audit", cwd=cwd, round_started=round_started, made_at=made_at
+    )
 
 
 def check(
@@ -548,8 +809,10 @@ def check(
     acceptance: Sequence[str] | None,
     round_started: object,
     made_at: object,
+    cwd: str,
 ) -> Reflection:
-    """Every local rule a reflection must meet for this round, in one place."""
+    """Every local rule a reflection must meet for this round, in one place.
+    ``cwd`` is the repository: a relative evidence path is read from there."""
     parsed = parse(
         body,
         round_number=round_number,
@@ -563,10 +826,18 @@ def check(
         )
     if parsed.escalate:
         parsed.problems.append("the reflection escalates: it needs an architecture decision")
-    if parsed.audit_evidence:
-        trouble = audit_problem(parsed.audit_evidence, round_started, made_at)
-        if trouble:
-            parsed.problems.append(trouble)
+    for kind, path in (("audit", parsed.audit_evidence), ("premise", parsed.premise_evidence)):
+        if path:
+            trouble = evidence_problem(
+                path,
+                kind=kind,
+                cwd=cwd,
+                round_started=round_started,
+                made_at=made_at,
+                reflection=parsed,
+            )
+            if trouble:
+                parsed.problems.append(trouble)
     return parsed
 
 
@@ -606,14 +877,22 @@ def covered_keys(
     A reflection counts only when it is an EMPTY commit naming this exact head,
     made before any fix to it (``before_any_fix``), and ``check`` passes it:
     the grammar, the round's obligations, the recurring-class rule against
-    every earlier round head (``prior_heads``), a readable adversarial audit
-    written between ``round_started`` and the reflection's commit where one is
-    cited, no escalation, and the
+    every earlier round head (``prior_heads``), readable evidence files
+    (an adversarial audit, a premise check) written between ``round_started``
+    and the reflection's commit where cited or owed, no escalation, and the
     acceptance points (None only when the PR declares none). Every argument is
     required, so no caller gets a weaker check by leaving one out. A
     reflection committed by hand is held to exactly this; there is no weaker
     path. Raises ``Refused`` when git cannot be read: a caller must treat that
     as unknown, never as nothing owed.
+
+    Some inputs are read as they are NOW, not as they were when the reflection
+    was committed: the acceptance points (today's PR body), the lane (today's
+    changed files) and the cited evidence files (read from disk at each check).
+    Each change there can only refuse a reflection that passed, except a PR
+    edit that removes an acceptance point, or one that moves the PR across the
+    hook-surface boundary (the lanes owe different checks at a round); cite
+    evidence from a place nothing prunes (``~/.genesis/review_evidence/``).
     """
     previous = previous_class_labels(cwd, prior_heads)
     covered: set[str] = set()
@@ -629,6 +908,7 @@ def covered_keys(
             acceptance=acceptance,
             round_started=round_started,
             made_at=committed_at,
+            cwd=cwd,
         )
         if result.ok:
             covered.update(result.keys)
@@ -688,14 +968,27 @@ def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
     budget = review_budget.evaluate_pr(repo, number)
     state = owed_state(budget, (), now=now or datetime.now(UTC))
     if state["status"] == "ok" and state["round_state"] == "open":
-        meta = _pr_meta(repo, number)
+        if budget.get("body_changed"):
+            raise Refused(
+                "the PR body changed between the two reads, so its acceptance "
+                "points are not known: run status again"
+            )
+        # The body comes with the budget read. Only a budget that carries no
+        # body at all (an older review_budget) is answered by asking again; a
+        # carried body of None (two reads that disagreed) never is.
+        if "body" in budget:
+            body = budget.get("body")
+            if not isinstance(body, str):
+                raise Refused("the PR body could not be read, so its acceptance is unknown")
+        else:
+            body = _pr_meta(repo, number).get("body") or ""
         covered = covered_keys(
             cwd,
             str(state["head"]),
             round_number=int(state["round"] or 0),
             gate_lane=state["gate_lane"],
             prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
-            acceptance=acceptance_points(meta.get("body") or ""),
+            acceptance=acceptance_points(body),
             round_started=state["round_started"],
         )
         if state["reflection_keys"] == "ok":

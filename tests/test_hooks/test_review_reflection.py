@@ -68,8 +68,8 @@ def _reflection(
     "round_number, gate, want",
     [
         (1, False, (False, False)),
-        (2, False, (True, False)),
-        (3, False, (False, True)),
+        (2, False, (False, True)),  # premise check first (owner ruling 2026-10-08)
+        (3, False, (True, True)),  # then the class sweep, premise still owed
         (4, False, (False, True)),
         (1, True, (True, False)),
         (2, True, (False, True)),
@@ -227,26 +227,48 @@ def test_lead_is_only_a_round_one_verdict():
     assert any("from round 2" in p for p in rr.parse(_reflection(), round_number=2).problems)
 
 
-def test_round_obligations_by_lane():
-    audit = ["Audit-evidence: ~/.genesis/review_evidence/x.txt NO BLOCKER"]
-    checks = [
-        "Premise-check: P1 TRUE the store already dedups by key",
-        "Premise-check: P2 FALSE replies are never top level",
-    ]
+AUDIT_LINE = "Audit-evidence: ~/.genesis/review_evidence/x.txt NO BLOCKER"
+CHECK_LINES = [
+    "Premise-check: P1 TRUE the store already dedups by key",
+    "Premise-check: P2 FALSE replies are never top level",
+]
+PREMISE_LINES = [*CHECK_LINES, "Premise-evidence: ~/.genesis/review_evidence/p.txt SOUND"]
+
+
+def _problems(*extra, round_number, gate_lane=False):
     sound = "SOUND-BUT-INFERIOR"
+    return rr.parse(
+        _reflection(premise=sound, extra=list(extra)),
+        round_number=round_number,
+        gate_lane=gate_lane,
+    ).problems
+
+
+def test_round_obligations_by_lane():
+    # gate lane: class audit at round 1, premise check at round 2
     assert any(
         "fresh-context audit" in p
         for p in rr.parse(_reflection(), round_number=1, gate_lane=True).problems
     )
-    assert rr.parse(_reflection(extra=audit), round_number=1, gate_lane=True).ok
-    two = rr.parse(_reflection(premise=sound), round_number=2, gate_lane=True)
-    assert any("premise check" in p for p in two.problems)
-    assert rr.parse(_reflection(premise=sound, extra=checks), round_number=2, gate_lane=True).ok
-    twice = [checks[0], checks[0]]
-    again = rr.parse(_reflection(premise=sound, extra=twice), round_number=2, gate_lane=True)
-    assert any("premise check" in p for p in again.problems), "one check written twice"
-    assert rr.parse(_reflection(premise=sound, extra=audit), round_number=2).ok
-    assert not rr.parse(_reflection(premise=sound, extra=checks[:1]), round_number=3).ok
+    assert rr.parse(_reflection(extra=[AUDIT_LINE]), round_number=1, gate_lane=True).ok
+    assert any("premise check" in p for p in _problems(round_number=2, gate_lane=True))
+    assert not _problems(*PREMISE_LINES, round_number=2, gate_lane=True)
+    twice = [CHECK_LINES[0], CHECK_LINES[0], PREMISE_LINES[-1]]
+    again = _problems(*twice, round_number=2, gate_lane=True)
+    assert any("premise check" in p for p in again), "one check written twice"
+    # ordinary lane (owner ruling 2026-10-08): premise check from round 2,
+    # the class sweep at round 3
+    assert any("premise check" in p for p in _problems(AUDIT_LINE, round_number=2))
+    assert not _problems(*PREMISE_LINES, round_number=2)
+    assert any("fresh-context audit" in p for p in _problems(*PREMISE_LINES, round_number=3))
+    assert not _problems(AUDIT_LINE, *PREMISE_LINES, round_number=3)
+    assert not _problems(*PREMISE_LINES, round_number=4)
+
+
+def test_premise_lines_without_their_evidence_file_are_refused():
+    got = _problems(*CHECK_LINES, round_number=2)
+    assert any("cites the premise check's output" in p for p in got), got
+    assert not rr.parse(_reflection(extra=CHECK_LINES), round_number=1).problems
 
 
 def test_a_recurring_class_forbids_fixing_instances():
@@ -422,6 +444,26 @@ def _covered(path, head, **kw):
     return rr.covered_keys(str(path), head, **kw)
 
 
+PREMISE_BLOCK = (
+    "Design-premise: SOUND-BUT-INFERIOR\n"
+    "Expected before checking: the cap holds\n"
+    "P1 TRUE \u2014 the reader is bounded \u00b7 scripts/x.py:12 \u00b7 90% \u00b7 falsified by a huge file\n"
+    "P2 FALSE \u2014 the caller retries \u00b7 scripts/y.py:3 \u00b7 80% \u00b7 falsified by a retry loop\n"
+    "Effect: the gate refuses an oversize audit\n"
+)
+
+
+def _strong_premise(tmp_path: Path) -> Path:
+    evidence = tmp_path / "premise.txt"
+    evidence.write_text(PREMISE_BLOCK)
+    return evidence
+
+
+def _round_two(tmp_path: Path) -> list[str]:
+    """What an ordinary round-2 reflection owes: the premise check."""
+    return [*CHECK_LINES, f"Premise-evidence: {_strong_premise(tmp_path)} SOUND-BUT-INFERIOR"]
+
+
 def _strong_audit(tmp_path: Path) -> Path:
     evidence = tmp_path / "audit.txt"
     evidence.write_text(
@@ -525,12 +567,12 @@ def test_a_hand_made_reflection_meets_the_recurring_class_rule(repo, tmp_path):
     _commit_reflection(path, tmp_path, _reflection(head=first))
     _fix(path, "fix\n")
     second = _git(path, "rev-parse", "HEAD").strip()
-    audit = [f"Audit-evidence: {_strong_audit(tmp_path)} PASS"]
+    owed = _round_two(tmp_path)
     sound = "SOUND-BUT-INFERIOR"
-    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=audit)
+    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=owed)
     _commit_reflection(path, tmp_path, repeat)
     assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
-    closing = _reflection(head=second, premise=sound, decision="close-class", extra=audit)
+    closing = _reflection(head=second, premise=sound, decision="close-class", extra=owed)
     _commit_reflection(path, tmp_path, closing)
     assert _covered(path, second, round_number=2, prior_heads=[first]) == {"c1", "c2"}
 
@@ -546,11 +588,16 @@ def test_a_stray_reflection_cannot_stand_in_for_the_previous_round(repo, tmp_pat
     decoy = _reflection(head="0" * 40, classes=("decoy class = 1",))
     _commit_reflection(path, tmp_path, decoy)
     assert rr.previous_class_labels(str(path), [first]) == ["unchecked subprocess result"]
-    audit = [f"Audit-evidence: {_strong_audit(tmp_path)} PASS"]
+    owed = _round_two(tmp_path)
     sound = "SOUND-BUT-INFERIOR"
-    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=audit)
+    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=owed)
     _commit_reflection(path, tmp_path, repeat)
     assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
+    # Control: the same reflection deciding close-class IS covered, so the
+    # refusal above came from the recurring-class rule and nothing else.
+    closing = _reflection(head=second, premise=sound, decision="close-class", extra=owed)
+    _commit_reflection(path, tmp_path, closing)
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == {"c1", "c2"}
 
 
 def test_a_class_from_any_earlier_round_recurs(repo, tmp_path):
@@ -727,13 +774,586 @@ def test_undecodable_audit_evidence_is_unreadable_not_a_crash(tmp_path):
     """Round 1 of #3055: invalid UTF-8 evidence must refuse the reflection."""
     bad = tmp_path / "bad.txt"
     bad.write_bytes(b"\xff\xfe not utf-8 \xc3")
-    assert "not valid UTF-8" in rr.audit_problem(str(bad), T0, T0)
+    assert "not valid UTF-8" in rr.audit_problem(str(bad), T0, T0, cwd=str(tmp_path))
 
 
 def test_an_audit_with_no_known_commit_time_is_refused(tmp_path):
     strong = _strong_audit(tmp_path)
-    assert "commit time is unknown" in rr.audit_problem(str(strong), T0, None)
-    assert rr.audit_problem(str(strong), T0, datetime.now(UTC) + timedelta(hours=1)) is None
+    cwd = str(tmp_path)
+    assert "commit time is unknown" in rr.audit_problem(str(strong), T0, None, cwd=cwd)
+    later = datetime.now(UTC) + timedelta(hours=1)
+    assert rr.audit_problem(str(strong), T0, later, cwd=cwd) is None
+
+
+# -- the evidence file itself (#3089 items 2, 4 and 5) --------------------------
+
+
+def _evidence(path, *, kind="audit", cwd, made=None):
+    made = made or datetime.now(UTC) + timedelta(hours=1)
+    return rr.evidence_problem(str(path), kind=kind, cwd=str(cwd), round_started=T0, made_at=made)
+
+
+def test_a_pipe_cited_as_evidence_is_refused_not_a_hang(tmp_path):
+    """#3089 item 4: read_bytes() on a FIFO blocked forever. The type is taken
+    from the opened descriptor, so this returns at once."""
+    import threading
+
+    fifo = tmp_path / "audit.fifo"
+    os.mkfifo(fifo)
+    got: list[object] = []
+    worker = threading.Thread(target=lambda: got.append(_evidence(fifo, cwd=tmp_path)))
+    worker.daemon = True
+    worker.start()
+    worker.join(5)
+    if worker.is_alive():
+        # Unblock the stuck open so the daemon thread can finish.
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        pytest.fail("reading a FIFO blocked: the open must not wait for a writer")
+    assert "not a regular file" in str(got[0])
+
+
+def test_a_directory_cited_as_evidence_is_refused(tmp_path):
+    assert "not a regular file" in _evidence(tmp_path, cwd=tmp_path)
+
+
+def test_oversize_evidence_is_refused(tmp_path):
+    big = tmp_path / "big.txt"
+    big.write_bytes(b"x" * (rr.EVIDENCE_MAX_BYTES + 1))
+    assert "larger than" in _evidence(big, cwd=tmp_path)
+
+
+def test_evidence_exactly_at_the_cap_is_read(tmp_path):
+    exact = tmp_path / "exact.txt"
+    exact.write_bytes(b"x" * rr.EVIDENCE_MAX_BYTES)
+    got = _evidence(exact, cwd=tmp_path)
+    assert "larger than" not in got and "not an adversarial audit" in got
+
+
+def test_a_relative_path_is_read_from_the_repository_not_the_process(tmp_path, monkeypatch):
+    """#3089 item 5: a gate runs from wherever its process happens to be."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "audit.txt").write_text(_strong_audit(tmp_path).read_text())
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert _evidence("audit.txt", cwd=repo_dir) is None
+    assert "unreadable" in _evidence("audit.txt", cwd=elsewhere)
+
+
+def test_the_commit_clock_slack_is_one_second(tmp_path):
+    """#3089 item 2: a file written in the commit's own second may carry a
+    later fractional mtime than the whole-second commit time."""
+    audit = _strong_audit(tmp_path)
+    made = datetime(2026, 10, 7, 12, 30, tzinfo=UTC)
+    stamp = made.timestamp()
+    os.utime(audit, (stamp + 0.9, stamp + 0.9))
+    assert _evidence(audit, cwd=tmp_path, made=made) is None
+    os.utime(audit, (stamp + 1.5, stamp + 1.5))
+    assert "after the reflection was committed" in _evidence(audit, cwd=tmp_path, made=made)
+
+
+#: The block as #3107 shipped it: verdict last. The canonical block (#3120)
+#: no longer reads it.
+OLD_PREMISE_BLOCK = (
+    "Design-premise: SOUND-BUT-INFERIOR\n"
+    "Expected before checking: the cap holds\n"
+    "  P1 the reader is bounded — TRUE · scripts/x.py:12\n"
+    "  P2 the caller retries — FALSE · scripts/y.py:3\n"
+)
+
+
+EXPECTED = "Expected before checking: it holds"
+
+
+def _block(head="Design-premise: SOUND", *claims, between=(EXPECTED,)):
+    """A canonical block: the verdict line, the required Expected line (#3238),
+    then the claims. Pass ``between=()`` for a block without the Expected line."""
+    claims = claims or ("P1 TRUE — a", "P2 FALSE — b")
+    return "\n".join([head, *between, *claims]) + "\n"
+
+
+@pytest.mark.parametrize(
+    "text, ok",
+    [
+        (PREMISE_BLOCK, True),
+        (OLD_PREMISE_BLOCK, False),  # verdict last: the shape #3107 shipped
+        (PREMISE_BLOCK.replace("Design-premise", "Premise"), False),  # no verdict line
+        (_block("Design-premise: SOUND", "P1 TRUE — a"), False),  # one claim
+        (_block("Design-premise: SOUND", "P1 TRUE — a", "P1 TRUE — b"), False),  # one distinct
+        (_block("Design-premise: SOUND", "P1 TRUE — a", "P1 FALSE — b", "P2 TRUE \u2014 c"), False),
+        ("Premise: SOUND (~80%)\n| 1 | real | TRUE |\n| 2 | real | FALSE |\n", False),  # summary
+        ("**Design-premise:** SOUND\n- P1 TRUE — a\n- P2 FALSE — b\n", False),  # markdown
+        ("Design-premise: BROKEN\n| P1 | TRUE | a |\n| P2 | FALSE | b |\n", False),  # a table
+        ("  Design-premise: SOUND\n  P1 TRUE — a\n  P2 FALSE — b\n", False),  # quoted, indented
+        ("> Design-premise: SOUND\n> P1 TRUE — a\n> P2 FALSE — b\n", False),  # quoted, >
+        (_block("Design-premise: SOUND", "P1 TRUE — a", "", "P2 FALSE — b"), False),  # gap
+        (_block("Design-premise: SOUND — UNPROVEN(1)", "P1 TRUE — a", "P2 UNPROVEN — b"), True),
+        (_block("Design-premise: BROKEN — premises hold, effect is nil"), True),
+        (_block(between=("Expected before checking: it holds",)), True),
+        (_block(between=("Expected before checking: it", "holds")), False),  # wrapped Expected
+        (_block("Design-premise: SOUND", "  P1 TRUE — a", "\tP2 FALSE — b"), True),
+        # #3127 round 1: the separator and the claim body are required
+        (_block("Design-premise: SOUND", "P1: TRUE \u2014 a", "P2 FALSE \u2014 b"), False),
+        (_block("Design-premise: SOUND", "P1. TRUE \u2014 a", "P2 FALSE \u2014 b"), False),
+        (_block("Design-premise: SOUND", "P1 TRUE a", "P2 FALSE \u2014 b"), False),
+        (_block("Design-premise: SOUND", "P1 TRUE \u2014 a", "P2 FALSE"), False),
+        (_block("Design-premise: SOUND", "P1 TRUE \u2014 a", "P2 FALSE \u2014"), False),
+        (_block("Design-premise: SOUND", "P1 TRUE \u2014 a", "P2  FALSE \u2014 b"), False),
+        (_block("Design-premise: SOUND", "P1 TRUE \u2212 a", "P2 FALSE \u2014 b"), False),
+        (_block("Design-premise: SOUND", "P1 TRUE \u2013 a", "P2 FALSE - b"), True),
+        (_block("Design-premise: SOUND", "P1 TRUE \u2014 a", "P2 FALSE (partially) \u2014 b"), True),
+        (_block(between=("Expected before checking:",)), False),  # empty Expected
+        (_block(between=("Expected before checking:   ",)), False),
+        (
+            "Design-premise: SOUND  \r\nExpected before checking: x \r\nP1 TRUE — a \r\nP2 FALSE — b\r\n",
+            True,
+        ),  # CRLF
+        (_block(between=()), False),  # #3238: the Expected line is required
+        ("Some prose first.\n\n```\n" + _block() + "```\n\nEffect: none\n", True),  # fenced
+    ],
+)
+def test_premise_evidence_must_be_a_premise_check_block(tmp_path, text, ok):
+    """The canonical block of .claude/docs/premise-check.md (#3120): a verdict
+    line at column 0, then at least two distinct ``P<n> <verdict>`` claims,
+    verdict first, directly under it. Markdown, tables, a quoted block and a
+    hand summary are refused (MEASURED 2026-10-08: a summarised premise-check
+    file on disk had neither)."""
+    evidence = tmp_path / "premise.txt"
+    evidence.write_bytes(text.encode())
+    got = _evidence(evidence, kind="premise", cwd=tmp_path)
+    assert (got is None) is ok, got
+
+
+@pytest.mark.parametrize(
+    "line, verdict",
+    [
+        ("Design-premise: SOUND-BUT-INFERIOR", "SOUND-BUT-INFERIOR"),
+        ("Design-premise: SOUND", "SOUND"),
+        ("Design-premise: BROKEN", "BROKEN"),
+        ("Design-premise: SOUND — UNPROVEN(1)", "SOUND"),
+        ("Design-premise: SOUND - UNPROVEN(1)", "SOUND"),
+        ("Design-premise: [SOUND / SOUND-BUT-INFERIOR / BROKEN]", None),  # the template
+        ("Design-premise: SOUND|SOUND-BUT-INFERIOR|BROKEN", None),
+        ("Design-premise: SOUNDNESS", None),
+        ("Design-premise: SOUND/BROKEN", None),
+        ("Design-premise: SOUND / BROKEN", None),
+        ("Design-premise: SOUND-BUT", None),
+        ("Design-premise: SOUND (80%)", None),  # a qualifier needs its dash
+        ("**Design-premise: BROKEN**", None),
+        ("| Design-premise: SOUND |", None),
+        ("later: Design-premise: SOUND", None),
+    ],
+)
+def test_the_premise_verdict_is_read_whole(line, verdict):
+    """Class audit C1c: the verdict is the whole token in its slot, never a
+    prefix of one, a template or a line that only mentions it."""
+    got, claims, why = rr.premise_block(_block(line))
+    assert got == verdict, why
+    if verdict:
+        assert claims == {"1": "TRUE", "2": "FALSE"}
+
+
+@pytest.mark.parametrize(
+    "line, verdict",
+    [
+        ("P1 TRUE — whether FALSE values survive · falsified by an UNPROVEN read", "TRUE"),
+        ("P1 FALSE — TRUE rows only — FALSE", "FALSE"),  # #3120's N3 residual
+        ("P1 UNPROVEN \u2014 TRUE cases are counted", "UNPROVEN"),
+        ("P1 UNPROVEN TRUE cases are counted", None),  # no dash: refused by line
+        ("P1 FALSE (only TRUE rows) \u2014 a", "FALSE"),
+        ("P1 whether TRUE values survive — FALSE", None),  # verdict last: not a claim
+        ("P1 TRUEISH — a", None),
+        ("P1 true — a", None),
+        ("P1TRUE — a", None),
+        ("- P1 TRUE — a", None),
+    ],
+)
+def test_a_claim_verdict_is_the_word_in_its_slot(line, verdict):
+    """#3107 round 2 c4225376510 and #3120: a verdict word inside the claim
+    text was read as the claim's verdict. The verdict is the token right after
+    the claim number, and nothing later on the line can change it."""
+    got = rr.premise_block(_block("Design-premise: SOUND", line, "P2 TRUE — b"))
+    assert got[1].get("1") == verdict
+
+
+def test_claim_lines_outside_the_block_are_prose():
+    """Only the run directly under a verdict line is the claims; the run ends
+    at the first line that is not a claim."""
+    text = _block() + "\nLater, P1 FALSE was considered and rejected.\nP3 FALSE — stray\n"
+    assert rr.premise_block(text)[1] == {"1": "TRUE", "2": "FALSE"}
+
+
+def test_a_misstated_claim_is_refused_when_its_text_names_a_verdict(tmp_path):
+    evidence = tmp_path / "premise.txt"
+    evidence.write_text(
+        "Design-premise: SOUND\n"
+        "Expected before checking: the values survive\n"
+        "P1 FALSE — whether TRUE values survive · x.py:1\n"
+        "P2 TRUE — the caller retries · y.py:3\n"
+    )
+
+    def problem(p1):
+        lines = [
+            f"Premise-check: P1 {p1} whether the stored values survive",
+            "Premise-check: P2 TRUE the caller retries on a refusal",
+            f"Premise-evidence: {evidence} SOUND",
+        ]
+        parsed = rr.parse(_reflection(premise="SOUND", extra=lines), round_number=2)
+        assert parsed.ok, parsed.problems
+        return rr.evidence_problem(
+            str(evidence),
+            kind="premise",
+            cwd=str(tmp_path),
+            round_started=T0,
+            made_at=datetime.now(UTC) + timedelta(hours=1),
+            reflection=parsed,
+        )
+
+    assert "P1 says TRUE" in problem("TRUE")
+    assert problem("FALSE") is None
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "P3 FALSE: the cap fails",
+        "P3 (FALSE, 80%) — the cap fails",
+        "- P3 FALSE — the cap fails",
+        "**P3 FALSE** — the cap fails",
+        "P2 TRUE — b",
+        "P100 TRUE — c",
+        # #3127 round 1 c4226814093: a bare or bodiless claim after two good ones
+        "P3 FALSE",
+        "P3 FALSE —",
+        "P3: FALSE — x",
+    ],
+)
+def test_a_near_miss_claim_is_refused_by_its_line(line):
+    """#3120 acceptance 3, diff audit SF-2: a claim in a near-miss shape under
+    the run used to end the claims silently, dropping it while the block was
+    still accepted."""
+    got = rr.premise_block(_block("Design-premise: SOUND", "P1 TRUE — a", "P2 TRUE — b", line))
+    assert got[0] is None and "line 5 is inside the premise block" in got[2], got
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "note\x0bDesign-premise: BROKEN\x0bP1 FALSE — a\x0bP2 FALSE — b\n",
+        "note Design-premise: BROKEN P1 FALSE — a P2 FALSE — b\n",
+        "x\rDesign-premise: BROKEN\rP1 FALSE — a\rP2 FALSE — b\r",
+        "Design‑premise: SOUND\nP1 TRUE — a\nP2 TRUE — b\n",
+        "Design-premise: SOUND‑BUT‑INFERIOR\nP1 TRUE — a\nP2 TRUE — b\n",
+        "Design-premise: SOUND\nP1 TRUE — a\nP2 TRUE — b\n",
+        "﻿Design-premise: SOUND\nP1 TRUE — a\nP2 TRUE — b\n",
+    ],
+)
+def test_lookalikes_and_in_line_separators_make_no_block(text):
+    """Diff audit NOTE-1/4: lines split on newlines only, as the reflection's
+    own reader does, so a block is never read out of the middle of one line;
+    and a lookalike hyphen or space is not the block's grammar."""
+    assert rr.premise_block(text)[0] is None
+
+
+def test_a_claim_like_line_further_down_is_prose():
+    """A claim-like line past the block's paragraph (after a blank line) is
+    prose: a review's later prose starting with "P2" is not a claim and not
+    refused."""
+    text = _block() + "\nEffect: x\nP2 is the weak one\nP3 FALSE: worth a look\n"
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        "Design-premise: BROKEN (80%)",
+        "Design-premise: BROKEN.",
+        "Design-premise: BROKEN, 80%",
+        "Design-premise: broken",
+        "Design-premise:BROKEN",
+        "**Design-premise:** BROKEN",
+        "design-premise: BROKEN",
+        "Design premise: BROKEN",
+        "Design-premise: BROKEN \u2014",
+        "Design-premise: <SOUND | SOUND-BUT-INFERIOR | BROKEN>",
+    ],
+)
+def test_a_near_miss_verdict_line_is_refused_by_its_line(later):
+    """#3127 round 1 c4226814101: a column-0 line opening like a verdict line
+    but not matching it was skipped, so a contradicting closing summary passed
+    the agreement check. It is refused, naming the line."""
+    for text in (_block() + "\n" + later + "\n", later + "\n\n" + _block()):
+        got = rr.premise_block(text)
+        assert got[0] is None and "starts like a 'Design-premise:' line" in got[2], (text, got)
+
+
+@pytest.mark.parametrize("quote", ["    Design-premise: BROKEN (80%)", "> Design-premise: BROKEN (80%)"])
+def test_a_quoted_near_miss_verdict_line_is_prose(quote):
+    """The doc's quoting rule: an indented or >-quoted verdict line is not the
+    author's, so it neither counts nor refuses."""
+    text = _block() + "\nAn earlier round said:\n\n" + quote + "\n"
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        "## Design-premise: BROKEN",
+        "- Design-premise: BROKEN (80%)",
+        "* Design-premise: SOUND-BUT-INFERIOR — residual",
+        "1. Design-premise: BROKEN",
+        "Design‑premise: BROKEN (80%)",
+    ],
+)
+def test_a_marked_or_lookalike_verdict_is_refused(later):
+    """#3127 round-1 fix audit SF-1: a verdict in a heading or list item, or
+    with a lookalike hyphen, still bound silently after a valid block."""
+    got = rr.premise_block(_block() + "\n" + later + "\n")
+    assert got[0] is None and f"line {len(_block().split(chr(10))) + 1}" in got[2], got
+
+
+def test_a_bare_section_heading_is_not_a_verdict():
+    text = "## Design-premise:\n\n" + _block() + "\n### Design premise check\n"
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
+def test_a_restated_verdict_then_claim_like_prose_is_refused_by_line():
+    """Fix audit NOTE 1: prose that starts like a claim in a restating
+    block's paragraph is refused by the paragraph scan, naming the line."""
+    text = _block() + "\nDesign-premise: SOUND\nP3 FALSE positives remain\n"
+    got = rr.premise_block(text)
+    assert got[0] is None and "line 7 is inside the premise block that starts at line 6" in got[2], got
+
+
+@pytest.mark.parametrize(
+    "between, culprit",
+    [
+        (("Expected before checking:",), 2),
+        (("Expected before checking: it", "holds"), 3),
+    ],
+)
+def test_a_broken_expected_line_is_named_not_the_claim_under_it(between, culprit):
+    """Fix audit SF-2: the refusal names the line that broke the block, never
+    the valid claim under it."""
+    got = rr.premise_block(_block(between=between))
+    assert got[0] is None and f"line {culprit} is inside the premise block" in got[2], got
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # #3238 item 2: every markdown claim marker, and spellings no marker list names
+        "+ P3 FALSE — c",
+        "# P3 FALSE — c",
+        "1. P3 FALSE — c",
+        "(1) P3 FALSE — c",
+        "• P3 FALSE — c",
+        "- [ ] P3 FALSE — c",
+        "> - P3 FALSE — c",
+        "P-3 FALSE — c",
+        " P3 FALSE — c",
+        # #3238 item 1: a misplaced Expected line, and any other prose
+        "Expected before checking: later",
+        "Note: one more thing",
+        "Effect:",
+    ],
+)
+def test_the_block_paragraph_is_closed(line):
+    """#3238: from the verdict line to the next blank line, every line must be
+    one of the block's lines. Any other line refuses by its line number rather
+    than being read as prose, so no spelling of a claim can be dropped."""
+    got = rr.premise_block(_block() + line + "\n")
+    assert got[0] is None and "line 5 is inside the premise block" in got[2], got
+
+
+def test_the_trailer_lines_and_a_closing_fence_belong_to_the_block():
+    text = "```\n" + _block() + "Effect: x\nBetter shape: none found\nPR-shape: OK (10)\n```\n"
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+    claim_after_trailer = _block() + "Effect: x\nP3 FALSE — c\n"
+    assert "line 6 is inside the premise block" in rr.premise_block(claim_after_trailer)[2]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _block(between=()),
+        "Expected before checking: x\n" + _block(between=()),
+        _block(between=()) + "\nExpected before checking: x\n",
+    ],
+)
+def test_the_expected_line_is_required_directly_under_the_verdict(text):
+    """#3238 item 1 (owner: Expected is required): a block without its
+    Expected line, or with it anywhere but directly under the verdict, is
+    refused."""
+    got = rr.premise_block(text)
+    assert got[0] is None and "Expected before checking" in got[2], got
+
+
+def test_persisted_state_after_the_trailers_belongs_to_the_block():
+    """#3238 diff audit SF-1: the architect agent's Step 0.7 emits
+    Persisted-state right after PR-shape; the closed paragraph allows it."""
+    text = _block() + "Effect: x\nBetter shape: none found\nPR-shape: OK (5)\nPersisted-state: NONE\n"
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
+def test_an_expected_line_on_a_claimless_stub_does_not_count():
+    """Diff audit NOTE 2: the Expected line must sit on a block that has
+    claims; a trailing verdict-plus-Expected stub does not carry it."""
+    text = _block(between=()) + "\nDesign-premise: SOUND\nExpected before checking: x\n"
+    got = rr.premise_block(text)
+    assert got[0] is None and "Expected before checking" in got[2], got
+
+
+def test_the_block_begins_at_its_verdict_line():
+    """Diff audit NOTE 3, a stated residual: the paragraph is closed downward
+    from the verdict line. Lines above it are prose, so the doc asks for a
+    blank line above the verdict line; a claim-like line there is not read."""
+    text = "P3 FALSE — c\n" + _block()
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
+def test_a_headline_summary_block_need_not_repeat_the_expected_line():
+    text = _block(between=()) + "\n" + _block()
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
+@pytest.mark.parametrize(
+    "line, refused",
+    [
+        # #3238 item 3: a heading or list item is a verdict only by its uppercase token
+        ("1. Design-premise: what evidence would make this sound?", False),
+        ("## Design-premise: compare sound and broken shapes", False),
+        ("## Design-premise: Sound reasoning, weak evidence", False),
+        ("- Design-premise: Broken", False),  # title case: stated residual, prose
+        ("> Design-premise: BROKEN", False),  # the doc's quote form
+        ("## Design-premise: BROKEN", True),
+        ("- Design-premise: `BROKEN`", True),
+        ('- Design-premise: "BROKEN"', True),
+        ("- Design-premise: verdict BROKEN", True),
+        ("1) Design-premise: SOUND-BUT-INFERIOR", True),
+        ("| Design-premise: | BROKEN |", True),  # diff audit NOTE 4: a table row
+    ],
+)
+def test_a_marked_verdict_line_is_judged_by_its_uppercase_token(line, refused):
+    got = rr.premise_block(line + "\n\n" + _block())
+    if refused:
+        assert got[0] is None and "line 1 gives a 'Design-premise:' verdict" in got[2], got
+    else:
+        assert got == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None), got
+
+
+def test_a_wrapped_claim_is_refused_rather_than_dropping_the_rest():
+    """#3127 round 1 class audit C8: a wrapped claim ended the run and every
+    claim after it was silently dropped. #3238 closes the paragraph, so the
+    wrapped tail of the LAST claim (once accepted, C9) is refused too."""
+    text = _block("Design-premise: SOUND", "P1 TRUE \u2014 a", "P2 FALSE \u2014 b is long", "and wraps", "P3 FALSE \u2014 c")
+    got = rr.premise_block(text)
+    assert got[0] is None and "line 5 is inside the premise block" in got[2], got
+    tail = _block("Design-premise: SOUND", "P1 TRUE \u2014 a", "P2 FALSE \u2014 b is long", "and wraps")
+    got = rr.premise_block(tail)
+    assert got[0] is None and "line 5 is inside the premise block" in got[2], got
+
+
+def test_repeated_blocks_must_agree():
+    """A summary may restate the verdict and any claims with the same verdicts.
+    A second verdict, a changed verdict or an added claim is refused, never
+    resolved."""
+    two = "Design-premise: SOUND\n" + _block("Design-premise: BROKEN")
+    assert "more than one" in rr.premise_block(two)[2]
+    again = _block() + "\nSummary:\n\n" + _block()
+    assert rr.premise_block(again)[:2] == ("SOUND", {"1": "TRUE", "2": "FALSE"})
+    flipped = _block() + "\n" + _block("Design-premise: SOUND", "P1 FALSE — a", "P2 FALSE — b")
+    assert "never add or change one" in rr.premise_block(flipped)[2]
+    headline = "Design-premise: SOUND\n\nDetail:\n\n" + _block()
+    assert rr.premise_block(headline)[:2] == ("SOUND", {"1": "TRUE", "2": "FALSE"})
+    partial = _block() + "\nSummary:\nDesign-premise: SOUND\nP2 FALSE — b\n"
+    assert rr.premise_block(partial)[:2] == ("SOUND", {"1": "TRUE", "2": "FALSE"})
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        # diff audit SF-1(a): a restated verdict line, then a claim the first block lacks
+        "\nDesign-premise: SOUND\nP3 FALSE \u2014 positives remain in the corpus\n",
+        # SF-1(b): a column-0 quote of an earlier round's block inside a fence
+        "\n```\nDesign-premise: SOUND\nP3 TRUE — old claim\nP4 FALSE — old\n```\n",
+    ],
+)
+def test_a_later_block_cannot_add_claims(later):
+    """A later block may only restate the first one; claims the author never
+    stated in their own block are never read as theirs."""
+    got = rr.premise_block(_block() + later)
+    assert got[0] is None and "never add or change one" in got[2], got
+
+
+def _bound(tmp_path, *, premise="SOUND-BUT-INFERIOR", cited="SOUND-BUT-INFERIOR", checks=CHECK_LINES):
+    lines = [*checks, f"Premise-evidence: {_strong_premise(tmp_path)} {cited}"]
+    parsed = rr.parse(_reflection(premise=premise, extra=lines), round_number=2)
+    assert parsed.ok, parsed.problems
+    return rr.evidence_problem(
+        parsed.premise_evidence,
+        kind="premise",
+        cwd=str(tmp_path),
+        round_started=T0,
+        made_at=datetime.now(UTC) + timedelta(hours=1),
+        reflection=parsed,
+    )
+
+
+def test_the_premise_verdict_is_bound_to_the_reflection(tmp_path):
+    """#3107 c4222860280: the file's verdict was checked only for existence, so
+    a file concluding BROKEN could be cited by a reflection saying SOUND."""
+    assert _bound(tmp_path) is None
+    assert "cites it as SOUND" in _bound(tmp_path, cited="SOUND")
+    assert "Premise is SOUND" in _bound(tmp_path, premise="SOUND")
+    flipped = ["Premise-check: P1 FALSE the store already dedups", CHECK_LINES[1]]
+    assert "P1 says FALSE" in _bound(tmp_path, checks=flipped)
+    unknown = [*CHECK_LINES, "Premise-check: P7 TRUE a claim the file never made"]
+    assert "has no claim P7" in _bound(tmp_path, checks=unknown)
+
+
+def test_a_premise_evidence_line_needs_its_verdict():
+    line = "Premise-evidence: ~/.genesis/review_evidence/p.txt"
+    got = rr.parse(_reflection(extra=[*CHECK_LINES, line]), round_number=2)
+    assert any("not a recognised field" in p for p in got.problems)
+
+
+def test_a_reflection_giving_one_claim_two_verdicts_is_refused():
+    twice = [*CHECK_LINES, "Premise-check: P1 FALSE the store already dedups by key"]
+    got = rr.parse(_reflection(extra=twice), round_number=1)
+    assert any("given two verdicts" in p for p in got.problems)
+
+
+def test_a_broken_premise_check_cannot_cover_its_findings(repo, tmp_path):
+    """The file decides: BROKEN cited honestly escalates, and cited as anything
+    else it fails the binding; either way nothing is covered."""
+    path, first = repo
+    _commit_reflection(path, tmp_path, _reflection(head=first))
+    _fix(path, "fix\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    broken = tmp_path / "broken.txt"
+    broken.write_text(PREMISE_BLOCK.replace("SOUND-BUT-INFERIOR", "BROKEN"))
+    for premise in ("BROKEN", "SOUND-BUT-INFERIOR"):
+        lines = [*CHECK_LINES, f"Premise-evidence: {broken} {premise}"]
+        _commit_reflection(path, tmp_path, _reflection(head=second, premise=premise, extra=lines))
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
+
+
+def test_a_round_two_reflection_needs_a_real_premise_check(repo, tmp_path):
+    path, first = repo
+    _commit_reflection(path, tmp_path, _reflection(head=first))
+    _fix(path, "fix\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    summary = tmp_path / "summary.txt"
+    summary.write_text("Premise: SOUND\n| 1 | TRUE |\n| 2 | FALSE |\n")
+    lines = [*CHECK_LINES, f"Premise-evidence: {summary} SOUND"]
+    sound = "SOUND-BUT-INFERIOR"
+    _commit_reflection(path, tmp_path, _reflection(head=second, premise=sound, extra=lines))
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
+    owed = _round_two(tmp_path)
+    _commit_reflection(path, tmp_path, _reflection(head=second, premise=sound, extra=owed))
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == {"c1", "c2"}
 
 
 def test_an_audit_written_after_the_reflection_is_refused(repo, tmp_path):
@@ -785,6 +1405,56 @@ def test_an_acceptance_point_maps_within_one_covered_scope_line(scopes, ok):
     point = "the gate refuses an unreadable PR body"
     got = rr.parse(_reflection(scopes=scopes), round_number=1, acceptance=[point])
     assert got.ok is ok, got.problems
+
+
+def test_an_open_round_with_unknown_keys_still_reports_its_timing():
+    """GLM secondary P3: owed stays unknown, but the settle window is still
+    reported, so a reader can tell when the round settles."""
+    got = rr.owed_state(_budget(reflection_keys="unknown"), (), now=T0 + timedelta(hours=1))
+    assert got["owed"] is None
+    assert got["round_started"] == T0.isoformat() and got["settled"]
+    assert got["settle_until"] == (T0 + rr.SETTLE).isoformat()
+
+
+def _status_with(monkeypatch, path, budget):
+    import review_budget
+
+    monkeypatch.setattr(rr, "pr_identity", lambda cwd: ("o/r", 7))
+    monkeypatch.setattr(review_budget, "evaluate_pr", lambda repo, number: budget)
+
+    def no_second_read(repo, number):
+        raise AssertionError("the body came with the budget; no gh pr view")
+
+    monkeypatch.setattr(rr, "_pr_meta", no_second_read)
+    return rr.status(str(path), now=T0 + timedelta(hours=1))
+
+
+def test_status_binds_acceptance_to_the_budget_body(repo, tmp_path, monkeypatch):
+    """#3107 c4222860305: the acceptance points come from the body the budget
+    read, and no second read of the PR is made."""
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=head))
+    plain = _budget(open_keys=["c1"], current_head=head, body="no acceptance section")
+    assert _status_with(monkeypatch, path, plain)["owed"] == []
+    # Control: the same reflection under a body that declares an acceptance
+    # point it never maps is not covered, so the body really was read.
+    declared = dict(plain, body="## Acceptance\n- the cap holds on every path\n")
+    assert _status_with(monkeypatch, path, declared)["owed"] == ["c1"]
+
+
+def test_status_refuses_a_body_that_changed_between_reads(repo, monkeypatch):
+    path, head = repo
+    budget = _budget(current_head=head, body=None, body_changed=True)
+    with pytest.raises(rr.Refused, match="changed between the two reads"):
+        _status_with(monkeypatch, path, budget)
+
+
+def test_status_refuses_a_carried_body_it_cannot_read(repo, monkeypatch):
+    """A budget that carries the key but no text never falls back to a third,
+    unsynchronised read."""
+    path, head = repo
+    with pytest.raises(rr.Refused, match="could not be read"):
+        _status_with(monkeypatch, path, _budget(current_head=head, body=None))
 
 
 def test_status_subtracts_what_is_covered(repo, tmp_path, monkeypatch):

@@ -15,6 +15,10 @@ import os
 import sys
 from pathlib import Path
 
+# -I does not stop bytecode writes. Set before the runtime's own imports so they
+# create no __pycache__; the venv's startup .pth modules rely on install-time
+# compilation, since the sealed argv is fixed.
+sys.dont_write_bytecode = True
 RUNTIME_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(RUNTIME_ROOT / "src"))
 sys.path.insert(0, str(RUNTIME_ROOT / "scripts"))
@@ -70,7 +74,7 @@ def execute(request: object) -> dict:
 
 
 def main() -> int:
-    parser = RequestParser()
+    parser = RequestParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--workspace-root", required=True)
     parser.add_argument("--request", required=True)
     try:
