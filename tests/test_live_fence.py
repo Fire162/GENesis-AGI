@@ -246,6 +246,11 @@ def update_routes(tmp_path, monkeypatch):
     # processes, and these writes are not what this test is measuring.
     monkeypatch.setattr(updates, "_GENESIS_DIR", tmp_path / "gd")
     monkeypatch.setattr(updates, "_HOME", tmp_path)
+    # The spawns run with cwd= the checkout root: a temp root, never the deployed
+    # checkout (which a CI runner does not have at all).
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(updates, "_GENESIS_ROOT", root)
     app = Flask(__name__)
     with app.app_context():
         yield updates
@@ -272,7 +277,7 @@ def test_replay_supervised_fallback_never_reaches_claude(update_routes, monkeypa
     """systemd-run missing → the orchestrator starts as a plain python process.
     That process is allowed; the `claude` it starts is not (PATH shim)."""
     root = tmp_path / "root"
-    (root / ".venv" / "bin").mkdir(parents=True)
+    (root / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
     (root / ".venv" / "bin" / "python").symlink_to(sys.executable)
     monkeypatch.setattr(update_routes, "_GENESIS_ROOT", root)
     monkeypatch.setenv("HOME", str(tmp_path))
