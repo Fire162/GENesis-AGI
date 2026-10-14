@@ -1328,8 +1328,15 @@ def _keep_substitutions_whole(text: str) -> str:
 
     Each span is bounded by :func:`_command_sub_close` and passed through
     byte for byte; inside ``"…"`` the quote is closed around it and reopened.
-    An unterminated span leaves the text unchanged (bash refuses it as a syntax
+    An arithmetic ``$((…))`` is one word too (``X=$((1 + 2)) git push`` hid the
+    push the same way), and its parentheses balance the same way. An
+    unterminated span leaves the text unchanged (bash refuses it as a syntax
     error and runs none of it).
+
+    KNOWN OVER-BLOCK: a heredoc body is still split into segments here (issue
+    #1748), so a body line such as ``X=$(id -u) git push`` now yields a push
+    segment, exactly as the same line without the prefix already did. It adds a
+    refusal of data, never hides a command.
 
     This reading is ADDED to the old one, never substituted for it: see
     :func:`_whole_word_reading`. The scanner does not model every construct bash
@@ -1360,7 +1367,7 @@ def _keep_substitutions_whole(text: str) -> str:
             in_dq = not in_dq
             i += 1
             continue
-        if c == "$" and text.startswith("$(", i) and not text.startswith("$((", i):
+        if c == "$" and text.startswith("$(", i):
             close = _command_sub_close(text, i, n)
             if close is None:
                 return text

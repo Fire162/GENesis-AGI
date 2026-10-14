@@ -327,6 +327,9 @@ def _pushes(command: str) -> list[Segment]:
         "X=$(echo\\) a b) git push origin main",
         'env X=$(echo")" a b) git push origin main',
         '(X=$(echo")" a b) git push origin main)',
+        # An arithmetic expansion is one word as well.
+        "X=$((1 + 2)) git push origin main",
+        "env X=$((1 + 2)) git push origin main",
         # Both readings name git, with different operations.
         "X=$(command git rev-parse HEAD) git push origin main",
         "X=$(echo git status) git push origin main",
