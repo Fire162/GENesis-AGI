@@ -87,6 +87,16 @@
 # Pages name processes, never their arguments: a command line can carry a
 # credential, and a page leaves the machine (review finding, P1).
 #
+# A holder's identity is read through ONE handle on its /proc entry
+# (scripts/lib/wg_proc.py): the descriptor still leading to the file, the
+# process's start time, its name and its parent all come from that process,
+# never from a pid that was reused in between. _RW_IDENT[pid] holds what it
+# read this poll ("starttime state comm ppid pcomm", tab-separated, "?" where
+# it could not tell). Names are made safe for a page there: a process chooses
+# its own name, and a newline in it could forge page lines. Without python3,
+# or if the read does not finish, the holders are the ones the stat above
+# found, with unknown identity and control bytes removed from their names.
+#
 # Pure functions; nothing runs at source time. DG_PROC (default /proc) lets the
 # tests point the walk at a fake process table.
 
@@ -123,6 +133,9 @@ declare -gA _RW_LINKS=() _RW_DUE=()
 # measured, so growth is still judged against it (review finding).
 declare -gA _RW_PREV_AT=()
 _RW_PREV_T=0
+# Per pid, this poll only: the identity wg_proc.py read (see the header).
+declare -gA _RW_IDENT=()
+_RW_PROC_PY="${BASH_SOURCE[0]%/*}/wg_proc.py"
 # Set by wg_runaway_check: 1 when some file grew fast enough to want 5 s polls.
 # shellcheck disable=SC2034  # read by check_disks in tmp_watchgod.sh
 RUNAWAY_FAST=0
@@ -207,16 +220,40 @@ _rw_domain_for() {
     printf '%s\n' "${best:-$fallback}"
 }
 
+_rw_show() {
+    # $1 made safe for a page or a log line: a file name is chosen by whoever
+    # created the file, and a newline, a Unicode line separator or a bidi
+    # control in it could forge or disguise page lines (review finding). The
+    # same sanitiser as the process names; printable ASCII only without it.
+    local out
+    if out="$(printf '%s' "$1" | timeout -k 1 5 python3 -I -S "$_RW_PROC_PY" - safe 2>/dev/null)" \
+            && [[ -n "$out" ]]; then
+        printf '%s' "$out"
+    else
+        printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' '?'
+    fi
+}
+
 _rw_holders() {
     # One line per distinct holder: "pid comm (parent ppid: comm)". Never the
     # command line: arguments can carry credentials, and the page leaves the
     # machine (review finding, P1).
+    # Names come from the identity read through the holder's own /proc handle
+    # (_RW_IDENT); without one, from comm with everything but printable
+    # ASCII replaced (any locale: a multibyte line separator or bidi control
+    # must not reach the page either).
     local proc="${DG_PROC:-/proc}" pid comm ppid pcomm
     for pid in "$@"; do
-        comm="$(cat "$proc/$pid/comm" 2>/dev/null)" || comm="?"
-        ppid="$(awk '/^PPid:/ { print $2; exit }' "$proc/$pid/status" 2>/dev/null)" || ppid=""
-        pcomm="?"
-        [[ "$ppid" =~ ^[0-9]+$ ]] && pcomm="$(cat "$proc/$ppid/comm" 2>/dev/null)" || true
+        if [[ -n "${_RW_IDENT[$pid]:-}" ]]; then
+            IFS=$'\t' read -r _ _ comm ppid pcomm <<< "${_RW_IDENT[$pid]}"
+        else
+            comm="$(cat "$proc/$pid/comm" 2>/dev/null)" || comm="?"
+            ppid="$(awk '/^PPid:/ { print $2; exit }' "$proc/$pid/status" 2>/dev/null)" || ppid=""
+            pcomm="?"
+            [[ "$ppid" =~ ^[0-9]+$ ]] && pcomm="$(cat "$proc/$ppid/comm" 2>/dev/null)" || true
+            comm="$(printf '%s' "$comm" | LC_ALL=C tr -c '[:print:]' '?')"
+            pcomm="$(printf '%s' "$pcomm" | LC_ALL=C tr -c '[:print:]' '?')"
+        fi
         printf '  pid %s %s (parent %s: %s)\n' "$pid" "${comm:-?}" "${ppid:-?}" "${pcomm:-?}"
     done
 }
@@ -303,6 +340,41 @@ wg_runaway_check() {
             log WARN "runaway-file revalidation did not complete (status ${st_rc}; timeout ${DG_RUNAWAY_SCAN_TIMEOUT_S} s) — files were not revalidated this poll (a killed stat loses its buffered output)"
         fi
     fi
+    # Bind each holder still pointing at its file to the process behind it:
+    # one python3 run per poll, under the same bound as the stat (it stats the
+    # descriptors again). bound[key pid] marks a holder it confirmed. If it did
+    # not run to completion, holders stay as the stat above found them.
+    local -A bound=()
+    local bound_ok=0 cand="" ncand=0 bk bp bst bstate bcomm bppid bpcomm
+    _RW_IDENT=()
+    for key in "${!fds_of[@]}"; do
+        for pf in ${fds_of[$key]}; do
+            read -r id _ <<< "${st_of["${DG_PROC:-/proc}/${pf%/*}/fd/${pf#*/}"]:-}" || id=""
+            [[ "$id" == "$key" ]] || continue
+            cand+="${key} ${pf%/*} ${pf#*/}"$'\n'
+            ncand=$(( ncand + 1 ))
+        done
+    done
+    # Never silent (review finding): a read that fails leaves the writers
+    # unbound, and one that confirms nobody hides every file this poll.
+    if [[ -n "$cand" ]]; then
+        local idout id_rc=0
+        if ! command -v python3 >/dev/null 2>&1; then
+            _wg_warn_once rw_ident_nopy "runaway-file identity read skipped: no python3; writers are named without their start time"
+        elif idout="$(timeout -k 2 "$DG_RUNAWAY_SCAN_TIMEOUT_S" python3 -I -S "$_RW_PROC_PY" "${DG_PROC:-/proc}" holders \
+                          <<< "$cand" 2>/dev/null)"; then
+            bound_ok=1
+            while IFS=$'\t' read -r bk bp bst bstate bcomm bppid bpcomm; do
+                [[ -n "$bk" && "$bp" =~ ^[0-9]+$ ]] || continue
+                bound["$bk $bp"]=1
+                _RW_IDENT[$bp]="${bst}"$'\t'"${bstate}"$'\t'"${bcomm}"$'\t'"${bppid}"$'\t'"${bpcomm}"
+            done <<< "$idout"
+            (( ${#bound[@]} )) || log WARN "runaway-file identity read confirmed none of the ${ncand} writers the stat found; the files only they hold are not checked this poll"
+        else
+            id_rc=$?
+            _wg_warn_once "rw_ident_rc${id_rc}" "runaway-file identity read failed (status ${id_rc}; timeout ${DG_RUNAWAY_SCAN_TIMEOUT_S} s); writers are named without their start time"
+        fi
+    fi
     for key in "${!size_of[@]}"; do
         # Every descriptor is re-checked: since the walk, one may have been
         # closed, its number reused, or its process gone. A holder counts only
@@ -315,6 +387,9 @@ wg_runaway_check() {
             local l="${DG_PROC:-/proc}/${pfpid}/fd/${pf#*/}" b="" k=""
             read -r id b k <<< "${st_of[$l]:-}" || id=""
             [[ "$id" == "$key" ]] || continue
+            # Not confirmed through its own /proc handle: closed, exited, or
+            # its pid reused since the stat.
+            (( bound_ok )) && [[ -z "${bound["$key $pfpid"]:-}" ]] && continue
             # A followed descriptor must still be a writer's: the same number
             # reopened read-only is not the writer that was paged (review
             # finding). The scan already checked its own.
@@ -397,8 +472,13 @@ wg_runaway_check() {
         [[ -n "$why" ]] || continue
         (( opened )) && continue
         [[ " ${_RW_PAGED[$gen]:-} " == *" mode${pg} "* ]] && continue
+        # The raw path stays the key for the domain and the session; only
+        # what is shown goes through the sanitiser.
+        local spath
+        spath="$(_rw_show "$path")"
         sid="$(_rw_session_of "${path% (deleted)}")"
-        body="${path}: ${size_mb} MB in use, held open for writing. Why flagged: ${why}."$'\n'"Writers:"$'\n'"$(_rw_holders "${holders[@]:0:DG_RUNAWAY_MAX_HOLDERS}")"
+        [[ -n "$sid" ]] && sid="$(_rw_show "$sid")"
+        body="${spath}: ${size_mb} MB in use, held open for writing. Why flagged: ${why}."$'\n'"Writers:"$'\n'"$(_rw_holders "${holders[@]:0:DG_RUNAWAY_MAX_HOLDERS}")"
         (( ${#holders[@]} > DG_RUNAWAY_MAX_HOLDERS )) && body+=$'\n'"  +$(( ${#holders[@]} - DG_RUNAWAY_MAX_HOLDERS )) more"
         [[ -n "$sid" ]] && body+=$'\n'"Claude Code session: ${sid}"
         local pkey="watchgod:runaway:${gen}" again=""
@@ -409,13 +489,13 @@ wg_runaway_check() {
             body+=$'\n'"It shrank after an earlier page (at ${since}) and is over the threshold again."
         fi
         body+=$'\n'"The guardian has not acted on it. Stop the writer, or empty the file, before the filesystem fills."
-        if _wg_page critical "Runaway file on ${dpath}: ${path##*/}${again}" "$body" \
-                "$pkey" "CRITICAL — runaway ${path} (${size_mb} MB)${again}"; then
+        if _wg_page critical "Runaway file on ${dpath}: ${spath##*/}${again}" "$body" \
+                "$pkey" "CRITICAL — runaway ${spath} (${size_mb} MB)${again}"; then
             _RW_PAGED[$gen]="${_RW_PAGED[$gen]:-} mode${pg}"
             # Only this mode's debt: the other mode still owes its own page
             # (review finding).
             unset "_RW_DUE[$gen$pg]"
-            log WARN "runaway file ${path} (${size_mb} MB; ${why}); writers: ${holders[*]}"
+            log WARN "runaway file ${spath} (${size_mb} MB; ${why}); writers: ${holders[*]}"
         else
             _RW_DUE[$gen$pg]="${why% (found at an earlier poll*}"
         fi
