@@ -248,6 +248,43 @@ a test behaves as it does on CI, where none exist. Child processes inherit it.
     and a reader of the fixed `~/genesis/data/genesis.db` path ignores
     `GENESIS_DB_PATH`.
 
+### The outbound fence: tests never connect to a live service
+
+`tests/_live_outbound.py`, armed after the live closure, refuses a test's
+connection to a service running on this machine, the way CI refuses it because
+nothing listens there. A PEP 578 audit hook judges every in-process
+`socket.connect`:
+
+- **TCP to this machine** (loopback, `0.0.0.0`/`::`, or one of its own
+  addresses): refused when the port is listening NOW and no listening socket on
+  it belongs to the pytest process or one of its children. Decided at connect
+  time, so a test's own server (in a thread or a child) is always reachable, a
+  service that started mid-run is still fenced, and a port nobody listens on
+  fails on its own.
+- **TCP to a private address that is not this machine** (the RFC 1918, CGNAT,
+  link-local and ULA ranges in `genesis.util.netclass`): refused on any port.
+- Port 53 (DNS) is exempt everywhere.
+- **Unix sockets** under the real home, `/run/user/<uid>/` or `/run/dbus/`
+  that are listening and not owned by the pytest tree: refused with
+  `FileNotFoundError`, which is what CI gives for a socket that does not exist.
+- Public addresses are untouched.
+
+A refusal raises `ConnectionRefusedError` (or `FileNotFoundError`) to the
+caller, so the code under test takes its CI path. The test is NOT failed; each
+refusal is listed in the run summary under "live fence: live connections
+refused", and `GENESIS_LIVE_OUTBOUND_REPORT=<file>` writes them per test (an
+empty file on a clean run).
+
+A test that must reach a live service is marked `live_service` and gated on
+`GENESIS_LIVE_E2E=1` (the Qdrant collection, retriever and FalkorDB engine
+tests are); the fence lets it connect for its whole run, setup and teardown
+included, and the summary lists it. Mark the whole module when its fixtures
+connect.
+
+Known gaps, by design (the OS-level sandbox is the boundary): connections made
+by child processes (the memory hook's URL is redirected by the live closure),
+connects done in C (curl_cffi), and UDP.
+
 ## Integration Tests
 
 Integration tests in `tests/integration/` require running external services
