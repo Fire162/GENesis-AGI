@@ -213,6 +213,41 @@ guardrail (code in the test process could get around it), not a sandbox.
     where CI raises "not found", and a system-level `systemctl` also gets "Failed
     to connect to bus".
 
+### The live closure: tests run without this machine's credentials
+
+`tests/_live_closure.py`, armed right after the live fence, takes credentials
+and live state paths out of the process environment before any test runs, so
+a test behaves as it does on CI, where none exist. Child processes inherit it.
+
+- `SECRETS_PATH` names a file that does not exist, so every `secrets.env`
+  loader that honours it loads nothing. Each test gets its own such path under
+  its `tmp_path`, so a script that writes there (`restore.sh`) cannot leave a
+  file for the next test. A test that runs `backup.sh` or `restore.sh` against
+  a sandbox `GENESIS_DIR` drops `SECRETS_PATH` from the child's environment, so
+  the sandbox decides where the secrets file is, as on CI.
+- Credential-shaped variables are removed for the run: `SSH_AUTH_SOCK`,
+  `GH_TOKEN`, `GITHUB_TOKEN`, and names containing `_API_KEY`, `_SECRET`,
+  `PASSWORD`, `PASSPHRASE`, `WEBHOOK`, `CREDENTIAL`, `_ACCESS_KEY` or
+  `_PRIVATE_KEY`, starting `API_KEY_`, or ending `_TOKEN`, `_PASS` or
+  `_KEY_ID`. The run summary lists their names, never values.
+- `GH_CONFIG_DIR` points at an empty directory, `GIT_TERMINAL_PROMPT=0`, and
+  `GIT_SSH_COMMAND=false`.
+- `GENESIS_PROACTIVE_HOOK_URL` points at a closed port, so a test running the
+  memory hook as a child never posts to the live server.
+- `GENESIS_DB_PATH` is set per test (`_isolate_genesis_db_path` in
+  `tests/conftest.py`) to the same temp database the in-process patch returns.
+- A test that sets its own value with `monkeypatch` still wins.
+- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves secrets in place, and the
+  summary says so; the git, gh and hook-URL settings still apply.
+- Not covered:
+  - a reader that builds its own path to `secrets.env` instead of honouring
+    `SECRETS_PATH`;
+  - credentials kept in other files (`~/.claude`, `~/.genesis`, `~/.ssh`,
+    `~/.git-credentials`);
+  - state paths other than the database: `GENESIS_HOME` is not redirected,
+    and a reader of the fixed `~/genesis/data/genesis.db` path ignores
+    `GENESIS_DB_PATH`.
+
 ## Integration Tests
 
 Integration tests in `tests/integration/` require running external services
