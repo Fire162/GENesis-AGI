@@ -1,6 +1,7 @@
 """Process identity for the watchgod, read through one handle per process.
 
-Run as `python3 -I -S wg_proc.py <proc root> holders`, stdlib only, like the
+Run as `python3 -I -S wg_proc.py <proc root> holders|chain`, stdlib only, like
+the
 rest of the watchgod's python: it must work when the venv does not.
 `python3 -I -S wg_proc.py - safe` prints its stdin made safe for a page (see
 below), for text that is not a process name: a file path, a session id.
@@ -29,6 +30,25 @@ All candidates of one pid are read through ONE handle, so every row printed
 for a pid describes the same process. The parent is named only if the holder
 still has the same parent after the parent was read; otherwise both parent fields are "?". A parent that cannot
 be opened keeps the holder's own ppid, with its name "?".
+
+chain: stdin has one process per line, "<pid> <starttime>" ("-" for the
+start time: whatever process holds the pid now). For each, print
+
+    pid TAB status TAB comm TAB state TAB threads TAB depth TAB root TAB ancestry
+
+walking up its parents to the nearest process named `claude`. Every link is
+bound the same way as a holder's parent: a parent counts only if the child
+still has it after the parent's record was read. status is
+  ok       a claude ancestor was found; the process is not claude itself;
+  claude   the process IS claude;
+  nocc     no claude ancestor (init, or 64 hops, reached first);
+  gone     the process exited, or is not the one with that start time;
+  unknown  something on the way could not be read or changed while read.
+depth is the hops to that claude, root the "pid:starttime" of the ancestor
+whose parent is that claude (the process itself at depth 1), and ancestry
+every "pid:starttime" from the process up to root, comma-separated. state and
+threads are the process's own (stat fields 3 and 20), and comm its name made
+safe for a page. Fields that do not apply are "-".
 """
 
 from __future__ import annotations
@@ -104,6 +124,69 @@ def _stat_fields(dfd: int) -> tuple[str, str, str, str] | None:
     return (st.decode(), _safe(state), comm, ppid.decode())
 
 
+def _threads(dfd: int) -> str:
+    try:
+        tail = _read("stat", dfd).rpartition(b")")[2].split()
+    except OSError:
+        return "?"
+    return tail[17].decode() if len(tail) > 17 and tail[17].isdigit() else "?"
+
+
+def _chain_one(root: str, pid: str, want: str) -> str:
+    try:
+        dfd = os.open(f"{root}/{pid}", os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return f"{pid}\tgone\t-\t-\t-\t-\t-\t-"
+    try:
+        ident = _stat_fields(dfd)
+        if ident is None or (want != "-" and ident[0] != want):
+            return f"{pid}\tgone\t-\t-\t-\t-\t-\t-"
+        start, state, comm, ppid = ident
+        head = f"{pid}\t%s\t{comm}\t{state}\t{_threads(dfd)}"
+        if start == "?":
+            return head % "unknown" + "\t-\t-\t-"
+        if comm == "claude":
+            return head % "claude" + "\t-\t-\t-"
+        links = [f"{pid}:{start}"]
+        own = True  # dfd is still the process asked about
+        for depth in range(1, 65):
+            if not ppid.isdigit() or int(ppid) <= 1:
+                return head % "nocc" + "\t-\t-\t-"
+            try:
+                pdfd = os.open(f"{root}/{ppid}", os.O_RDONLY | os.O_DIRECTORY)
+            except OSError:
+                return head % "unknown" + "\t-\t-\t-"
+            parent = _stat_fields(pdfd)
+            again = _stat_fields(dfd)
+            if again is None and own:
+                os.close(pdfd)
+                return f"{pid}\tgone\t-\t-\t-\t-\t-\t-"
+            if parent is None or again is None or again[3] != ppid or parent[0] == "?":
+                os.close(pdfd)
+                return head % "unknown" + "\t-\t-\t-"
+            if parent[2] == "claude":
+                os.close(pdfd)
+                return head % "ok" + f"\t{depth}\t{links[-1]}\t{','.join(links)}"
+            os.close(dfd)
+            dfd = pdfd
+            own = False
+            links.append(f"{ppid}:{parent[0]}")
+            ppid = parent[3]
+        return head % "nocc" + "\t-\t-\t-"
+    finally:
+        os.close(dfd)
+
+
+def chain(root: str, lines: list[str]) -> list[str]:
+    out = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 2 or not parts[0].isdigit() or not (parts[1].isdigit() or parts[1] == "-"):
+            continue
+        out.append(_chain_one(root, parts[0], parts[1]))
+    return out
+
+
 def _writer(dfd: int, fd: str) -> bool:
     for line in _read(f"fdinfo/{fd}", dfd).splitlines():
         if line.startswith(b"flags:"):
@@ -176,11 +259,12 @@ def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[2] == "safe":
         sys.stdout.write(_safe(sys.stdin.buffer.read()) + "\n")
         return 0
-    if len(argv) != 3 or argv[2] != "holders":
-        print("usage: wg_proc.py <proc root> holders|safe", file=sys.stderr)
+    verbs = {"holders": holders, "chain": chain}
+    if len(argv) != 3 or argv[2] not in verbs:
+        print("usage: wg_proc.py <proc root> holders|chain|safe", file=sys.stderr)
         return 2
     lines = sys.stdin.read().splitlines()
-    for row in holders(argv[1], lines):
+    for row in verbs[argv[2]](argv[1], lines):
         sys.stdout.write(row + "\n")
     return 0
 
