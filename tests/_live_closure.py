@@ -114,12 +114,21 @@ def uninstall_files(config) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _live_closure_secrets_path(tmp_path, monkeypatch):
+def _live_closure_secrets_path(tmp_path):
     """A per-test nonexistent ``SECRETS_PATH``: one test's write is never the
-    next test's load."""
+    next test's load.
+
+    A private MonkeyPatch, never the shared ``monkeypatch`` fixture: requesting
+    that from an autouse fixture sets it up first and tears it down LAST, after
+    conftest's mock-leak guard, which then sees a test's own still-unrestored
+    ``monkeypatch.setattr`` as a leak."""
+    mp = pytest.MonkeyPatch()
     if _S.installed and not _S.live_e2e:
-        monkeypatch.setenv("SECRETS_PATH", str(tmp_path / "no-secrets.env"))
-    yield
+        mp.setenv("SECRETS_PATH", str(tmp_path / "no-secrets.env"))
+    try:
+        yield
+    finally:
+        mp.undo()
 
 
 def pytest_terminal_summary(terminalreporter):
