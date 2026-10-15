@@ -26,8 +26,16 @@ in the process environment, so every child process inherits the closure:
 A test that sets its own value (``monkeypatch.setenv``) still wins: the closure
 is applied before any test runs. With ``GENESIS_LIVE_E2E=1`` the opt-in
 live tests need real credentials, so the secrets half is skipped and the summary
-says so; the git, gh and hook-URL closures stay on. ``GENESIS_DB_PATH`` is set
-per test by ``tests/conftest.py`` (``_isolate_genesis_db_path``), not here.
+says so; the git, gh and hook-URL closures stay on.
+
+``GENESIS_DB_PATH`` names a file under the closure's own directory from
+``pytest_configure`` on, so a module that resolves the database path when it is
+IMPORTED (during collection, before any fixture runs) binds that file rather than
+the checkout's ``data/genesis.db``, the live database in the main checkout.
+``tests/conftest.py`` (``_isolate_genesis_db_path``) then points it at a per-test
+file for the code a test runs and the children it starts. The import-time file is
+one per session: a default-argument connect in one test can leave rows another
+reads, which is still never the live database.
 
 Not covered (stated residuals):
 
@@ -103,6 +111,9 @@ def install(config) -> None:
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
     os.environ["GIT_SSH_COMMAND"] = "false"
     os.environ["GENESIS_PROACTIVE_HOOK_URL"] = _CLOSED_PORT_URL
+    # Before collection: modules that resolve the database path at import
+    # (``_DB_PATH = genesis_db_path()``) bind this, not the checkout's live file.
+    os.environ["GENESIS_DB_PATH"] = str(Path(_S.base) / "import-time-genesis.db")
     config._genesis_live_closure_dir = _S.base
     _S.installed = True
 
