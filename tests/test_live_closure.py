@@ -148,6 +148,45 @@ def _subrun(tmp_path: Path, live_e2e: bool) -> str:
     return out.stdout
 
 
+_SUBRUN_IMPORT_TIME = """
+import genesis.db.connection as connection
+import genesis.mcp.health.campaign_tools as campaign_tools
+import genesis.mcp.health.task_tools as task_tools
+from tests import _live_closure
+
+
+def test_bound_paths():
+    print("BASE=" + _live_closure._S.base)
+    for bound in (connection.DEFAULT_DB_PATH, task_tools._DB_PATH, campaign_tools._DB_PATH):
+        print("BOUND=" + str(bound))
+"""
+
+
+def test_a_module_imported_at_collection_binds_the_closures_database(tmp_path):
+    """Collection runs before any fixture, so a module that resolves the database
+    path at import binds whatever the environment says then: the closure's file,
+    never the checkout's data/genesis.db (the live database in the main checkout)."""
+    (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
+    (tmp_path / "test_sub.py").write_text(_SUBRUN_IMPORT_TIME)
+    repo = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(repo), str(repo / "src")])}
+    for name in ("PYTEST_CURRENT_TEST", "GENESIS_DB_PATH", "GENESIS_LIVE_E2E"):
+        env.pop(name, None)
+    out = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", str(tmp_path)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    lines = out.stdout.splitlines()
+    base = next(line.split("=", 1)[1] for line in lines if line.startswith("BASE="))
+    bound = [line.split("=", 1)[1] for line in lines if line.startswith("BOUND=")]
+    assert bound == [str(Path(base) / "import-time-genesis.db")] * 3, out.stdout
+
+
 def test_a_run_removes_keys_and_names_them(tmp_path):
     text = _subrun(tmp_path, live_e2e=False)
     assert "KEY=<absent>" in text
