@@ -22,6 +22,8 @@ in the process environment, so every child process inherits the closure:
   ``GIT_SSH_COMMAND=false`` stop git from prompting or reaching an ssh agent.
 - ``GENESIS_PROACTIVE_HOOK_URL`` points at a closed port, so a test that runs
   the memory hook as a child never posts to the live server.
+- ``GENESIS_MCP_LOG_DIR`` names a directory that does not exist, so importing the
+  health MCP's browser module opens no log in the shared ``~/tmp``.
 
 A test that sets its own value (``monkeypatch.setenv``) still wins: the closure
 is applied before any test runs. With ``GENESIS_LIVE_E2E=1`` the opt-in
@@ -114,6 +116,10 @@ def install(config) -> None:
     # Before collection: modules that resolve the database path at import
     # (``_DB_PATH = genesis_db_path()``) bind this, not the checkout's live file.
     os.environ["GENESIS_DB_PATH"] = str(Path(_S.base) / "import-time-genesis.db")
+    # A directory that does not exist: importing the health MCP's browser module
+    # then attaches no log file, instead of appending every genesis.* line of this
+    # run to the MCP servers' shared ~/tmp/mcp_health.log.
+    os.environ["GENESIS_MCP_LOG_DIR"] = str(Path(_S.base) / "no-mcp-log")
     config._genesis_live_closure_dir = _S.base
     _S.installed = True
 
