@@ -18,6 +18,9 @@ Genesis session. Session-bound tools are for an existing Genesis session
 explicitly identified by the user; never supply Codex identifiers, register a
 transcript, or create a synthetic charter. Pending Claude plan bookmarks remain
 unprocessed in every external role.
+External charter updates and ledger additions require exact target membership
+in the existing charter, recorded-transcript or heartbeat identity stores after
+prefix resolution; a valid UUID alone cannot create an external charter.
 
 Directed interactive follow-ups record `source=external_interactive`, remain
 eligible for the sanctioned hot lane, and match the `mine` source filter.
@@ -30,9 +33,20 @@ through the main checkout even when invoked in a linked worktree. The native
 entry point sets a process-local policy before bootstrap. At the router's shared
 secret-loading chokepoint, external roles exclude the eight launcher session
 markers and GENESIS_REPO_ROOT, and preserve all existing environment values.
-Remaining provider values load from the selected secrets file. The policy also
+Native startup also clears those eight inherited markers for both transports,
+while preserving the selected runtime root. File loading admits only
+`routing.standalone.EXTERNAL_SECRET_KEYS`: the original MCP infrastructure,
+embedding and timeout settings plus explicit supported routing, web, document
+and Cloudflare credentials and local-provider settings. Proposal kill switches,
+the custom privacy fingerprint path, MCP staleness mode and relocated procedure
+trigger cache are retained as safety/compatibility inputs. The policy also
 applies after failed bootstrap on lazy retries. Ordinary clients keep their
 existing dotenv override behavior.
+This positive file policy does not remove unrelated credentials already
+inherited from the operator, restrict explicit module environment configuration,
+or prevent trusted code from reading files. Custom integrations requiring other
+variables must supply them explicitly; arbitrary credential names are not loaded
+from the file automatically. No live provider execution is established here.
 Experiment, evolution and skill-replay router construction also uses this
 policy for its shared secret loader, including provider-key remapping. In
 external mode it honors the selected secrets path and never falls back to the
@@ -68,7 +82,7 @@ Qualification uses explicit test files and isolated child homes, databases,
 secrets and provider targets. `test_interactive_profiles.py` checks the complete
 registered census and synthetic dispatch/refusal for every admitted/excluded
 name; it does not prove every production tool workflow. Real stdio tests exercise
-the launcher, bootstrap, catalogs, refusal, health snapshot and memory
+both wrapper and native stdio entry points, bootstrap, catalogs, refusal, health snapshot and memory
 save/duplicate/restart/keyword recall without embedding providers, plus imported
 source hashes and scrubbed child-environment receipts. The fixture supplies
 an isolated checkout linked to the test interpreter's dependency environment,

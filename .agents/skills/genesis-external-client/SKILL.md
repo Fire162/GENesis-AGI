@@ -30,6 +30,12 @@ skips dispatch queue and campaign initialization. The interactive role reuses
 ordinary health initialization without starting a worker or executor. Startup
 and lazy router retries cannot restore scrubbed session markers from secrets.env,
 and explicit environment values win over file values for external clients.
+Native startup clears inherited session markers as well. External file loading
+uses a positive configuration/provider allowlist across startup and retries,
+including existing proposal kill switches and the privacy fingerprint path;
+it does not scrub unrelated credentials already inherited from the operator.
+Charter updates and ledger additions require an existing Genesis transcript
+identity, including a session known only through its first heartbeat.
 These tool profiles are not
 authentication or isolation from an operator with full host access.
 

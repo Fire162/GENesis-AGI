@@ -125,8 +125,11 @@ def test_native_cli_accepts_closed_roles(profile):
 @pytest.mark.parametrize("name", ["health", "memory"])
 def test_native_entrypoint_sets_secret_policy_before_bootstrap(monkeypatch, tmp_path, profile, name):
     from scripts import genesis_mcp_server as server
+    from scripts.codex_external_mcp import _SESSION_CONTEXT
 
     events = []
+    for marker in _SESSION_CONTEXT:
+        monkeypatch.delenv(marker, raising=False)
     monkeypatch.setattr("genesis.env.secrets_path", lambda: tmp_path / "missing.env")
     monkeypatch.setattr(server, "is_genesis_enabled", lambda: True)
     monkeypatch.setattr("genesis.observability.mcp_spawn_identity.capture_spawn_identity", lambda: None)

@@ -21,6 +21,81 @@ from genesis.routing.types import BudgetStatus
 if TYPE_CHECKING:
     from genesis.routing.router import Router
 
+
+# Ordinary native MCP loading retains its historical population. External
+# startup and every lazy/eval retry share a positive superset, never a suffix
+# wildcard that would import unrelated deployment or publication credentials.
+MCP_SECRET_KEYS = frozenset({
+    # Infrastructure
+    "OLLAMA_URL", "QDRANT_URL", "GENESIS_DB_PATH", "GENESIS_CC_PROJECT_ID",
+    # Browser (CDP remote backend)
+    "GENESIS_CDP_URL",
+    # Embedding providers (required for memory MCP)
+    "API_KEY_DEEPINFRA", "API_KEY_QWEN",
+    # LLM providers (used by recon/outreach MCP tools)
+    "GOOGLE_API_KEY", "API_KEY_GROQ", "API_KEY_MISTRAL", "API_KEY_OPENROUTER",
+    "API_KEY_DEEPSEEK",
+    # Ollama config
+    "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL",
+    # Embedding chain levers read when the memory child builds its chains
+    # (env.embed_local_first / env.embed_priority_tier). Absent here, a value
+    # set only in secrets.env is dropped and the child disagrees with the
+    # main runtime about the order and the recall tier.
+    "GENESIS_EMBED_LOCAL_FIRST", "GENESIS_EMBED_PRIORITY_TIER",
+    # HTTP transport auth
+    "GENESIS_MCP_HTTP_TOKEN",
+    # Discord bot (used by discord-bot MCP server)
+    "DISCORD_BOT_TOKEN",
+    # SQLite busy_timeout override (must pass the allowlist or a
+    # secrets.env-set value would be silently dropped before the
+    # setdefault below)
+    "GENESIS_DB_BUSY_TIMEOUT_MS",
+    # Recall read-pool knobs — _bootstrap_memory honors the same kill
+    # switch + size as the server runtime, so a secrets.env-configured
+    # value must reach the child too (Codex P2 on #1302)
+    # GENESIS_SESSION_READ_POOL_SIZE is the one _bootstrap_memory actually
+    # reads now (this process is a per-session child, not the server) —
+    # without it here the documented lever is INERT, which is the third
+    # instance of this class in this list after #1302 and #1587.
+    "GENESIS_RECALL_READ_POOL_OFF",
+    "GENESIS_RECALL_READ_POOL_SIZE",
+    "GENESIS_SESSION_READ_POOL_SIZE",
+    # deliberate() (Model Fusion) timeout budget — the health MCP server hosts the
+    # `deliberate` tool, so a secrets.env-set override must reach this child or the
+    # documented knob is inert and every call silently stays at the 1000s default
+    # (Codex P2 on #1587).
+    "GENESIS_DELIBERATE_TIMEOUT_S",
+    # Graph-traversal telemetry kill switch (memory/graph_telemetry.py): the
+    # memory server makes most traversals, so a secrets.env setting that never
+    # reached it would leave the documented switch inert where it matters.
+    "GENESIS_GRAPH_TELEMETRY_DISABLED",
+})
+
+EXTERNAL_SECRET_KEYS = (MCP_SECRET_KEYS - {"DISCORD_BOT_TOKEN"}) | frozenset({
+    "API_KEY_TINYFISH", "FIRECRAWL_API_KEY", "API_KEY_TAVILY", "API_KEY_EXA",
+    "API_KEY_PERPLEXITY", "API_KEY_PAGEINDEX", "API_KEY_CLOUDFLARE",
+    "CLOUDFLARE_ACCOUNT_ID", "LM_STUDIO_URL", "GENESIS_ENABLE_LM_STUDIO",
+    "LM_STUDIO_HEALTH_URL",
+    "API_KEY_VOYAGE", "GENESIS_MEMORY_RERANK_OFF", "GENESIS_MEMORY_WRITEBACKS_OFF",
+    "GENESIS_RECALL_RERANK_GATE_OFF", "GENESIS_RECALL_RERANK_RPM",
+    "GENESIS_ENTITY_ADJUDICATION_DISABLED", "GENESIS_DREAM_SHIELD_DISABLED",
+    "GENESIS_FALKORDB_STORE_DISABLED", "GENESIS_MEMORY_INTEGRITY_DISABLED",
+    "GENESIS_TOP_TAGS_DISABLED", "GENESIS_ENTITY_ALIASES", "GENESIS_DAILY_BUDGET_DISABLED",
+    "GENESIS_SQLITE_SLOW_MS", "GENESIS_SKILL_EVOLUTION_GATE_OFF", "GENESIS_OUTPUT_DIR",
+    "GENESIS_PLANS_DIR", "USER_TIMEZONE", "GENESIS_GITHUB_USER", "GENESIS_GITHUB_PUBLIC_REPO",
+    "GENESIS_VNC_PASSWORD", "GENESIS_BUILD_LANE_ENABLED", "GENESIS_MODELS_MD_SYNTHESIS_OFF",
+    "GENESIS_CONTRIBUTOR_WORKLOG_DISABLED", "GENESIS_BOARD_DISABLED",
+    "GENESIS_RELEASE_FINGERPRINTS", "GENESIS_MCP_STALENESS_GUARD", "GENESIS_PROCEDURE_TRIGGERS",
+}) | frozenset(
+    key
+    for service in (
+        "DEEPINFRA", "QWEN", "MISTRAL", "GROQ", "GOOGLE", "OPENROUTER",
+        "NVIDIA_NIM", "GITHUB", "DEEPSEEK", "OPENAI", "XAI", "ZENMUX",
+        "MINIMAX", "GLM", "CEREBRAS", "SAMBANOVA", "OLLAMA", "LMSTUDIO",
+    )
+    for key in (f"API_KEY_{service}", f"{service}_API_KEY", f"{service}_API_TOKEN")
+)
+
 logger = logging.getLogger(__name__)
 _external_secret_blocked_keys: frozenset[str] | None = None
 
@@ -43,7 +118,7 @@ def _load_standalone_secrets(path: Path) -> None:
         # would derive new targets/keys from file values we deliberately retain
         # from the environment. Use the same precedence for expansion and load.
         for key, value in DotEnv(path, override=False).dict().items():
-            if key not in _external_secret_blocked_keys and value is not None:
+            if key in EXTERNAL_SECRET_KEYS and key not in _external_secret_blocked_keys and value is not None:
                 os.environ.setdefault(key, value)
 
 

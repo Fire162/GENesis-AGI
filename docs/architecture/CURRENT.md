@@ -3706,6 +3706,10 @@ verified: 8b445d636 2026-10-15
   External startup and lazy routing share a secret-loading policy: no restoration
   of eight session markers or GENESIS_REPO_ROOT, and existing environment values
   win over file values. Ordinary standalone dotenv overrides are unchanged.
+  Native startup clears inherited session markers for either transport. External
+  file loading uses a shared positive configuration/provider allowlist, retaining
+  proposal kill switches and the custom privacy fingerprint path; it does
+  not remove unrelated credentials already inherited from the operator.
   The shared experiment/evolution/skill-replay secret loader follows the same
   external policy and preserves ordinary eval loading/key remapping.
   Profiles constrain tools, not an operator's host access or per-action permission.
@@ -3713,6 +3717,8 @@ verified: 8b445d636 2026-10-15
   persist `external_interactive`, without a Genesis session identity; dispatched
   cold routing still wins. The `mine` source filter includes this sanctioned
   interactive source. `session_config` remains deferred because its cache is global.
+  Charter-creating external writes require an existing transcript identity in
+  the charter, recorded-session or heartbeat store, after prefix resolution.
   See `docs/reference/codex-interactive-mcp.md` for deferred tools and scope.
   The separately launched validator can admit one canonical invocation of
   `scripts/codex_validator_request.py` through its native shell hook. Its

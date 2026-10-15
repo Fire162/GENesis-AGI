@@ -18,8 +18,8 @@ from genesis.mcp.external_profiles import profile_tools
 from scripts.codex_external_mcp import _SESSION_CONTEXT, runtime_root
 
 
-@pytest.fixture
-async def isolated_child(tmp_path):
+@pytest.fixture(params=["wrapper", "native"])
+async def isolated_child(tmp_path, request):
     source_root = Path(__file__).resolve().parents[2]
     # Model an installed checkout without assuming the runner has .venv there.
     # The real portable launcher still selects .venv/bin/python; use the actual
@@ -63,7 +63,7 @@ async def isolated_child(tmp_path):
     # never the parent's provider secrets. No live DB, HTTP service or dispatcher.
     environment = {
         "PATH": os.environ["PATH"], "HOME": str(tmp_path),
-        "GENESIS_HOME": str(state), "GENESIS_DB_PATH": str(database),
+        "GENESIS_HOME": str(state), "GENESIS_DB_PATH": str(database), "GENESIS_REPO_ROOT": str(root),
         "SECRETS_PATH": str(secrets), "PYTHONPATH": os.pathsep.join([str(tmp_path), str(root / "src")]),
         "GENESIS_ENABLE_OLLAMA": "0", "QDRANT_URL": "http://127.0.0.1:1",
         "GENESIS_RECALL_READ_POOL_OFF": "1", "FASTMCP_SHOW_SERVER_BANNER": "false",
@@ -71,9 +71,12 @@ async def isolated_child(tmp_path):
     }
 
     def transport(server, role):
+        command = sys.executable if request.param == "native" else "python3"
+        args = [str(root / "scripts/genesis_mcp_server.py"), "--external-client", role]
+        if request.param == "wrapper":
+            args = [str(root / "scripts/codex_external_mcp.py"), "--profile", role]
         return StdioTransport(
-            command="python3", args=[str(root / "scripts/codex_external_mcp.py"),
-                                     "--server", server, "--profile", role],
+            command=command, args=[*args, "--server", server],
             env=environment, cwd=str(root), keep_alive=False,
         )
 
@@ -124,6 +127,31 @@ async def test_real_interactive_follow_up_has_external_provenance(isolated_child
         )).fetchone()
         assert row == ("external_interactive", "follow_up", None, arguments["content"])
         assert await (await db.execute("SELECT COUNT(*) FROM follow_ups")).fetchone() == (1,)
+
+
+async def test_real_external_charter_writes_require_an_existing_target(isolated_child):
+    database, transport = isolated_child
+    existing = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+    unknown = "12345678-1234-4321-8123-123456789abc"
+    async with aiosqlite.connect(database) as db:
+        await db.execute("INSERT INTO session_heartbeats(cc_session_id,updated_at) VALUES (?,'t0')", (existing,))
+        await db.commit()
+    async with Client(transport("health", "interactive"), timeout=45) as client:
+        for name, payload in (
+            ("session_charter_update", {"mission": "Synthetic directed mission"}),
+            ("session_ledger_add", {"text": "Synthetic directed commitment"}),
+        ):
+            rejected = await client.call_tool(name, {"session_id": unknown, **payload})
+            assert "existing Genesis session" in rejected.data["error"]
+            accepted = await client.call_tool(name, {"session_id": existing[:8], **payload})
+            assert "error" not in accepted.data
+    async with aiosqlite.connect(database) as db:
+        assert await (await db.execute("SELECT session_id,mission FROM session_charters")).fetchall() == [
+            (existing, "Synthetic directed mission"),
+        ]
+        assert await (await db.execute("SELECT session_id,text FROM session_ledger")).fetchall() == [
+            (existing, "Synthetic directed commitment"),
+        ]
 
 
 async def test_real_memory_save_duplicate_restart_and_keyword_recall(isolated_child):
