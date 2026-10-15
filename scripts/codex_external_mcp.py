@@ -91,7 +91,7 @@ def launcher_path() -> Path:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False, add_help=False)
     parser.add_argument("--profile", choices=["external", "validator", "interactive"], action="append")
     selection, args = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
     if selection.profile and len(selection.profile) != 1:

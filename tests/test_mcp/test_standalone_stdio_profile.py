@@ -3,6 +3,8 @@
 import hashlib
 import json
 import os
+import shutil
+import sys
 from pathlib import Path
 
 import aiosqlite
@@ -18,7 +20,21 @@ from scripts.codex_external_mcp import _SESSION_CONTEXT, runtime_root
 
 @pytest.fixture
 async def isolated_child(tmp_path):
-    root = Path(__file__).resolve().parents[2]
+    source_root = Path(__file__).resolve().parents[2]
+    # Model an installed checkout without assuming the runner has .venv there.
+    # The real portable launcher still selects .venv/bin/python; use the actual
+    # dependency environment, including setup-python's global prefix on CI.
+    root = tmp_path / "checkout"
+    root.mkdir()
+    for relative in (
+        "scripts/codex_external_mcp.py", "scripts/genesis_mcp_server.py",
+        ".claude/mcp/run-mcp-server",
+    ):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_root / relative, target)
+    (root / "src").symlink_to(source_root / "src", target_is_directory=True)
+    (root / ".venv").symlink_to(sys.prefix, target_is_directory=True)
     state = tmp_path / ".genesis"
     state.mkdir()
     (state / "cc_context_enabled").touch()
@@ -69,9 +85,9 @@ async def isolated_child(tmp_path):
         "genesis.routing.standalone": "src/genesis/routing/standalone.py",
     }.items():
         path = root / relative
-        assert evidence["sources"][module] == [str(path), hashlib.sha256(path.read_bytes()).hexdigest()]
+        assert evidence["sources"][module] == [str(path), hashlib.sha256((source_root / relative).read_bytes()).hexdigest()]
     assert not (set(evidence["env_keys"]) & set(_SESSION_CONTEXT))
-    assert evidence["root"] == str(runtime_root())
+    assert evidence["root"] == str(runtime_root(root))
 
 
 @pytest.mark.parametrize("role", ["external", "validator", "interactive"])
@@ -84,8 +100,30 @@ async def test_real_stdio_catalog_and_direct_refusal(isolated_child, role, serve
         with pytest.raises(ToolError, match="unavailable"):
             await client.call_tool(forbidden, {} if server == "health" else {"doc_id": "synthetic"})
         if server == "health":
+            with pytest.raises(ToolError, match="unavailable"):
+                await client.call_tool("session_config", {"session_id": "synthetic", "effort": "low"})
             result = await client.call_tool("health_status")
             assert result.data["queues"]["synthetic_fixture"] == 37
+
+
+async def test_real_interactive_follow_up_has_external_provenance(isolated_child):
+    database, transport = isolated_child
+    arguments = {
+        "content": "Synthetic external-client follow-up", "reason": "owner directed",
+        "strategy": "ego_judgment", "work_state": "ready", "domain": "internal",
+    }
+    async with Client(transport("health", "interactive"), timeout=45) as client:
+        result = await client.call_tool("follow_up_create", arguments)
+        follow_up_id = result.data["id"]
+    async with Client(transport("health", "external"), timeout=45) as narrow:
+        with pytest.raises(ToolError, match="unavailable"):
+            await narrow.call_tool("follow_up_create", arguments)
+    async with aiosqlite.connect(database) as db:
+        row = await (await db.execute(
+            "SELECT source, kind, source_session, content FROM follow_ups WHERE id=?", (follow_up_id,),
+        )).fetchone()
+        assert row == ("external_interactive", "follow_up", None, arguments["content"])
+        assert await (await db.execute("SELECT COUNT(*) FROM follow_ups")).fetchone() == (1,)
 
 
 async def test_real_memory_save_duplicate_restart_and_keyword_recall(isolated_child):

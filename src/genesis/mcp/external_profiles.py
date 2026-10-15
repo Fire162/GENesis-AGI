@@ -11,6 +11,7 @@ boundary before this profile can cover them.
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 from enum import StrEnum
 
 from fastmcp.exceptions import ToolError
@@ -21,6 +22,14 @@ class ExternalProfile(StrEnum):
     EXTERNAL = "external"
     VALIDATOR = "validator"
     INTERACTIVE = "interactive"
+
+
+_CALL_PROFILE: ContextVar[ExternalProfile | None] = ContextVar("genesis_external_profile", default=None)
+
+
+def current_external_profile() -> ExternalProfile | None:
+    """Current admitted request's profile, without a Genesis session identity."""
+    return _CALL_PROFILE.get()
 
 
 logger = logging.getLogger(__name__)
@@ -59,7 +68,7 @@ HEALTH_INTERACTIVE_TOOLS = frozenset({
     "open_question_block", "open_question_list", "open_question_raise",
     "open_question_resolve", "provider_activity", "reflex_signal_resolve",
     "reflex_status", "session_address", "session_charter",
-    "session_charter_update", "session_config", "session_ledger_add",
+    "session_charter_update", "session_ledger_add",
     "session_ledger_update", "settings_get", "settings_list",
     "settings_update", "skill_replay_run", "subsystem_heartbeats",
     "task_detail", "task_list", "task_submit",
@@ -122,4 +131,8 @@ class ExternalProfileMiddleware(Middleware):
         if context.message.name not in self.allowed:
             logger.warning("External profile %s refused tool %r", self.profile, context.message.name)
             raise ToolError("Tool is unavailable to this external client profile")
-        return await call_next(context)
+        token = _CALL_PROFILE.set(self.profile)
+        try:
+            return await call_next(context)
+        finally:
+            _CALL_PROFILE.reset(token)

@@ -17,9 +17,9 @@ not already visible, use MCP tool discovery for its exact `server.tool` name.
 
 The committed Codex configuration currently selects the health and recall floor.
 The launcher also supports the reviewed, opt-in `--profile interactive` role:
-34 memory and 84 health tools, including directed memory writes and existing
+34 memory and 83 health tools, including directed memory writes and existing
 browser, queue, campaign, settings and cognitive tools. `document_delete` and
-nine health tools remain deferred; future tool names require capability review.
+ten health tools remain deferred; future tool names require capability review.
 See `docs/reference/codex-interactive-mcp.md` for scope and qualification limits.
 
 The standalone launcher enforces `--external-client` on the server as well as

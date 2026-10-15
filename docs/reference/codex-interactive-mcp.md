@@ -4,7 +4,7 @@ The standalone server offers three closed external roles. The launcher defaults
 to `external`; `--profile external`, `--profile validator` and
 `--profile interactive` select a role explicitly. Invalid or duplicate selections
 are rejected. `external` and `validator` retain five health and eight recall
-tools. `interactive` admits 84 health and 34 memory tools; additions require
+tools. `interactive` admits 83 health and 34 memory tools; additions require
 explicit review in `src/genesis/mcp/external_profiles.py`.
 
 This change makes the interactive role available. The committed project
@@ -18,6 +18,12 @@ Genesis session. Session-bound tools are for an existing Genesis session
 explicitly identified by the user; never supply Codex identifiers, register a
 transcript, or create a synthetic charter. Pending Claude plan bookmarks remain
 unprocessed in every external role.
+
+Directed interactive follow-ups record `source=external_interactive`, remain
+eligible for the sanctioned hot lane, and match the `mine` source filter.
+Their default `source_session` is null. The marker is request-local; it creates
+no Genesis session or lifecycle record. Existing dispatched-session cold routing
+and promotion restrictions remain unchanged and take precedence over the marker.
 
 The launcher scrubs inherited session context and resolves live runtime state
 through the main checkout even when invoked in a linked worktree. The native
@@ -35,7 +41,9 @@ legacy home checkout when that file is missing; ordinary eval loading is unchang
 Deferred tools are `document_delete` and these health names:
 `health_errors`, `health_alerts`, `task_control`, `campaign_trigger`,
 `user_job_create`, `user_job_list`, `user_job_control`, `user_job_history`,
-`ego_proposal_resolve`. Health capability gaps are tracked in
+`ego_proposal_resolve`, `session_config`. The last tool writes a singleton
+model/effort cache read by unrelated new sessions; it needs a target-aware
+cache contract before admission ([#3384](https://github.com/WingedGuardian/GENesis-AGI/issues/3384)). Health capability gaps are tracked in
 [diagnostics #3152](https://github.com/WingedGuardian/GENesis-AGI/issues/3152),
 [task control #3153](https://github.com/WingedGuardian/GENesis-AGI/issues/3153),
 [campaign trigger #3154](https://github.com/WingedGuardian/GENesis-AGI/issues/3154),
@@ -62,7 +70,10 @@ registered census and synthetic dispatch/refusal for every admitted/excluded
 name; it does not prove every production tool workflow. Real stdio tests exercise
 the launcher, bootstrap, catalogs, refusal, health snapshot and memory
 save/duplicate/restart/keyword recall without embedding providers, plus imported
-source hashes and scrubbed child-environment receipts. Full native
+source hashes and scrubbed child-environment receipts. The fixture supplies
+an isolated checkout linked to the test interpreter's dependency environment,
+so it also runs when CI installs dependencies outside a checkout-local venv.
+Full native
 Codex CLI/app-server and tool-family qualification belongs to activation.
 
 Rollback selects the narrow profile through normal reviewed configuration and

@@ -1214,6 +1214,9 @@ verified: 50b79ffb 2026-09-01
   (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
   cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
   requires a `revisit_condition` (nullable column on `follow_ups`).
+  Attended external interactive writes record `external_interactive` and retain
+  sanctioned lane selection; dispatched writes still route cold. The `mine`
+  source filter includes this external source without registering a session.
 - GROUNDWORK: v4-parallel-dispatch, v4-surplus-tasks, v4-rate-tracking.
 
 ## 5. Information intake & research
@@ -3646,7 +3649,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: de01d52b6 2026-10-15
+verified: 8b445d636 2026-10-15
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3697,7 +3700,7 @@ verified: de01d52b6 2026-10-15
   The standalone server enforces closed `external`, `validator` and `interactive`
   profiles during discovery and direct calls. The first two retain the same
   health/recall floor and skip health router, dispatch queue and campaign setup.
-  Opt-in `--profile interactive` admits 34 memory and 84 health tools and reuses
+  Opt-in `--profile interactive` admits 34 memory and 83 health tools and reuses
   ordinary health setup without starting a worker. The committed project
   configuration still selects the floor; connection activation is separate.
   External startup and lazy routing share a secret-loading policy: no restoration
@@ -3706,6 +3709,10 @@ verified: de01d52b6 2026-10-15
   The shared experiment/evolution/skill-replay secret loader follows the same
   external policy and preserves ordinary eval loading/key remapping.
   Profiles constrain tools, not an operator's host access or per-action permission.
+  Directed follow-up writes use request-local external profile provenance and
+  persist `external_interactive`, without a Genesis session identity; dispatched
+  cold routing still wins. The `mine` source filter includes this sanctioned
+  interactive source. `session_config` remains deferred because its cache is global.
   See `docs/reference/codex-interactive-mcp.md` for deferred tools and scope.
   The separately launched validator can admit one canonical invocation of
   `scripts/codex_validator_request.py` through its native shell hook. Its

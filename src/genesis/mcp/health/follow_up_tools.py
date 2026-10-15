@@ -113,10 +113,13 @@ async def _impl_follow_up_create(
         import os
 
         from genesis.ego.domain_classifier import classify_domain
+        from genesis.mcp.external_profiles import ExternalProfile, current_external_profile
 
         # Detect dispatched session context for proper source attribution
         if os.environ.get("GENESIS_CC_SESSION") == "1":
             source = "ego_dispatch"
+        elif current_external_profile() == ExternalProfile.INTERACTIVE:
+            source = "external_interactive"
         else:
             source = "foreground_session"
 

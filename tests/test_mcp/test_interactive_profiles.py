@@ -1,23 +1,29 @@
 """Interactive admission is a closed scope, independent of client filtering."""
 
+import asyncio
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
-from genesis.mcp.external_profiles import ExternalProfileMiddleware, profile_tools
+from genesis.mcp.external_profiles import (
+    ExternalProfileMiddleware,
+    current_external_profile,
+    profile_tools,
+)
 
 DEFERRED = {
     "health": {
         "health_errors", "health_alerts", "task_control", "campaign_trigger",
         "user_job_create", "user_job_list", "user_job_control", "user_job_history",
-        "ego_proposal_resolve",
+        "ego_proposal_resolve", "session_config",
     },
     "memory": {"document_delete"},
 }
@@ -41,7 +47,7 @@ def test_interactive_names_exist_in_fresh_standalone_registry(server, count, tmp
     assert profile_tools(server, "interactive") == registered - DEFERRED[server]
 
 
-@pytest.mark.parametrize("server,count", [("health", 84), ("memory", 34)])
+@pytest.mark.parametrize("server,count", [("health", 83), ("memory", 34)])
 async def test_interactive_scope_dispatches_every_admitted_name_and_refuses_others(server, count):
     allowed = profile_tools(server, "interactive")
     assert len(allowed) == count
@@ -68,6 +74,44 @@ async def test_interactive_scope_dispatches_every_admitted_name_and_refuses_othe
             with pytest.raises(ToolError, match="unavailable"):
                 await client.call_tool(name)
     assert entered == sorted(allowed)
+    assert current_external_profile() is None
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
+async def test_request_profile_resets_after_return_error_or_cancel(failure):
+    context = SimpleNamespace(message=SimpleNamespace(name="health_status"))
+    middleware = ExternalProfileMiddleware("health", "interactive")
+
+    async def call_next(_):
+        assert current_external_profile() == "interactive"
+        if failure:
+            raise failure()
+        return "done"
+
+    if failure:
+        with pytest.raises(failure):
+            await middleware.on_call_tool(context, call_next)
+    else:
+        assert await middleware.on_call_tool(context, call_next) == "done"
+    assert current_external_profile() is None
+
+
+async def test_concurrent_clients_keep_separate_request_profiles():
+    ready = asyncio.Event()
+    entered = []
+    context = SimpleNamespace(message=SimpleNamespace(name="health_status"))
+
+    async def request(role):
+        async def call_next(_):
+            entered.append(role)
+            if len(entered) == 2:
+                ready.set()
+            await ready.wait()
+            assert current_external_profile() == role
+        await ExternalProfileMiddleware("health", role).on_call_tool(context, call_next)
+        assert current_external_profile() is None
+
+    await asyncio.wait_for(asyncio.gather(request("interactive"), request("validator")), timeout=5)
 
 
 @pytest.mark.parametrize("profile", ["external", "validator", "interactive"])
@@ -123,3 +167,20 @@ def test_codex_launcher_refuses_invalid_or_conflicting_role_before_exec(monkeypa
         launcher.main(["--server", "health", *args])
     assert error.value.code == 2
     execute.assert_not_called()
+
+
+@pytest.mark.parametrize("flag", ["-h", "--help"])
+def test_codex_launcher_forwards_help_to_native_cli(monkeypatch, capsys, flag):
+    from scripts import codex_external_mcp as launcher
+    from scripts.genesis_mcp_server import parse_args
+
+    execute = MagicMock()
+    monkeypatch.setattr(launcher.os, "execve", execute)
+    launcher.main([flag])
+    argv = execute.call_args.args[1]
+    assert argv[-1] == flag
+    with pytest.raises(SystemExit) as error:
+        parse_args(argv[1:])
+    assert error.value.code == 0
+    help_text = capsys.readouterr().out
+    assert all(option in help_text for option in ("--server", "--transport", "--host", "--port", "--auth-token"))
