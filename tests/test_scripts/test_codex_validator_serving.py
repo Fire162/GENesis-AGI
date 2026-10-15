@@ -126,10 +126,22 @@ async def test_fixed_argv_scrubbed_environment_and_full_drain(monkeypatch, tmp_p
     assert captured["cwd"] == tmp_path
 
 
+def status_script(first=None, verified=None, log=None):
+    """A disposable deploy_code_only.sh: `status` prints FIRST; `status --verify T`
+    prints VERIFIED (the valid sentence by default) and exits 0."""
+    first = VALUES if first is None else first
+    verified = {**first, "bracket": serving.VALID_BRACKET} if verified is None else verified
+    record = f'printf "%s\\n" "$*" >> {shlex.quote(str(log))}\n' if log else ""
+    return (record + 'if [ "$2" = --verify ]; then printf %s ' + shlex.quote(output(verified).decode())
+            + "; else printf %s " + shlex.quote(output(first).decode()) + "; fi\n")
+
+
 @pytest.mark.parametrize("kind", ["known", "verify", "partial", "failure", "stdout_overflow", "stderr_overflow"])
 def test_real_disposable_child_outcomes(tmp_path, kind):
     values = {**VALUES, "bracket": serving.VALID_BRACKET} if kind == "verify" else VALUES
     script = "printf %s " + shlex.quote(output(values).decode()) + "\n"
+    if kind == "known":
+        script = status_script()
     if kind == "partial":
         script = "printf 'serving: private marker\\n'\n"
     elif kind == "failure":
@@ -141,6 +153,53 @@ def test_real_disposable_child_outcomes(tmp_path, kind):
     assert "private marker" not in json.dumps(result)
     if kind == "verify":
         assert result["verified"] and result["bracket"] == TOKEN
+
+
+@pytest.mark.parametrize("change", ["none", "mainpid", "invocation", "serving", "runtime-overrides", "head", "invalid"])
+def test_status_is_confirmed_by_a_verify_read_of_its_own_token(tmp_path, change):
+    """A restart between the printed fields and the token pairs old fields with a new
+    token; the verify read of that token must agree on what the server runs."""
+    log = tmp_path / "calls.log"
+    later = dict(VALUES)
+    if change in ("mainpid",):
+        later["mainpid"] = "654"
+    elif change in ("invocation", "serving"):
+        later[change] = "9" * len(VALUES[change])
+    elif change == "runtime-overrides":
+        later[change] = "1 files, " + "b" * 16
+    elif change == "head":
+        later["head"] = "4" * 40
+    verified = {**later, "bracket": serving.VALID_BRACKET}
+    if change == "invalid":
+        verified = {**VALUES, "bracket": "INVALID — since that token the server restarted"}
+    result = serving.observe(runtime(tmp_path, status_script(VALUES, verified, log)))
+    # HEAD may move over docs without changing the token, so it alone does not refuse.
+    assert result["established"] == (change in ("none", "head"))
+    assert log.read_text().splitlines() == ["status", f"status --verify {TOKEN}"]
+    if result["established"]:
+        assert result == {**VALUES, "mainpid": 321, "established": True}
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_creation_kills_the_new_group(tmp_path, monkeypatch):
+    """The child exists in its own session before its handle reaches _capture."""
+    created = []
+    original = serving.asyncio.create_subprocess_exec
+    async def slow_spawn(*args, **kwargs):
+        proc = await original(*args, **kwargs)
+        created.append(proc)
+        await asyncio.sleep(0.2)  # cancellation lands here, before the handle returns
+        return proc
+    monkeypatch.setattr(serving.asyncio, "create_subprocess_exec", slow_spawn)
+    root = runtime(tmp_path, "exec /usr/bin/sleep 30\n")
+    task = asyncio.create_task(serving._capture(root, None))
+    while not created:
+        await asyncio.sleep(0.001)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert created[0].returncode is not None and created[0].returncode < 0
+    assert created[0].pid != os.getpgrp()
 
 
 @pytest.mark.asyncio
@@ -181,7 +240,9 @@ async def test_owned_grandchild_cannot_keep_output_pipe_open(tmp_path, monkeypat
     root = runtime(tmp_path, "/usr/bin/sleep 30 &\n" + "echo $! > " + shlex.quote(str(marker)) + "\nwait\n")
     task = asyncio.create_task(serving._capture(root, None))
     async with asyncio.timeout(2):
-        while not marker.exists():
+        # The shell creates the file before writing the pid into it, and the
+        # child can run before creation returns its handle to the wrapper.
+        while not (created and marker.exists() and marker.read_text().strip()):
             await asyncio.sleep(0.001)
     child = int(marker.read_text())
     assert os.getpgid(child) == created[0].pid != os.getpgrp()
@@ -191,5 +252,11 @@ async def test_owned_grandchild_cannot_keep_output_pipe_open(tmp_path, monkeypat
         await task
     assert created[0].returncode < 0
     # A killed descendant can await init's reap as a zombie; it cannot hold pipes.
-    status = Path(f"/proc/{child}/stat")
-    assert not status.exists() or status.read_text().split(") ", 1)[1].startswith("Z ")
+    # Read once: a check-then-read races init's reap, which removes the entry
+    # (FileNotFoundError) or empties it mid-read (ESRCH) — both mean it is gone.
+    try:
+        stat = Path(f"/proc/{child}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return
+    # Z (zombie) or X (dead, mid-reap): either way it holds no pipe.
+    assert stat.split(") ", 1)[1][:2] in ("Z ", "X ")
