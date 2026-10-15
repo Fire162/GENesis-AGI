@@ -71,12 +71,18 @@ async def _spawn(argv: list[str], runtime: Path):
     try:
         return await asyncio.shield(creation)
     except BaseException:
-        # A creation that itself failed leaves nothing to own; the original
-        # error propagates either way.
-        with contextlib.suppress(BaseException):
-            proc = await creation
+        # Recovery stays shielded: a repeated cancellation must not cancel the
+        # creation before its handle is recovered. A creation that itself
+        # failed, or was cancelled by loop teardown, leaves nothing to own; the
+        # original error propagates either way.
+        while not creation.done():
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(creation)
+        if not creation.cancelled() and creation.exception() is None:
+            proc = creation.result()
             kill_process_group(proc)
-            await reap_bounded(proc)
+            with contextlib.suppress(BaseException):
+                await reap_bounded(proc)
         raise
 
 

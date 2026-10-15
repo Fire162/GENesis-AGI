@@ -203,6 +203,29 @@ async def test_cancellation_during_creation_kills_the_new_group(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_repeated_cancellation_during_creation_still_kills_the_new_group(tmp_path, monkeypatch):
+    """A second cancel while recovery waits for the handle must not abandon it."""
+    created = []
+    original = serving.asyncio.create_subprocess_exec
+    async def slow_spawn(*args, **kwargs):
+        proc = await original(*args, **kwargs)
+        created.append(proc)
+        await asyncio.sleep(0.2)  # both cancellations land here, before the handle returns
+        return proc
+    monkeypatch.setattr(serving.asyncio, "create_subprocess_exec", slow_spawn)
+    root = runtime(tmp_path, "exec /usr/bin/sleep 30\n")
+    task = asyncio.create_task(serving._capture(root, None))
+    while not created:
+        await asyncio.sleep(0.001)
+    task.cancel()
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert created[0].returncode is not None and created[0].returncode < 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_timeout_and_cancellation_kill_only_owned_child(tmp_path, monkeypatch, cancel):
     created = []
