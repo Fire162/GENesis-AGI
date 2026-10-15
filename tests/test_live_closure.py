@@ -91,6 +91,12 @@ def test_the_memory_hook_url_is_a_closed_port():
     assert os.environ["GENESIS_PROACTIVE_HOOK_URL"] == "http://127.0.0.1:9"
 
 
+def test_the_mcp_log_directory_does_not_exist():
+    path = os.environ["GENESIS_MCP_LOG_DIR"]
+    assert path.startswith(closure._S.base)
+    assert not os.path.exists(path)
+
+
 def test_children_resolve_the_per_test_database(tmp_path):
     out = subprocess.run(
         [sys.executable, "-c", "import os; print(os.environ['GENESIS_DB_PATH'])"],
