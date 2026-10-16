@@ -145,36 +145,19 @@ async def memory_delete(memory_id: str):
 
     try:
         if rt.memory_store is None:
-            # Degraded boot (no MemoryStore/Qdrant client): SQLite is all we can
-            # touch. An EMBEDDED memory is refused — we can't remove its point,
-            # and dropping only FTS+metadata would orphan it as a ghost. The
-            # helper keeps MemoryStore.delete's guarantees for everything else
-            # (queued embedding job, namespaced identity tombstone).
+            # SQL mirrors cannot prove vector absence after a partial store.
+            # Retain rows and let the existing vector-aware delete drain intent.
             from genesis.memory.store import delete_without_vector_store
 
             outcome = await delete_without_vector_store(rt.db, memory_id)
-            if outcome["status"] == "unavailable":
-                return (
-                    jsonify(
-                        {
-                            "status": "unavailable",
-                            "detail": "vector store unavailable; cannot safely delete an embedded memory",
-                        }
-                    ),
-                    503,
-                )
-            if outcome["status"] == "deferred":
-                return (
-                    jsonify(
-                        {
-                            "status": "deferred",
-                            "detail": "memory is being written; deletion recorded, retry later",
-                            "details": outcome,
-                        }
-                    ),
-                    503,
-                )
-            return jsonify({"status": "partial", "fts5": outcome["fts5"]})
+            return (
+                jsonify({
+                    "status": "deferred",
+                    "detail": "vector-aware deletion deferred; retry when the memory store is available",
+                    "details": outcome,
+                }),
+                503,
+            )
 
         results = await rt.memory_store.delete(memory_id)
         if results.get("deferred"):

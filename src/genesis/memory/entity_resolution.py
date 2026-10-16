@@ -194,6 +194,7 @@ def _find_dedup_candidates_sync(
             collection=collection,
             query_vector=vec,
             limit=max_candidates_per_point + 1,  # +1 for self-match
+            exclude_namespaced=True,
         )
 
         for hit in hits:

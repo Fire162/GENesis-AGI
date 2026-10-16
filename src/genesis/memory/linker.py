@@ -87,6 +87,7 @@ class MemoryLinker:
             collection=collection,
             query_vector=vector,
             limit=max_links + 1,
+            exclude_namespaced=True,
         )
 
         now = datetime.now(UTC).isoformat()

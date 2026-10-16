@@ -1212,7 +1212,10 @@ class MemoryStore:
                     async with namespace.write_lock(
                         path, memory_id, timeout=namespace.DELETE_LOCK_WAIT_S
                     ):
-                        await namespace.mark_deleted(path, memory_id)
+                        if not await namespace.drain_operation(
+                            namespace.prepare_deletion(self._db, path, memory_id)
+                        ):
+                            return {"deferred": True, "tombstoned": False, "metadata": False, "fts5": False}
                         return await namespace.drain_operation(self._delete_locked(memory_id))
                 except namespace.NamespaceLockBusy:
                     # A cross-process writer still holds this ID: tombstone the
@@ -1331,26 +1334,20 @@ class MemoryStore:
 async def delete_without_vector_store(db: aiosqlite.Connection, memory_id: str) -> dict:
     """Owner delete when no MemoryStore/vector client exists (degraded boot).
 
-    SQLite is all this can touch, so an ``embedded`` memory is refused
-    (``status='unavailable'``): dropping only its rows would orphan the point.
-    Every other row is deleted with the same guarantees as
-    ``MemoryStore.delete``: its queued embedding job goes too (or the recovery
-    worker would rebuild a vector for a deleted memory), and a namespaced ID
-    gets the same permanent identity tombstone under the same writer lock, so
-    a later identical peer offer cannot read the gap as a partial write.
+    No metadata status proves vector absence: a successful upsert can precede
+    its SQL mirror. Retain every row and record the existing durable intent;
+    the vector-aware canonical delete owns the eventual complete cascade.
     """
     from genesis.memory import namespace
 
     async def rows(namespace_path):
-        meta = await memory_crud.get_metadata(db, memory_id)
-        if meta and meta["embedding_status"] == "embedded":
-            return {"status": "unavailable"}
         if namespace_path is not None:
-            await namespace.mark_deleted(namespace_path, memory_id)
-        fts5 = await memory_crud.delete(db, memory_id=memory_id)
-        await memory_crud.delete_metadata(db, memory_id=memory_id)
-        pending = await pending_embeddings.delete_by_memory(db, memory_id=memory_id)
-        return {"status": "partial", "fts5": fts5, "pending_deleted": pending}
+            tombstoned = await namespace.prepare_deletion(db, namespace_path, memory_id)
+        else:
+            from genesis.memory.delete_tombstones import enqueue_tombstone
+
+            tombstoned = await enqueue_tombstone(db, memory_id=memory_id, reason="vector_store_unavailable")
+        return {"status": "deferred", "deferred": True, "tombstoned": tombstoned, "metadata": False, "fts5": False}
 
     async with memory_id_lock(memory_id):
         if not namespace.is_namespaced_id(memory_id):

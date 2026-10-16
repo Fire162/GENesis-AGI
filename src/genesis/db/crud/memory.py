@@ -395,10 +395,10 @@ async def create_metadata(
 ) -> str:
     """Insert a row into memory_metadata. Returns memory_id.
 
-    ``replace`` overwrites an existing row for ``memory_id`` instead of
-    keeping it: a namespaced repair re-runs the pipeline under a reserved ID
-    and replaces FTS and the vector payload, so metadata follows the same
-    latest-attempt policy.
+    ``replace`` updates latest-attempt ingestion fields for a reserved ID,
+    preserving owner lifecycle, retrieval counters and existing invalid_at.
+    The namespace reservation rejects an owner-superseded identity before any
+    repair can rewrite its vector.
 
     ``valid_at`` records when the fact became true in the real world
     (bi-temporal modeling). Defaults to ``created_at`` if not provided.
@@ -426,12 +426,20 @@ async def create_metadata(
     # a string that breaks the always-on filter.
     resolved_valid_at = canonical_iso(valid_at) or canonical_iso(created_at) or created_at
     await db.execute(
-        f"INSERT OR {'REPLACE' if replace else 'IGNORE'} INTO memory_metadata "  # noqa: S608 - fixed keyword
+        "INSERT OR IGNORE INTO memory_metadata "
         "(memory_id, created_at, collection, confidence, embedding_status, "
         "memory_class, wing, room, valid_at, invalid_at, source_subsystem, "
         "origin_class, speech_act, speech_act_confidence, assertion_provenance, "
         "durability, expires_at, preference_domain) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        + (" ON CONFLICT(memory_id) DO UPDATE SET " + ",".join(
+            f"{column}=excluded.{column}" for column in (
+                "created_at", "collection", "confidence", "embedding_status",
+                "memory_class", "wing", "room", "valid_at", "source_subsystem",
+                "origin_class", "speech_act", "speech_act_confidence",
+                "assertion_provenance", "durability", "expires_at", "preference_domain",
+            )
+        ) + ",invalid_at=COALESCE(memory_metadata.invalid_at,excluded.invalid_at)" if replace else ""),
         (
             memory_id,
             created_at,
@@ -473,13 +481,18 @@ async def invalidate_memory(
     canonical = canonical_iso(invalid_at)
     if canonical is None:
         raise ValueError(f"invalidate_memory: unparseable invalid_at {invalid_at!r}")
-    cursor = await db.execute(
-        "UPDATE memory_metadata SET invalid_at = ? WHERE memory_id = ?",
-        (canonical, memory_id),
-    )
-    await db.commit()
-    return cursor.rowcount > 0
+    from genesis.memory.namespace import lifecycle_write
 
+    async def perform():
+        cursor = await db.execute(
+            "UPDATE memory_metadata SET invalid_at = ? WHERE memory_id = ?",
+            (canonical, memory_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+    return await lifecycle_write(db, memory_id, perform)
 
 async def resolve_id(db: aiosqlite.Connection, id_or_prefix: str) -> tuple[list[str], str]:
     """Resolve a full memory id OR a short hex handle to the memory row(s).
@@ -577,15 +590,20 @@ async def mark_superseded(
     explicitly referenced, at the cost of its ``extends`` provenance edges
     losing link repair's exemption. That trade is deliberate.
     """
-    cursor = await db.execute(
-        "UPDATE memory_metadata SET deprecated = 1, "
-        "superseded_by = ?, superseded_at = ?, dream_cycle_run_id = NULL "
-        "WHERE memory_id = ?",
-        (new_id, timestamp, old_id),
-    )
-    await db.commit()
-    return cursor.rowcount > 0
+    from genesis.memory.namespace import lifecycle_write
 
+    async def perform():
+        cursor = await db.execute(
+            "UPDATE memory_metadata SET deprecated = 1, "
+            "superseded_by = ?, superseded_at = ?, dream_cycle_run_id = NULL "
+            "WHERE memory_id = ?",
+            (new_id, timestamp, old_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+    return await lifecycle_write(db, old_id, perform)
 
 async def get_metadata(
     db: aiosqlite.Connection,

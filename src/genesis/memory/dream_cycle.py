@@ -873,6 +873,7 @@ async def _cross_wing_scan(
                         query_vector=vec,
                         limit=5,
                         wing=wing_b,
+                        exclude_namespaced=True,
                     )
                 except Exception:
                     continue

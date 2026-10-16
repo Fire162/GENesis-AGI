@@ -25,6 +25,8 @@ A retry repairs only its deterministic ID and reports `created=False` if the
 reservation already existed. Callers performing compensation must respect that
 ownership result. Partial vector/FTS/metadata writes never justify deleting or
 relabeling another peer's or an owner's record.
+Repair updates ingestion fields without replacing owner lifecycle/provenance
+columns or existing invalidation times. Owner-superseded IDs refuse reoffers.
 
 Namespaced writes and deletion hold the existing per-ID asyncio lock and a
 per-ID kernel file lock under the database's `.memory-namespace-locks` sibling
@@ -32,11 +34,26 @@ directory. Cancellation drains an in-flight vector write or deletion before
 releasing these locks. Lock files are retained so different processes lock the
 same inode; a process exit releases its kernel lock.
 
-Owner deletion records reservation status `deleted` before the existing delete
-pipeline touches Qdrant. This state persists even when deletion is deferred,
+Owner deletion requires the existing durable deletion intent before recording
+reservation status `deleted` or touching Qdrant. Failure to record intent
+defers without permanent denial or removal. Open intent also blocks retry in
+the crash window before the permanent mark. This state persists when deferred,
 and rejects stale retries and later same-peer offers of identical content.
 Restoration requires a separate explicit owner operation; this slice exposes
 no restore command or peer route. This retention policy was chosen by the owner.
+
+A degraded caller without a vector client cannot prove point absence from any
+metadata status, including missing metadata. It records intent and retains all
+SQL rows for the existing vector-aware deletion cascade. Recovery validates the
+complete captured pending-job snapshot under the namespace lock before either
+successful or failed finalization. In-place requeues and explicit owner
+supersession/invalidation use the same lock and drain SQL commits on cancellation.
+
+Canonical vector writes derive an internal reserved-ID marker independently of
+caller payload. Automatic link, entity and cross-wing candidate searches exclude
+it before their result limits; ordinary external-origin memories remain eligible.
+This is a first-release invariant for the unmerged namespace feature, not a
+backfill guarantee for points from earlier unpublished branch versions.
 
 SQLite and Qdrant remain separate stores. Existing integrity detection and
 repair still owns later vector drift; a complete reservation checks its FTS and
