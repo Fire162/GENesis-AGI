@@ -24,7 +24,16 @@ prefix resolution; a valid UUID alone cannot create an external charter.
 
 Directed interactive follow-ups record `source=external_interactive`, remain
 eligible for the sanctioned hot lane, and match the `mine` source filter.
-Their default `source_session` is null. The marker is request-local; it creates
+Their default `source_session` is null. Explicit external references are resolved
+against the same three identity stores: known full IDs or unique prefixes are
+retained; unknown or ambiguous follow-up provenance becomes null with a diagnostic
+while the follow-up itself is saved. External `bookmark_shelve` and structured
+`knowledge_ingest` / `reference_store` session provenance refuse unknown targets
+before transcript reads or persistence. A filesystem-only legacy session does
+not qualify externally; ordinary clients retain filesystem bookmark resolution
+and their existing provenance behavior. Knowledge normalization copies the
+provenance dictionary. General free-text source labels remain caller metadata;
+these checks do not inspect arbitrary payloads for identifiers. The marker is request-local; it creates
 no Genesis session or lifecycle record. Existing dispatched-session cold routing
 and promotion restrictions remain unchanged and take precedence over the marker.
 

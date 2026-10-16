@@ -81,6 +81,10 @@ async def test_external_charter_writers_accept_each_existing_identity_store(
             result = await client.call_tool(writer, arguments)
     assert "error" not in result.data
     assert await crud.get(db, SID) is not None
+    assert result.data["session_id"] == SID
+    if writer == "session_ledger_add":
+        ledger_ids = {item["id"] for item in await crud.ledger_list(db, SID)}
+        assert result.data["id"] in ledger_ids
     assert (sessions_dir / SID / "charter.md").is_file()
 
 

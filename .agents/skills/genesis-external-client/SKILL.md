@@ -36,6 +36,11 @@ including existing proposal kill switches and the privacy fingerprint path;
 it does not scrub unrelated credentials already inherited from the operator.
 Charter updates and ledger additions require an existing Genesis transcript
 identity, including a session known only through its first heartbeat.
+The same recorded-identity boundary applies to explicit bookmarks and structured
+knowledge/reference session provenance. Unknown follow-up session provenance is
+dropped with a diagnostic while preserving the work. Filesystem-only legacy
+sessions are not external write targets; ordinary clients remain unchanged.
+Do not put Codex identifiers in structured provenance or free-text metadata.
 These tool profiles are not
 authentication or isolation from an operator with full host access.
 

@@ -3719,6 +3719,10 @@ verified: 8b445d636 2026-10-15
   interactive source. `session_config` remains deferred because its cache is global.
   Charter-creating external writes require an existing transcript identity in
   the charter, recorded-session or heartbeat store, after prefix resolution.
+  External bookmarks and structured knowledge/reference session provenance use
+  the same recorded-identity boundary before transcript reads or storage; unknown
+  follow-up session provenance is stored null with a diagnostic. Ordinary clients
+  retain existing behavior, including filesystem-only legacy bookmarks.
   See `docs/reference/codex-interactive-mcp.md` for deferred tools and scope.
   The separately launched validator can admit one canonical invocation of
   `scripts/codex_validator_request.py` through its native shell hook. Its

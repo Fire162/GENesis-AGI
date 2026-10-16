@@ -115,9 +115,23 @@ async def test_real_interactive_follow_up_has_external_provenance(isolated_child
         "content": "Synthetic external-client follow-up", "reason": "owner directed",
         "strategy": "ego_judgment", "work_state": "ready", "domain": "internal",
     }
+    known = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+    unknown = "12345678-1234-4321-8123-123456789abc"
+    async with aiosqlite.connect(database) as db:
+        await db.execute("INSERT INTO session_heartbeats(cc_session_id,updated_at) VALUES (?,'t0')", (known,))
+        await db.commit()
     async with Client(transport("health", "interactive"), timeout=45) as client:
         result = await client.call_tool("follow_up_create", arguments)
         follow_up_id = result.data["id"]
+        dropped = await client.call_tool("follow_up_create", {
+            **arguments, "content": "Synthetic unknown follow-up provenance", "source_session": unknown,
+        })
+        assert dropped.data["source_session"] is None
+        assert "existing Genesis session" in dropped.data["message"]
+        retained = await client.call_tool("follow_up_create", {
+            **arguments, "content": "Synthetic known follow-up provenance", "source_session": known[:8],
+        })
+        assert retained.data["source_session"] == known
     async with Client(transport("health", "external"), timeout=45) as narrow:
         with pytest.raises(ToolError, match="unavailable"):
             await narrow.call_tool("follow_up_create", arguments)
@@ -126,7 +140,9 @@ async def test_real_interactive_follow_up_has_external_provenance(isolated_child
             "SELECT source, kind, source_session, content FROM follow_ups WHERE id=?", (follow_up_id,),
         )).fetchone()
         assert row == ("external_interactive", "follow_up", None, arguments["content"])
-        assert await (await db.execute("SELECT COUNT(*) FROM follow_ups")).fetchone() == (1,)
+        assert await (await db.execute("SELECT COUNT(*) FROM follow_ups")).fetchone() == (3,)
+        for result_id, expected in ((dropped.data["id"], None), (retained.data["id"], known)):
+            assert await (await db.execute("SELECT source_session FROM follow_ups WHERE id=?", (result_id,))).fetchone() == (expected,)
 
 
 async def test_real_external_charter_writes_require_an_existing_target(isolated_child):
@@ -175,3 +191,40 @@ async def test_real_memory_save_duplicate_restart_and_keyword_recall(isolated_ch
         })
         assert any(row.get("memory_id") == memory_id and row.get("content") == content
                    for row in recalled.structured_content["result"])
+
+
+async def test_real_memory_session_references_require_recorded_targets(isolated_child):
+    database, transport = isolated_child
+    known = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+    unknown = "12345678-1234-4321-8123-123456789abc"
+    async with aiosqlite.connect(database) as db:
+        await db.execute("INSERT INTO session_heartbeats(cc_session_id,updated_at) VALUES (?,'t0')", (known,))
+        await db.commit()
+    async with Client(transport("memory", "interactive"), timeout=45) as client:
+        for name, arguments in (
+            ("bookmark_shelve", {"session_id": unknown, "context": "Synthetic rejected bookmark"}),
+            ("knowledge_ingest", {"content": "Synthetic rejected knowledge", "project": "fixture",
+                                  "domain": "fixture", "provenance": {"session_id": unknown}}),
+            ("reference_store", {"kind": "fact", "identifier": "rejected-synthetic-reference",
+                                 "value": "synthetic", "description": "Synthetic rejected reference",
+                                 "source": {"session_id": unknown}}),
+        ):
+            with pytest.raises(ToolError, match="existing Genesis session"):
+                await client.call_tool(name, arguments)
+        await client.call_tool("bookmark_shelve", {"session_id": known[:8], "context": "Synthetic recorded bookmark"})
+        knowledge_id = (await client.call_tool("knowledge_ingest", {
+            "content": "Synthetic recorded knowledge", "project": "fixture", "domain": "fixture",
+            "provenance": {"session_id": known[:8]},
+        })).data
+        reference_id = (await client.call_tool("reference_store", {
+            "kind": "fact", "identifier": "recorded-synthetic-reference", "value": "synthetic",
+            "description": "Synthetic recorded reference", "source": {"session_id": known[:8]},
+        })).data
+    async with aiosqlite.connect(database) as db:
+        assert await (await db.execute("SELECT cc_session_id FROM session_bookmarks")).fetchall() == [(known,)]
+        rows = await (await db.execute(
+            "SELECT k.id,p.source_session_id FROM knowledge_units k"
+            " JOIN pending_embeddings p ON p.memory_id=k.qdrant_id ORDER BY k.id",
+        )).fetchall()
+        assert rows == sorted([(knowledge_id, known), (reference_id, known)])
+        assert (await (await db.execute("SELECT COUNT(*) FROM knowledge_units")).fetchone())[0] == 2
