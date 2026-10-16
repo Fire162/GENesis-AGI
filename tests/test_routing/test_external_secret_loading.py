@@ -221,8 +221,9 @@ def test_external_loaders_retain_actual_safety_and_procedure_consumers(monkeypat
 
 @pytest.mark.parametrize("external", [False, True])
 @pytest.mark.parametrize("selected_exists", [False, True])
+@pytest.mark.parametrize("explicit_path", [False, True])
 def test_experiment_secret_loader_retains_external_policy_and_ordinary_control(
-    monkeypatch, tmp_path, external, selected_exists,
+    monkeypatch, tmp_path, external, selected_exists, explicit_path,
 ):
     from genesis.eval import reflection_golden_set as golden
     from genesis.mcp.external_profiles import EXTERNAL_SECRET_BLOCKED_KEYS
@@ -235,6 +236,10 @@ def test_experiment_secret_loader_retains_external_policy_and_ordinary_control(
         selected.write_text("GENESIS_SESSION_ID=selected-session\nAPI_KEY_DEEPSEEK=selected-provider\n")
     monkeypatch.setattr(golden.Path, "home", lambda: tmp_path)
     monkeypatch.setattr("genesis.env.secrets_path", lambda: selected)
+    if explicit_path:
+        monkeypatch.setenv("SECRETS_PATH", str(selected))
+    else:
+        monkeypatch.delenv("SECRETS_PATH", raising=False)
     monkeypatch.setattr(golden, "_secrets_loaded", False)
     monkeypatch.delenv("GENESIS_SESSION_ID", raising=False)
     monkeypatch.delenv("API_KEY_DEEPSEEK", raising=False)
@@ -248,8 +253,9 @@ def test_experiment_secret_loader_retains_external_policy_and_ordinary_control(
         assert os.environ.get("API_KEY_DEEPSEEK") == ("selected-provider" if selected_exists else None)
         assert os.environ.get("DEEPSEEK_API_KEY") == ("selected-provider" if selected_exists else None)
     else:
-        assert os.environ["GENESIS_SESSION_ID"] == "legacy-session"
-        assert os.environ["DEEPSEEK_API_KEY"] == "legacy-provider"  # pragma: allowlist secret — synthetic fixture value
+        source = "selected" if selected_exists else (None if explicit_path else "legacy")
+        assert os.environ.get("GENESIS_SESSION_ID") == (f"{source}-session" if source else None)
+        assert os.environ.get("DEEPSEEK_API_KEY") == (f"{source}-provider" if source else None)
 
 
 @pytest.mark.parametrize("family", ["experiment", "evo", "skill_replay"])

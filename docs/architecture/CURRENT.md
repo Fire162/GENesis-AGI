@@ -144,7 +144,11 @@ Easy-to-forget mechanisms:
   when the server can't answer. Latency budget: 4.5s server / 4.75s client
   (sized to the production engine's measured cold path — embed + a 1.0s
   rerank timebox + retrieval under load; see the #1169 timeout
-  investigation), inside the hook wrapper's 10s ceiling. The
+  investigation), inside the hook wrapper's 10s ceiling. The hook keeps to
+  that ceiling with an 8s soft deadline counted from process start and a
+  process-level hard stop at 8.5s (`scripts/hooks/hook_deadline.py`) that
+  ends a run stuck inside one step, with a one-line out-of-time notice and the
+  blocked frame on stderr, instead of being killed silently. The
   `memory_proactive` MCP tool shares the engine but stays unfiltered/
   un-reranked.
 - **FTS term counts are bounded** (`db/crud/_fts.py` `bounded_terms`,
@@ -963,7 +967,7 @@ row (`GovernanceGate._is_duplicate`). Inside the signal type's window
 signal type, category and `content_hash` (SHA-256 of the first 200 characters of
 `context`, topic ignored). The content-hash match is skipped for the signal types
 whose topic is the message identity (`_TOPIC_IS_IDENTITY`: `queued_alert`,
-`morning_report`, `career_outreach_nudged`) and for any empty or whitespace-only
+`morning_report`, `career_outreach_nudged`, `peer_message`) and for any empty or whitespace-only
 context. Before that exemption, at least 3 of a live install's 84 recorded
 morning-report job runs (mid-July to October) delivered nothing this way: the
 next day's report finished drafting a few seconds sooner, fell inside the 24 h
@@ -974,10 +978,16 @@ gives a repeated failure one dedupe key with `alert_stable_key`
 (`scripts/lib/alert_queue.sh`), which leaves the per-run
 `Time:`/`Duration:`/`SQLite lines:` lines out of the hash.
 
+Peer messages use their peer/epoch/message identity as the topic. Every
+`agent_send` first reserves the existing pending queue; the adapter checks its
+immutable payload and canceled/dequeued state before committing a new outbox
+message. Collection ACKs and peer traffic are excluded from human engagement
+judgments, without changing outbound governance or granting authority.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: d6edbcc6 2026-09-11
+verified: 0164dd1f0 2026-10-14
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -1419,12 +1429,32 @@ verified: cfbb876243f2 2026-10-07
   deprecated allowance field remains only for database compatibility. Local
   `genesis peers` CLI writes relationships; `/v1/agent/a2a/health` authenticates
   through the existing runtime loop. The Agent Card returns `503 not_ready`
-  until an installed task transport can fulfill its advertised interface.
+  until the conversation service below is installed and ready.
   Revocation disables access immediately; only active peer credentials contribute
   to fallback readiness, while inactive credentials still participate in scope
   collision checks. Scope checks also reject equality with loaded active/fallback
   Flask signing keys, without request-time credential-file reads.
-  See `docs/reference/peer-registry.md`.
+  `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
+  existing Flask/runtime loop: it atomically persists native receipts, binds
+  contexts and retries to relationship epochs, and admits at most two
+  outstanding peer turns globally and per peer, without a daily submission
+  quota. Fresh native turns use Genesis identity/cognition, available memory
+  enrichment, observe/interact tools, external unattended provenance and the
+  native background ceiling. Result heads and full artifacts have bounded
+  disclosure checks. Approval attribution survives notification updates; the API
+  lists pending owner actions and never resolves them. Presented peer/backend
+  bearers are refused before owner mutation shortcuts. Deployment/enrollment and
+  connector-only ingress verification are separate prerequisites. No new listener
+  or peer execution queue. See `docs/reference/peer-registry.md` and
+  `docs/reference/agent-conversations.md`.
+  `peers/outbox.py` retains addressed A2A messages for collection, with scoped
+  idempotent ACKs and atomic first-reply correlation in the native receipt.
+  `channels/agent_adapter.py` queues locally through ordinary outreach governance;
+  `agent_send` is denied to observe/restricted mail profiles and available to
+  permitted interact turns. Pending/deferred delivery preserves typed message
+  identity. ACKs confer no owner engagement or approval. This is a pull channel,
+  not an HTTP sender or new listener; the separately operated peer client must
+  durably deduplicate before ACK/execution. See `docs/reference/agent-outbox.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is
@@ -2658,7 +2688,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 4117f6ed 2026-10-05
+verified: 8b445d636b26 2026-10-16
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2800,7 +2830,7 @@ verified: 4117f6ed 2026-10-05
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
-  No transport, CLI, automatic execution or qualification verdict is wired yet;
+  No CLI, automatic execution or qualification verdict is wired yet;
   subsequent replacement PRs supply those callers. Production credentials and
   accounting stores are outside this boundary. See
   `docs/reference/qualification-journal.md`. Offline reference admission also
@@ -2820,6 +2850,29 @@ verified: 4117f6ed 2026-10-05
   full-schema SQLite fixtures and observes the actual rendered candidate IDs.
   Full preflight, storage replay and execution/reporting orchestration land later.
   See `docs/reference/qualification-corpus.md`.
+  Qualification's pinned transport supplies a caller-provided adapter router
+  through the production delegate, a shared one-egress wire guard, response-hook
+  durability and exact lexical Decimal GET billing. Documented selected-route
+  metadata is checked on live acceptance and replay; gateway response caching
+  is explicitly disabled. Contradictory served identities retain unresolved
+  liability, while expense settlement cannot qualify invalid routing evidence.
+  Frozen schedule/provider
+  mapping and dedicated nonreset credentials are required; any journal incident
+  pauses new requests and replay until verified recovery. These checks do not
+  admit more than reported or exact limit-minus-spend headroom supports. Local
+  client setup precedes durable dispatch; recovery metadata uses the shared JSON
+  authority before redaction, and diagnostic formatting cannot interrupt calls.
+  External JSON has explicit local byte/depth bounds and a shared forward string
+  scanner. Unsafe response/receipt bodies retain opaque error evidence; decoded
+  strings stay untrusted through bounded nested JSON redaction. Refusals preserve
+  unresolved funding and never resend a completion.
+  Credential lending preserves known redaction values while keeping production
+  aliases hidden from the SDK, including log calls on SDK threads.
+  These checks do not
+  establish provider spend bounds or owner approval. The isolated runner remains
+  a later replacement. This verification refresh covers the qualification slice;
+  other learning/evaluation entries retain their previous verification scope.
+  See `docs/reference/qualification-transport.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
