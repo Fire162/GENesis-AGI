@@ -100,6 +100,12 @@ from pathlib import Path
 
 import pytest
 
+_context_spec = importlib.util.spec_from_file_location(
+    '_live_fence_context', Path(__file__).with_name('_live_fence_context.py')
+)
+_context = importlib.util.module_from_spec(_context_spec)
+_context_spec.loader.exec_module(_context)
+
 DENY_NAMES = frozenset({"claude", "systemd-run", "systemctl", "sudo", "gh", "loginctl"})
 # Other names the same programs install under (the repo's own list:
 # cc/slot_liveness.py): the claude launcher is a symlink to `claude.exe`.
@@ -211,12 +217,10 @@ def _with_assignments(env, words) -> dict | Mapping | None:
     """``env`` plus the ``NAME=value`` words a command line sets in front of a
     command (``env PATH=/usr/bin systemctl``, ``PATH=/x cmd``)."""
     assigned = {w.split("=", 1)[0]: w.split("=", 1)[1] for w in words if _ASSIGN.match(w)}
+    env = _context.env_options(env, words)
     if not assigned:
         return env
-    base = os.environ if env is None else env
-    merged = {os.fsdecode(k): os.fsdecode(v) for k, v in base.items()} if base else {}
-    merged.update(assigned)
-    return merged
+    return _context.overlay(env, assigned)
 
 
 def _line_paths(line: str, env) -> list:
@@ -234,6 +238,10 @@ def _resolve(program: str, env, cwd=None) -> str | None:
     """The file a program name runs: a path (relative to ``cwd``) when it has a
     '/', else via the call's PATH. None when there is no such file: it cannot run,
     and the code under test should see the same FileNotFoundError it would on CI."""
+    if _context.unknown(env, 'PATH') and '/' not in program:
+        return None
+    if _context.unknown_cwd(env) and _context.needs_cwd(program, env):
+        return None
     if "/" in program:
         path = program if os.path.isabs(program) else os.path.join(cwd or os.getcwd(), program)
         return path if os.path.exists(path) else None
@@ -420,6 +428,10 @@ def _deny_reason(program: str, argv: list[str], env, cwd) -> str | None:
         return None
     if _S.opted_out and name in USER_MANAGER_ALLOWED:
         return None
+    if (getattr(env, 'namespace_unknown', False)
+            or (_context.unknown(env, 'PATH') and '/' not in program)
+            or (_context.unknown_cwd(env) and _context.needs_cwd(program, env))):
+        return f'{name}: unproved systemd-run execution context'
     resolved = _resolve(program, env, cwd)
     if resolved is None:
         return None  # not installed here: it cannot run, and CI is the same
@@ -448,37 +460,8 @@ def _deploy_script(path: str, cwd) -> tuple[str, str | None] | None:
 
 
 def _script_args(argv: list[str]) -> list[str]:
-    """The script a script-running program would run: a shell's first operand
-    (none with ``-c``, whose string is judged as commands; none with ``-n``, parse
-    only, when it comes BEFORE the script), what ``source``/``.`` read, and any
-    operand of ``systemd-run``."""
-    head = os.path.basename(argv[0])
-    if head in _SHELLS:
-        noexec = False
-        i = 1
-        while i < len(argv):
-            arg = argv[i]
-            if arg in ("--", "-"):
-                return argv[i + 1 : i + 2] if not noexec else []
-            if arg.startswith("--"):
-                i += 2 if arg in ("--rcfile", "--init-file") else 1
-                continue
-            if arg.startswith(("-", "+")):
-                letters = arg[1:]
-                if "c" in letters:
-                    return []
-                values = sum(letter in "oO" for letter in letters)
-                if "n" in letters or ("o" in letters and "noexec" in argv[i + 1 : i + 1 + values]):
-                    noexec = arg[0] == "-"
-                i += 1 + values
-                continue
-            return [] if noexec else [arg]
-        return []
-    if head in ("source", "."):
-        return argv[1:2]
-    if head == "systemd-run":
-        return [a for a in argv[1:] if not a.startswith("-")]
-    return []
+    """Only executable shell operands; carrier option values are never scripts."""
+    return _context.script_args(argv, _SHELLS)
 
 
 def _deploy_reason(argv: list[str], env, cwd) -> str | None:
@@ -487,10 +470,16 @@ def _deploy_reason(argv: list[str], env, cwd) -> str | None:
     if not argv:
         return None
     for arg in [argv[0], *_script_args(argv)]:
+        if (_context.unknown_cwd(env) and not os.path.isabs(arg)
+                and os.path.basename(arg) in DEPLOY_SCRIPTS):
+            return 'deploy script with unproved systemd-run working directory'
         found = _deploy_script(arg, cwd)
         if found is None:
             continue
         name, root = found
+        key = 'GENESIS_DIR' if name in _GENESIS_DIR_SCRIPTS else _ROOT_OVERRIDES.get(name)
+        if _context.unknown(env, 'HOME') or (key and _context.unknown(env, key)):
+            return f'{name} with unproved systemd-run HOME/root context'
         home = _env_get(env, "HOME")
         if name in _GENESIS_DIR_SCRIPTS:
             target = _env_get(env, "GENESIS_DIR") or (
@@ -498,6 +487,8 @@ def _deploy_reason(argv: list[str], env, cwd) -> str | None:
             )
         else:
             target = _env_get(env, _ROOT_OVERRIDES.get(name, "")) or root
+        if _context.unknown_cwd(env) and any(value and not os.path.isabs(value) for value in (home, target)):
+            return f'{name} with relative paths in an unproved systemd-run working directory'
         target = _real(target, cwd) if target else None
         if not _S.real_home:
             why = "an unknown real HOME"
@@ -515,21 +506,11 @@ def _deploy_reason(argv: list[str], env, cwd) -> str | None:
 
 
 def _systemd_run_payload(argv: list[str]) -> list[str]:
-    """The command a ``systemd-run`` argv starts."""
-    i = 1
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--":
-            return argv[i + 1 :]
-        if not arg.startswith("-") or arg == "-":
-            return argv[i:]
-        if arg in _SYSTEMD_RUN_VALUE_OPTS:
-            i += 1
-        i += 1
-    return []
+    """Compatibility alias for callers inspecting the finite payload boundary."""
+    return _context.systemd_context(argv, {}, None, _SYSTEMD_RUN_VALUE_OPTS)[0]
 
 
-def judge(program, argv, env, cwd=None) -> str | None:
+def judge(program, argv, env, cwd=None, *, _deploy_only=False) -> str | None:
     """Why this exec must be refused, or None to allow it.
 
     ``program`` is what the kernel will run (a path or a bare name), ``argv``
@@ -544,17 +525,32 @@ def judge(program, argv, env, cwd=None) -> str | None:
     program = os.fsdecode(program)
     argv = [os.fsdecode(a) for a in (argv or [])]
     cwd = os.fsdecode(cwd) if cwd is not None else None
-    reason = _deny_reason(program, argv, env, cwd)
+    reason = None if _deploy_only else _deny_reason(program, argv, env, cwd)
     if reason:
         return reason
     if not argv:
+        return None
+    if _tool_name(program, cwd) == 'systemd-run':
+        real_carrier = _S.opted_out or 'systemd-run' in _S.real_tool_names
+        try:
+            payload, unit_env, unit_cwd = _context.systemd_context(argv, env, cwd, _SYSTEMD_RUN_VALUE_OPTS)
+        except ValueError as error:
+            return f'systemd-run payload: {error}' if real_carrier else None
+        if not real_carrier:
+            # The answered PATH shim never starts a payload. Preserve its
+            # existing caller-context deploy check without inventing a service.
+            unit_env, unit_cwd = env, cwd
+        if payload:
+            reason = judge(payload[0], payload, unit_env, unit_cwd,
+                           _deploy_only=_deploy_only or not real_carrier)
+            return f'systemd-run payload: {reason}' if reason else None
         return None
     reason = _deploy_reason(argv, env, cwd)
     if reason:
         return reason
     raw_line = shlex.join(argv)
     for code in (c for arg in argv for c in _here_strings(arg)):
-        reason = judge("sh", ["sh", "-c", code], env, cwd)
+        reason = judge("sh", ["sh", "-c", code], env, cwd, _deploy_only=_deploy_only)
         if reason:
             return reason
     line = shlex.join(_drop_heredoc_bodies(a) for a in argv)
@@ -563,27 +559,22 @@ def judge(program, argv, env, cwd=None) -> str | None:
         seg_env = _with_assignments(env, wrappers)
         for word in wrappers:
             for e in (seg_env, *alt_envs):
-                reason = _deny_reason(word, [word], e, cwd)
+                reason = None if _deploy_only else _deny_reason(word, [word], e, cwd)
                 if reason:
                     return reason
         if not seg:
             continue
         for e in (seg_env, *alt_envs):
-            reason = _deny_reason(seg[0], seg, e, cwd)
+            reason = None if _deploy_only else _deny_reason(seg[0], seg, e, cwd)
             if reason:
                 return reason
         reason = _deploy_reason(seg, seg_env, cwd)
         if reason:
             return reason
-        if _S.opted_out and _tool_name(seg[0], cwd) == "systemd-run":
-            # A real systemd-run starts its payload in the user manager, under
-            # that manager's PATH, where no stub stands in for anything.
-            payload = _systemd_run_payload(seg)
-            if payload:
-                unit_env = dict(_with_assignments(seg_env, ["PATH=" + _S.orig_path]))
-                reason = judge(payload[0], payload, unit_env, cwd)
-                if reason:
-                    return f"systemd-run payload: {reason}"
+        if _tool_name(seg[0], cwd) == 'systemd-run':
+            reason = judge(seg[0], seg, seg_env, cwd, _deploy_only=_deploy_only)
+            if reason:
+                return reason
     return None
 
 
@@ -686,7 +677,7 @@ def install(config) -> None:
         _S.real_home = os.environ.get("HOME")
     if not _S.real_home or not os.path.isabs(_S.real_home):
         _S.real_home = None
-    _S.orig_path = os.environ.get("PATH", "")
+    _S.orig_path = os.environ.get("PATH", os.defpath)
     base = Path(tempfile.mkdtemp(prefix="genesis-live-fence-"))
     _S.base = str(base)
     _S.shim_dir = str(base / "bin")
@@ -695,7 +686,7 @@ def install(config) -> None:
     Path(_S.log).touch()
     # A stub only where the tool is installed: where it is not, a bare call
     # fails as on CI and `shutil.which` keeps answering "not installed".
-    stubbed = {n for n in _STUB_NAMES if _which(n, path=_S.orig_path or os.defpath)}
+    stubbed = {n for n in _STUB_NAMES if _resolve(n, {"PATH": _S.orig_path}, os.getcwd())}
     if os.environ.get("GENESIS_CC_BIN"):
         stubbed.add("claude")
     _S.stubbed = frozenset(stubbed)
