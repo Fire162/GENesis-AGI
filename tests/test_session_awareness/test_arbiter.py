@@ -11,8 +11,6 @@ from pathlib import Path
 
 import pytest
 
-from tests._live_fence import _S
-
 from genesis.session_awareness.arbiter import (
     ARBITER_MODEL,
     MAX_PICKS,
@@ -22,6 +20,7 @@ from genesis.session_awareness.arbiter import (
     judge_candidates,
     parse_verdict,
 )
+from tests._live_fence import _S
 
 
 def _envelope(result: str) -> str:
