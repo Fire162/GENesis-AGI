@@ -73,8 +73,9 @@ two ways:
 
 Every refusal, from either layer, is appended to one log with the test's node
 id. The test that caused it fails at teardown even if the code swallowed the
-exception; a hit that arrives after its test ended (a detached child) fails the
-session.
+exception; a hit drained after its test ended (a detached child) fails the
+session. Reporting ends at the final session drain. Shim files remain in their
+unique temp directory for surviving children, until normal temp cleanup.
 
 Opt-outs, each listed in the terminal summary: a test marked ``user_manager``
 may run the real ``systemd-run`` (for a transient ``--user`` scope or a unit
@@ -103,6 +104,7 @@ DENY_NAMES = frozenset({"claude", "systemd-run", "systemctl", "sudo", "gh", "log
 # Other names the same programs install under (the repo's own list:
 # cc/slot_liveness.py): the claude launcher is a symlink to `claude.exe`.
 _ALIASES = {"claude.exe": "claude", "claude-code": "claude"}
+_STUB_NAMES = DENY_NAMES | _ALIASES.keys()
 # Of those, the tools hundreds of existing tests reach only to READ live state
 # (a user-manager query, a GitHub GET). Called by bare name they get the stub,
 # which answers as the real tool does on CI (nothing reachable) and is reported,
@@ -157,7 +159,7 @@ class LiveStateViolation(BaseException):  # noqa: N818 - named for what it is
 class _State:
     installed = False
     pid = 0  # the pytest process; a refusal in a forked child exits instead
-    real_home = ""
+    real_home: str | None = None
     orig_path = ""  # PATH before the fence put its stubs in front
     shim_dir = ""
     all_stub_dir = ""  # every DENY_NAMES stub, for the fence's own tests
@@ -181,7 +183,9 @@ _S = _State()
 # ── decision ────────────────────────────────────────────────────────────────
 
 
-def _real(path: str) -> str:
+def _real(path: str, cwd=None) -> str:
+    if cwd is not None and not os.path.isabs(path):
+        path = os.path.join(cwd, path)
     try:
         return os.path.realpath(path)
     except (OSError, ValueError):
@@ -233,7 +237,15 @@ def _resolve(program: str, env, cwd=None) -> str | None:
     if "/" in program:
         path = program if os.path.isabs(program) else os.path.join(cwd or os.getcwd(), program)
         return path if os.path.exists(path) else None
-    search = _env_get(env, "PATH") or os.defpath
+    search = _env_get(env, "PATH")
+    if search is None:
+        search = os.defpath
+    # Empty and relative PATH components are relative to the child's cwd,
+    # including an explicitly empty PATH (which is not the default PATH).
+    search = os.pathsep.join(
+        part if os.path.isabs(part) else os.path.join(cwd or os.getcwd(), part)
+        for part in search.split(os.pathsep)
+    )
     return _which(program, path=search)
 
 
@@ -389,13 +401,13 @@ def _segments(command: str) -> list[tuple[list[str], list[str]]]:
     return out
 
 
-def _tool_name(program: str) -> str:
+def _tool_name(program: str, cwd=None) -> str:
     """The DENY_NAMES entry ``program`` runs, by its name or, for a path, by the
     name of the file it resolves to; else its plain basename."""
     name = os.path.basename(program)
     name = _ALIASES.get(name, name)
     if name not in DENY_NAMES and "/" in program:
-        target = os.path.basename(_real(program))
+        target = os.path.basename(_real(program, cwd))
         target = _ALIASES.get(target, target)
         if target in DENY_NAMES:
             return target
@@ -403,7 +415,7 @@ def _tool_name(program: str) -> str:
 
 
 def _deny_reason(program: str, argv: list[str], env, cwd) -> str | None:
-    name = _tool_name(program)
+    name = _tool_name(program, cwd)
     if name not in DENY_NAMES or name in _S.real_tool_names:
         return None
     if _S.opted_out and name in USER_MANAGER_ALLOWED:
@@ -442,16 +454,25 @@ def _script_args(argv: list[str]) -> list[str]:
     operand of ``systemd-run``."""
     head = os.path.basename(argv[0])
     if head in _SHELLS:
-        for i, arg in enumerate(argv[1:], 1):
-            if arg.startswith("--") or arg in ("-o", "+o", "-O", "+O"):
+        noexec = False
+        i = 1
+        while i < len(argv):
+            arg = argv[i]
+            if arg in ("--", "-"):
+                return argv[i + 1 : i + 2] if not noexec else []
+            if arg.startswith("--"):
+                i += 2 if arg in ("--rcfile", "--init-file") else 1
                 continue
             if arg.startswith(("-", "+")):
-                if "c" in arg[1:] or "n" in arg[1:]:
+                letters = arg[1:]
+                if "c" in letters:
                     return []
+                values = sum(letter in "oO" for letter in letters)
+                if "n" in letters or ("o" in letters and "noexec" in argv[i + 1 : i + 1 + values]):
+                    noexec = arg[0] == "-"
+                i += 1 + values
                 continue
-            if argv[i - 1] in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
-                continue
-            return [arg]
+            return [] if noexec else [arg]
         return []
     if head in ("source", "."):
         return argv[1:2]
@@ -477,8 +498,10 @@ def _deploy_reason(argv: list[str], env, cwd) -> str | None:
             )
         else:
             target = _env_get(env, _ROOT_OVERRIDES.get(name, "")) or root
-        target = _real(target) if target else None
-        if not home or _real(home) == _real(_S.real_home):
+        target = _real(target, cwd) if target else None
+        if not _S.real_home:
+            why = "an unknown real HOME"
+        elif not home or _real(home, cwd) == _real(_S.real_home):
             why = "the real HOME"
         elif target in _S.live_roots:
             why = f"the live install's checkout as its root ({target})"
@@ -552,7 +575,7 @@ def judge(program, argv, env, cwd=None) -> str | None:
         reason = _deploy_reason(seg, seg_env, cwd)
         if reason:
             return reason
-        if _S.opted_out and _tool_name(seg[0]) == "systemd-run":
+        if _S.opted_out and _tool_name(seg[0], cwd) == "systemd-run":
             # A real systemd-run starts its payload in the user manager, under
             # that manager's PATH, where no stub stands in for anything.
             payload = _systemd_run_payload(seg)
@@ -570,7 +593,7 @@ def _record(line: str) -> None:
     try:
         fd = os.open(_S.log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            os.write(fd, (line.replace("\n", " ") + "\n").encode())
+            os.write(fd, (line.replace("\n", " ") + "\n").encode("utf-8", "backslashreplace"))
         finally:
             os.close(fd)
     except OSError:
@@ -611,14 +634,15 @@ def _hook(event: str, args: tuple) -> None:
 
 _SHIM = """#!/bin/sh
 tag={tag}
-if [ "$(basename "$0")" = claude ] && [ $# -eq 1 ]; then
+tool={tool}
+if [ "$tool" = claude ] && [ $# -eq 1 ]; then
   case "$1" in --version|--help) tag=answered ;; esac
 fi
 args=$(printf '%s' "$*" | tr '\\n\\t' '  ')
 printf '%s\\t%s\\t%s %s\\n' "${{PYTEST_CURRENT_TEST:-<no test>}}" "$tag" "$(basename "$0")" "$args" >> {log}
 if [ "$tag" = answered ]; then
   # What the real tool says on a CI runner, where nothing is reachable.
-  case "$(basename "$0")" in
+  case "$tool" in
     gh) echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4 ;;
     claude) exit 127 ;;
     *) echo "Failed to connect to bus: No such file or directory" >&2; exit 1 ;;
@@ -633,8 +657,9 @@ def _write_shims(directory: Path, log: str, names) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for name in names:
         shim = directory / name
-        tag = "answered" if name in ANSWERED_NAMES else "shim"
-        shim.write_text(_SHIM.format(log=shlex.quote(log), tag=tag))
+        tool = _ALIASES.get(name, name)
+        tag = "answered" if tool in ANSWERED_NAMES else "shim"
+        shim.write_text(_SHIM.format(log=shlex.quote(log), tag=tag, tool=shlex.quote(tool)))
         shim.chmod(0o755)
 
 
@@ -644,7 +669,7 @@ def _stub_dir_without(names: frozenset[str]) -> str:
         return _S.shim_dir
     own = Path(_S.base) / ("bin-real-" + "-".join(sorted(names)))
     if not own.is_dir():
-        _write_shims(own, _S.log, _S.stubbed - names)
+        _write_shims(own, _S.log, {n for n in _S.stubbed if _ALIASES.get(n, n) not in names})
     return str(own)
 
 
@@ -653,7 +678,14 @@ def install(config) -> None:
     if _S.installed:
         return
     _S.pid = os.getpid()
-    _S.real_home = pwd.getpwuid(os.getuid()).pw_dir
+    try:
+        _S.real_home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        # Numeric-UID containers need not have an /etc/passwd entry. HOME is
+        # usable identity only when absolute; otherwise deploys remain refused.
+        _S.real_home = os.environ.get("HOME")
+    if not _S.real_home or not os.path.isabs(_S.real_home):
+        _S.real_home = None
     _S.orig_path = os.environ.get("PATH", "")
     base = Path(tempfile.mkdtemp(prefix="genesis-live-fence-"))
     _S.base = str(base)
@@ -663,16 +695,16 @@ def install(config) -> None:
     Path(_S.log).touch()
     # A stub only where the tool is installed: where it is not, a bare call
     # fails as on CI and `shutil.which` keeps answering "not installed".
-    stubbed = {n for n in DENY_NAMES if _which(n, path=_S.orig_path or os.defpath)}
+    stubbed = {n for n in _STUB_NAMES if _which(n, path=_S.orig_path or os.defpath)}
     if os.environ.get("GENESIS_CC_BIN"):
         stubbed.add("claude")
     _S.stubbed = frozenset(stubbed)
     _write_shims(Path(_S.shim_dir), _S.log, _S.stubbed)
-    _write_shims(Path(_S.all_stub_dir), _S.log, DENY_NAMES)
+    _write_shims(Path(_S.all_stub_dir), _S.log, _STUB_NAMES)
     # The deployed install, as a root deploy scripts may not act on. A CI
     # checkout is never here, so the rule is inert there. An install elsewhere
     # names its checkout in GENESIS_LIVE_FENCE_LIVE_ROOT.
-    live = {Path(_S.real_home) / "genesis"}
+    live = {Path(_S.real_home) / "genesis"} if _S.real_home else set()
     if os.environ.get("GENESIS_LIVE_FENCE_LIVE_ROOT"):
         live.add(Path(os.environ["GENESIS_LIVE_FENCE_LIVE_ROOT"]))
     _S.live_roots = frozenset(
@@ -710,9 +742,13 @@ def install(config) -> None:
 
 
 def uninstall_files(config) -> None:
-    base = getattr(config, "_genesis_live_fence_dir", None)
-    if base:
-        shutil.rmtree(base, ignore_errors=True)
+    """Keep the file layer armed for children that outlive pytest.
+
+    Inherited PATH readers must not fall through to installed tools when the
+    parent finishes. Unique scratch directories remain for normal temp cleanup;
+    reporting ends at the session's final drain, while the shims still refuse.
+    The audit hook also remains installed, so same-process reuse stays armed.
+    """
 
 
 # ── per-test enforcement ────────────────────────────────────────────────────

@@ -6,7 +6,9 @@ stub under tmp_path that only exits; every refused probe is harmless unfenced.
 
 from __future__ import annotations
 
+import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -57,6 +59,67 @@ def test_a_root_override_to_a_fixture_is_allowed(live_install, tmp_path):
     other.mkdir()
     env = {"HOME": str(tmp_path), "GENESIS_UPDATE_ORIG_DIR": str(other), "PATH": os.defpath}
     assert fence.judge("bash", ["bash", str(live_install)], env) is None
+
+
+@pytest.mark.parametrize(
+    "script,variable",
+    [
+        ("update.sh", "GENESIS_UPDATE_ORIG_DIR"),
+        ("deploy_code_only.sh", "GENESIS_DEPLOY_ROOT"),
+        ("backup.sh", "GENESIS_DIR"),
+        ("restore.sh", "GENESIS_DIR"),
+    ],
+)
+def test_relative_root_overrides_use_the_child_cwd(live_install, tmp_path, script, variable):
+    live_root = live_install.parent.parent
+    fixture = tmp_path / "fixture" / "scripts" / script
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("#!/bin/sh\nexit 0\n")
+    env = {"HOME": str(tmp_path / "home"), "PATH": os.defpath, variable: "."}
+    argv = ["bash", str(fixture)]
+    assert fence.judge("bash", argv, env, str(live_root)) is not None
+    assert fence.judge("bash", argv, env, str(fixture.parent.parent)) is None
+
+
+@pytest.mark.parametrize("search", [".", "", "missing:."])
+def test_relative_search_paths_use_the_child_cwd(tmp_path, monkeypatch, search):
+    child = tmp_path / "child"
+    child.mkdir()
+    tool = child / "sudo"
+    tool.write_text("#!/bin/sh\nexit 0\n")
+    tool.chmod(0o755)
+    monkeypatch.setattr(fence._S, "allowed_roots", ())
+    env = {"HOME": str(tmp_path), "PATH": search}
+    assert fence.judge("sudo", ["sudo"], env, str(child)) is not None
+    monkeypatch.setattr(fence._S, "allowed_roots", (str(child),))
+    assert fence.judge("sudo", ["sudo"], env, str(child)) is None
+
+
+def test_relative_tool_alias_uses_the_child_cwd(tmp_path, monkeypatch):
+    child = tmp_path / "child"
+    child.mkdir()
+    tool = child / "sudo"
+    tool.write_text("#!/bin/sh\nexit 0\n")
+    tool.chmod(0o755)
+    (child / "runner").symlink_to(tool.name)
+    monkeypatch.setattr(fence._S, "allowed_roots", ())
+    env = {"HOME": str(tmp_path), "PATH": os.defpath}
+    assert fence.judge("./runner", ["./runner"], env, str(child)) is not None
+
+
+def test_non_utf8_argv_keeps_the_uncatchable_refusal(tmp_path, monkeypatch):
+    tool = tmp_path / "sudo"
+    tool.write_text("#!/bin/sh\nexit 0\n")
+    tool.chmod(0o755)
+    monkeypatch.setattr(fence._S, "allowed_roots", ())
+    caught = False
+    with fence.expect_violation() as violation:
+        try:
+            subprocess.run([str(tool), bytes([255])], check=False)
+        except Exception:
+            caught = True
+    assert not caught
+    assert any("audit" in line and "\\udcff" in line for line in violation.reasons)
 
 
 def test_replay_direct_with_a_private_home_is_refused(live_install, monkeypatch, tmp_path):
@@ -115,6 +178,131 @@ def test_parse_only_relative_paths_and_os_system_are_judged_right():
     assert fence.judge("bash", ["bash", "update.sh"], env, "/x/scripts") is not None
     # os.system is judged as `sh -c <line>`
     assert fence.judge("sh", ["sh", "-c", f"cd /x && bash {S}"], None) is not None
+
+
+@pytest.mark.parametrize(
+    "flags,runs",
+    [
+        (["+n"], True),
+        (["+xn"], True),
+        (["-n", "+n"], True),
+        (["+n", "-n"], False),
+        (["-o", "noexec"], False),
+        (["+o", "noexec"], True),
+        (["-o", "noexec", "+o", "noexec"], True),
+        (["+o", "noexec", "-o", "noexec"], False),
+    ],
+)
+def test_script_noexec_state_obeys_option_order(flags, runs):
+    env = {"HOME": fence._S.real_home, "PATH": os.defpath}
+    assert bool(fence.judge("bash", ["bash", *flags, S], env)) is runs
+
+
+def test_retired_pytest_keeps_inherited_shims_armed(tmp_path):
+    base = tmp_path / "fence"
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    tool = fallback / "sudo"
+    tool.write_text("#!/bin/sh\nprintf owned-fallback\n")
+    tool.chmod(0o755)
+    fence._write_shims(base / "bin", str(base / "hits.log"), ["sudo"])
+    env = {"PATH": f"{base / 'bin'}:{fallback}:{os.defpath}", "HOME": str(tmp_path)}
+    first = subprocess.run(["/bin/sh", "-c", "sudo"], env=env, capture_output=True)
+    fence.uninstall_files(type("Config", (), {"_genesis_live_fence_dir": str(base)})())
+    last = subprocess.run(["/bin/sh", "-c", "sudo"], env=env, capture_output=True)
+    assert first.returncode != 0
+    assert last.returncode == first.returncode
+    assert b"owned-fallback" not in last.stdout
+
+
+@pytest.mark.parametrize("name", ["claude", "claude.exe", "claude-code"])
+@pytest.mark.parametrize("action,status", [("-p", 3), ("--help", 127), ("--version", 127)])
+def test_claude_shim_spellings_share_refusal_and_ci_answers(tmp_path, name, action, status):
+    log = tmp_path / "hits.log"
+    fence._write_shims(tmp_path / "bin", str(log), [name])
+    result = subprocess.run([str(tmp_path / "bin" / name), action], capture_output=True)
+    assert result.returncode == status
+    assert ("\tanswered\t" in log.read_text()) is (status == 127)
+
+
+def test_real_claude_removes_all_installed_spellings_but_keeps_other_tools(tmp_path, monkeypatch):
+    monkeypatch.setattr(fence._S, "base", str(tmp_path))
+    monkeypatch.setattr(fence._S, "stubbed", frozenset({"claude", "claude.exe", "claude-code", "sudo"}))
+    directory = Path(fence._stub_dir_without(frozenset({"claude"})))
+    assert {path.name for path in directory.iterdir()} == {"sudo"}
+    with fence.expect_violation() as violation:
+        subprocess.run([str(directory / "sudo")], capture_output=True)
+    assert any("sudo: found the fence's stub" in reason for reason in violation.reasons)
+
+
+@pytest.mark.parametrize("optin", [False, True])
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("current_stub", [False, True])
+def test_live_cli_collection_requires_original_availability(tmp_path, monkeypatch, optin, available, nested, current_stub):
+    original = tmp_path / "original"
+    current = tmp_path / "current"
+    original.mkdir()
+    current.mkdir()
+    for directory, present in [(original, available), (current, current_stub)]:
+        if present:
+            executable = directory / "claude"
+            executable.write_text("#!/bin/sh\nexit 99\n")
+            executable.chmod(0o755)
+    monkeypatch.setattr(fence._S, "orig_path", str(original))
+    monkeypatch.setenv("PATH", str(current))
+    monkeypatch.setenv("GENESIS_LIVE_E2E", "1" if optin else "0")
+    monkeypatch.setenv("CLAUDECODE", "1" if nested else "0")
+    root = Path(__file__).parent
+    for relative, functions in [
+        ("test_cc/test_integration.py", ["test_real_cc_invocation", "test_real_cc_with_system_prompt"]),
+        ("test_session_awareness/test_arbiter.py", ["test_live_arbiter_e2e"]),
+    ]:
+        module = runpy.run_path(str(root / relative))
+        for name in functions:
+            skipped = any(mark.args[0] for mark in module[name].pytestmark if mark.name == "skipif")
+            assert skipped is (not optin or not available or (nested and relative.startswith("test_cc/")))
+
+
+@pytest.mark.parametrize("home", ["absolute", "missing", "relative"])
+def test_install_without_a_passwd_entry(tmp_path, home):
+    code = """
+import importlib.util, json, pathlib, sys, types
+spec = importlib.util.spec_from_file_location('isolated_fence', sys.argv[1])
+f = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(f)
+def missing(uid):
+    raise KeyError(uid)
+f.pwd.getpwuid = missing
+hooks = []
+f.sys.addaudithook = hooks.append
+config = types.SimpleNamespace(
+    option=types.SimpleNamespace(basetemp=sys.argv[2]),
+    addinivalue_line=lambda *args: None,
+)
+f.install(config)
+print(json.dumps({'armed': f._S.installed, 'home': f._S.real_home,
+                  'shim_exists': pathlib.Path(f._S.shim_dir).is_dir(),
+                  'hook_count': len(hooks)}))
+"""
+    env = {"PATH": os.defpath, "TMPDIR": str(tmp_path)}
+    if home != "missing":
+        env["HOME"] = str(tmp_path / "home") if home == "absolute" else "relative-home"
+    result = subprocess.run(
+        [sys.executable, "-c", code, fence.__file__, str(tmp_path)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    assert outcome == {
+        "armed": True,
+        "home": env.get("HOME") if home == "absolute" else None,
+        "shim_exists": True,
+        "hook_count": 1,
+    }
 
 
 def test_a_heredoc_that_only_prints_a_denied_name_runs():

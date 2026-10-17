@@ -39,15 +39,15 @@ queue time, and it is not what any of the ceilings below bound.
 
 Two ceilings bound the suite, and they are different things:
 
-- `timeout = 3600` in `pyproject.toml` is pytest-timeout's **per-test** limit —
-  one hung test is killed and the suite continues. It is NOT a suite budget,
-  and it applies **in CI only**: `pytest-timeout` ships in the `[test]` extra,
-  so a local `pip install -e .` venv does not have it and pytest emits
-  `PytestConfigWarning: Unknown config option: timeout` on every local run.
-  Install with `pip install -e ".[test]"` if you want it locally.
+- `timeout = 600` in `pyproject.toml` is pytest-timeout's **per-test** limit —
+  one hung test is killed and the suite continues. It is NOT a suite budget.
+  It applies wherever `pytest-timeout` is installed: always in CI, and locally
+  only if you installed it (it ships in the `[test]` extra, which no install
+  path installs). Without it a run starts with a warning saying so, because a
+  hung test then holds the box-wide test lock until it is killed by hand.
 - `timeout-minutes: 180` on CI's `test` job bounds the whole job, for a hang
   the per-test timeout cannot catch. It must stay above (max job + one
-  per-test kill) — 31m15s + 60m ≈ 91m — or it would pre-empt the per-test
+  per-test kill) — 31m15s + 10m ≈ 41m — or it would pre-empt the per-test
   limit and make it dead code.
 
 The per-test cost of individual tests had never been measured; CI now prints
@@ -184,8 +184,10 @@ guardrail (code in the test process could get around it), not a sandbox.
   stub". Stub the call in the test if its result matters. A stub exists only
   for a tool installed on the machine, so `shutil.which` still reports a missing
   tool as missing.
-- **A refusal that lands after its test ended** (a detached child) fails the
-  whole session, listed under "refusals outside their test".
+- **A refusal drained after its test ended** (a detached child) fails the
+  whole session, listed under "refusals outside their test". Reporting ends at
+  the final session drain. The unique shim directory remains for surviving
+  children until normal temp cleanup, so inherited PATH lookups keep refusing.
 - Any program inside the test's temp dirs that is not a deploy script runs, so
   a test that needs a fake of one of these tools puts it in `tmp_path`.
 - Give a test that runs a deploy script a private `HOME` and point the script's

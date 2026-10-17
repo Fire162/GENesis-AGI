@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import textwrap
 from pathlib import Path
 
 import pytest
+
+from tests._live_fence import _S
 
 from genesis.session_awareness.arbiter import (
     ARBITER_MODEL,
@@ -203,8 +206,8 @@ async def test_timeout_group_kills_children(tmp_path):
 
 
 @pytest.mark.skipif(
-    os.environ.get("GENESIS_LIVE_E2E") != "1",
-    reason="calls the real Claude API; opt in with GENESIS_LIVE_E2E=1",
+    os.environ.get("GENESIS_LIVE_E2E") != "1" or shutil.which("claude", path=_S.orig_path) is None,
+    reason="requires an installed Claude CLI and opt-in with GENESIS_LIVE_E2E=1",
 )
 @pytest.mark.real_tool("claude")
 @pytest.mark.asyncio
