@@ -1532,6 +1532,20 @@ verified: cfbb876243f2 2026-10-07
   names an external namespace; literal argv assigns it after login initialization.
   No live-install removal acceptance is
   claimed by isolated fixture tests.
+  Native enable/disable/remove share the fixed exclusive lifecycle lock. Enable
+  validates installed immutable state, typed backend commands/caps and loaded
+  client slice limits; it requires initial quiescence, enables without starting,
+  revalidates after reload, then starts and proves readiness.
+  Source authority rejects configuration and implicit dependency namespaces at
+  full-name, dash-prefix and unit-type scopes across native lookup paths.
+  Failed startup attempts the same canonical-source retirement as disable/remove: inspect both
+  fixed sources before a validated reload and refuse unsupported definitions.
+  Supported canonical retirement remains usable without valid settings or the
+  selected interpreter, proves actual quiescence and preserves immutable state.
+  Remove unlinks fixed artifacts only after validating the full population;
+  partial unlink failures refresh only after proving quiescence and accepted
+  remaining sources. Frontend and queued-worker admission integration
+  remain separate concerns.
 - **hosting/**: the OUTER layer that calls the runtime. Standalone's scoped peer
   request-input handler provides a trusted 256 KiB body reader with a five-second
   absolute deadline on peer send/cancel POST paths. It bounds framing and refusal
