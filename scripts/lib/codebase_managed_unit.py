@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -506,3 +507,25 @@ def frontend_command(main: Path, settings: Path, unit: str, backend: str, slice_
     bridge = 'exec "$$CBM_CLIENT_PYTHON" -I "$$CBM_CLIENT_HELPER" --config "$$CBM_CLIENT_CONFIG" client --unit "$$CBM_CLIENT_UNIT"'
     command.extend(("--", "/bin/sh", "-c", bridge))
     return command
+
+
+def parse_arguments(argv: list[str] | None, description: str | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--config", default=None)
+    commands = parser.add_subparsers(dest="command", required=True)
+    setup = commands.add_parser("configure")
+    for key in ("main", "binary", "state", "sentinel"):
+        setup.add_argument("--" + key, required=True)
+    commands.add_parser("status")
+    commands.add_parser("serve")
+    commands.add_parser("ready")
+    commands.add_parser("launch")
+    child = commands.add_parser("client")
+    child.add_argument("--unit", required=True)
+    for command in ("enable", "disable", "remove"):
+        commands.add_parser(command)
+    teardown = commands.add_parser("uninstall")
+    teardown.add_argument("arguments", nargs=argparse.REMAINDER)
+    verification = commands.add_parser("verify-uninstall-locks")
+    verification.add_argument("fds", type=int, nargs=3)
+    return parser.parse_args(argv)
