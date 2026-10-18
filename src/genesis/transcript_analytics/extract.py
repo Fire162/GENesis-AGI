@@ -634,9 +634,8 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                 if r.get(k) is not None
             }
             if isinstance(detail.get("status"), dict):
-                # HTTP headers are dropped: the shared label policy does not
-                # recognize authorization-style header names, and the code plus
-                # error payload carry the diagnostic.
+                # HTTP headers are dropped: the code plus the error payload carry
+                # the diagnostic, and headers add nothing an analysis needs.
                 detail["status"] = {k: v for k, v in detail["status"].items() if k != "headers"}
             dtext, dfailed = scrub_json(detail) if detail else (None, False)
             t["events"].append(
