@@ -151,7 +151,11 @@ def _result_agent_ids(content, structured) -> list[str]:
         candidates.update(match.group(1) for match in re.finditer(
             r"(?:^|\n)agentId: ([A-Za-z0-9_-]+)(?=\s|$)", text
         ))
-    return sorted(candidates)
+    # These come from untrusted result payloads and are stored in identity
+    # columns, which are never text-scrubbed. Keep only values the scrubber
+    # leaves byte-identical; a credential-shaped value (or a scrubber failure)
+    # drops the candidate rather than persisting it.
+    return sorted(value for value in candidates if scrub_text(value) == (value, False))
 
 
 def _complete_lines(path: Path, stop_at: int | None, counter: dict):
@@ -182,12 +186,23 @@ def _str(v) -> str | None:
     return v if isinstance(v, str) else None
 
 
+def _bool(v) -> bool | None:
+    # Tri-state: only a JSON boolean is an assertion; "false", 0 or absent is unknown.
+    return v if isinstance(v, bool) else None
+
+
 _INT64 = 2**63
 
 
 def _int(v) -> int | None:
     # Out-of-range values are not representable in int64 Parquet: NULL, not a crash (review SF-4).
     return v if isinstance(v, int) and not isinstance(v, bool) and -_INT64 <= v < _INT64 else None
+
+
+def _status(v) -> int | None:
+    # API-error records carry either a bare HTTP status or an object whose
+    # nested ``status`` is the code; the object itself is kept, scrubbed, in detail.
+    return _int(v.get("status")) if isinstance(v, dict) else _int(v)
 
 
 def _token(v) -> int | None:
@@ -347,7 +362,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "cache_create_5m": _token(cc.get("ephemeral_5m_input_tokens")),
                     "cache_create_1h": _token(cc.get("ephemeral_1h_input_tokens")),
                     "thinking_tokens": _token(otd.get("thinking_tokens")),
-                    "is_sidechain": bool(r.get("isSidechain")),
+                    "is_sidechain": _bool(r.get("isSidechain")),
                     "entrypoint": _str(r.get("entrypoint")),
                     "attribution_skill": _str(r.get("attributionSkill")),
                     "attribution_mcp_server": _str(r.get("attributionMcpServer")),
@@ -401,7 +416,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                         "skill_arg": _str(inp.get("skill")),
                         "description": desc,
                         "input_len": len(json.dumps(inp, ensure_ascii=False)),
-                        "is_sidechain": bool(r.get("isSidechain")),
+                        "is_sidechain": _bool(r.get("isSidechain")),
                         "attribution_skill": _str(r.get("attributionSkill")),
                         "entrypoint": _str(r.get("entrypoint")),
                         "cwd": _str(r.get("cwd")),
@@ -452,7 +467,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                         "skill_arg": None,
                         "description": None,
                         "input_len": None,
-                        "is_sidechain": bool(r.get("isSidechain")),
+                        "is_sidechain": _bool(r.get("isSidechain")),
                         "attribution_skill": None,
                         "entrypoint": None,
                         "cwd": _str(r.get("cwd")),
@@ -614,9 +629,15 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "content",
                     "error",
                     "level",
+                    "status",
                 )
                 if r.get(k) is not None
             }
+            if isinstance(detail.get("status"), dict):
+                # HTTP headers are dropped: the shared label policy does not
+                # recognize authorization-style header names, and the code plus
+                # error payload carry the diagnostic.
+                detail["status"] = {k: v for k, v in detail["status"].items() if k != "headers"}
             dtext, dfailed = scrub_json(detail) if detail else (None, False)
             t["events"].append(
                 {
@@ -636,7 +657,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "level": _str(r.get("level")),
                     "duration_ms": _int(r.get("durationMs")),
                     "message_count": _int(r.get("messageCount")),
-                    "status": _int(r.get("status")),
+                    "status": _status(r.get("status")),
                     "pre_tokens": _int(cm.get("preTokens")),
                     "post_tokens": _int(cm.get("postTokens")),
                     "trigger": _str(cm.get("trigger")),

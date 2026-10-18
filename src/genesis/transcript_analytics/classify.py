@@ -99,6 +99,18 @@ def _hook_script(command: str) -> str:
     return tokens[start].rsplit("/", 1)[-1]
 
 
+def _is_error_value(value) -> bool:
+    """A string error, or a JSON-RPC error object (integer ``code``, string ``message``)."""
+    if isinstance(value, str):
+        return True
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("code"), int)
+        and not isinstance(value.get("code"), bool)
+        and isinstance(value.get("message"), str)
+    )
+
+
 def classify(
     text: str, *, is_error: bool | None, denial_kind: str | None
 ) -> tuple[str | None, str | None]:
@@ -121,7 +133,7 @@ def classify(
         error_object = json.loads(full)
     except (ValueError, RecursionError):
         error_object = None
-    structural_error = isinstance(error_object, dict) and isinstance(error_object.get("error"), str)
+    structural_error = isinstance(error_object, dict) and _is_error_value(error_object.get("error"))
     if is_error is True:
         if is_hook:
             return "hook_block", "flag"
