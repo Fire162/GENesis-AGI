@@ -148,8 +148,9 @@ def test_sqlite_uploaded_under_dated_snapshot_dir(backup_env):
     """genesis.sql.gpg is put into Genesis/<host>/<stamp>/data, not a fixed path."""
     proc, cmds = _run(backup_env)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    put_sql = [ln for ln in cmds.splitlines() if "put" in ln and "genesis.sql.gpg" in ln]
-    assert put_sql, f"no SQL upload command logged:\n{cmds}"
+    # Frozen source filenames are opaque; the atomic final rename names SQL.
+    published_sql = [ln for ln in cmds.splitlines() if ln.startswith("rename ") and '"genesis.sql.gpg"' in ln]
+    assert published_sql, f"no final SQL publication command logged:\n{cmds}"
     # Starting directory is supplied by -D, separately from the -c log.
     # Assert the actual transferred location in the owned filesystem model.
     payloads = list(backup_env["remote"].rglob("genesis.sql.gpg"))

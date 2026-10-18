@@ -1363,7 +1363,7 @@ fi
 if [ "$_T2_OK" = true ] && [ $((_EXTRA_UPLOAD_FAILED + _EXTRA_SKIPPED + _EXTRA_PARTIAL)) -gt 0 ]; then
     _T2_STATUS="partial"
     _T2_EXTRAS_ONLY_PARTIAL=true
-    log "WARNING: original snapshot $_T2_STAMP is COMPLETE but extra dirs are incomplete"
+    log "WARNING: original snapshot $_T2_STAMP is COMPLETE but extra dirs are incomplete ($_EXTRA_SKIPPED not archived, $_EXTRA_PARTIAL partial, $_EXTRA_UPLOAD_FAILED not uploaded)"
 elif [ "$_T2_OK" = true ]; then
     log "Tier 2 backup copied to original off-site snapshot $_T2_STAMP (backend: $_T2_BACKEND)"
 fi
