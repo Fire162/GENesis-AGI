@@ -3787,7 +3787,8 @@ tool-disabled CC probe without changing its schedule or routing authority.
   rollout and final post-review verification are not implied by local tests.
   Recovery pins a selected off-site snapshot across retries,
   authenticates legacy and v2 transcript archives, and verifies pooled
-  objects before restoring. Pooled SMB downloads retain the backend credential
+  objects before restoring. Memory mapping preserves current project path bytes.
+  Pooled SMB downloads retain the backend credential
   lease until the off-site pull returns; library definitions load before that lease.
   Explicit local directories take precedence over
   off-site configuration; independently identified Tier-1 audit records restore

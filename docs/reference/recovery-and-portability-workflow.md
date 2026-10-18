@@ -620,6 +620,8 @@ from guardian.yaml, else `genesis`), `CCTMPVOL_POOL` (root device's pool),
 `CCTMPVOL_VOLUME_NAME` (`<container>-cc-tmp`), `CCTMPVOL_USER` (`ubuntu`),
 `CCTMPVOL_DISABLE` (opt out).
 
+Restore maps memory to the current installation's project identity using the
+same byte-preserving path substitution as backup, including trailing newlines.
 Pooled transcript recovery over SMB uses the same temporary credential file for
 snapshot selection, manifest/object downloads and later extra payloads. Restore
 loads library definitions before creating that credential lease; function-return
