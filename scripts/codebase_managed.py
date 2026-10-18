@@ -60,6 +60,9 @@ from codebase_managed_unit import (  # noqa: E402,F401
 from codebase_managed_unit import (  # noqa: E402
     parse_arguments as native_parse_arguments,
 )
+from codebase_managed_unit import (  # noqa: E402
+    parse_arguments as native_parse_arguments,
+)
 
 SCRIPT = Path(__file__).resolve()
 BACKEND = "genesis-cbm-query.service"
