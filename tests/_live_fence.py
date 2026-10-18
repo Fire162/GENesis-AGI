@@ -180,21 +180,24 @@ def _resolve(program: str, env, cwd=None) -> str | None:
     return _which(program, path=search)
 
 
-def _tool_name(program: str, cwd=None) -> str:
-    """The DENY_NAMES entry ``program`` runs, by its name or, for a path, by the
-    name of the file it resolves to; else its plain basename."""
+def _tool_name(program: str, env, cwd=None) -> str:
+    """The DENY_NAMES entry ``program`` runs, by its name or by the name of the
+    file it resolves to (a slash path against ``cwd``, a bare name against the
+    child's PATH); else its plain basename."""
     name = os.path.basename(program)
     name = _ALIASES.get(name, name)
-    if name not in DENY_NAMES and "/" in program:
-        target = os.path.basename(_real(program, cwd))
-        target = _ALIASES.get(target, target)
-        if target in DENY_NAMES:
-            return target
+    if name not in DENY_NAMES:
+        resolved = program if "/" in program else _resolve(program, env, cwd)
+        if resolved is not None:
+            target = os.path.basename(_real(resolved, cwd))
+            target = _ALIASES.get(target, target)
+            if target in DENY_NAMES:
+                return target
     return name
 
 
 def _deny_reason(program: str, argv: list[str], env, cwd) -> str | None:
-    name = _tool_name(program, cwd)
+    name = _tool_name(program, env, cwd)
     if name not in DENY_NAMES or name in _S.real_tool_names:
         return None
     if _S.opted_out and name in USER_MANAGER_ALLOWED:

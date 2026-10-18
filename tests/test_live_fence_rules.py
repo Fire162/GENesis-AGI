@@ -196,6 +196,16 @@ def test_claude_under_another_name_is_still_claude(tmp_path, monkeypatch):
     assert fence.judge(str(target), [str(target), "-p", "x"], None) is not None
 
 
+def test_a_bare_path_alias_to_claude_is_still_claude(tmp_path, monkeypatch):
+    target = tmp_path / "claude.exe"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    (tmp_path / "cc").symlink_to(target)
+    monkeypatch.setattr(fence._S, "allowed_roots", ())
+    env = {"PATH": str(tmp_path)}
+    assert fence.judge("cc", ["cc", "-p", "x"], env) is not None
+
+
 @pytest.mark.real_tool("gh")
 @pytest.mark.user_manager
 def test_both_opt_outs_on_one_test_keep_one_stub_dir_in_front():
