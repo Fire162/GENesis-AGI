@@ -1,0 +1,1 @@
+- After an update crashes having stopped `genesis-server`, the next update restarts and health-checks the server instead of treating it as deliberately stopped. Bootstrap's crash recovery leaves the standard update-failure record only when the crashed update had stopped the server, so a server an operator stopped before updating stays stopped.

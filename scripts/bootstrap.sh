@@ -92,6 +92,10 @@ try:
         text_field("own_head"),
         text_field("deploy_head"),
         "1" if "original_branch" in state else "0",
+        # Did the crashed update stop the server? (update.sh's _write_state
+        # records the services it stopped; absent in old-format states.)
+        "1" if isinstance(state.get("services_stopped"), list)
+        and "genesis-server" in state["services_stopped"] else "0",
     ]
     if any(ord(char) < 0x20 for value in fields for char in value):
         raise ValueError("control character in state field")
@@ -103,7 +107,7 @@ PY
         _crash_recovery_refuse "update state is unreadable"
     fi
     IFS=$'\x1f' read -r STATE_PHASE STATE_PID ROLLBACK_TAG ORIGINAL_BRANCH OWN_HEAD DEPLOY_HEAD ORIGINAL_BRANCH_PRESENT \
-        <<< "$_state_fields"
+        STATE_SERVER_STOPPED <<< "$_state_fields"
 
     # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
     # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
@@ -267,6 +271,64 @@ except Exception as e:
 PY
             then
                 echo "  WARNING: this crash recovery is NOT recorded in update_history (see the error above)." >&2
+            fi
+        fi
+
+        # bootstrap never starts genesis-server. If the crashed update had stopped
+        # it, the next update.sh finds nothing running, and without a failure
+        # artifact it reads that as an operator stop: server left down, success
+        # recorded, no health check (#3451). So leave update.sh's own artifact,
+        # last_update_failure.json in its writer's format, which its recovery
+        # detection reads as "restore genesis-server and health-check it". Only
+        # when the state says the server was stopped: a crash before the stop
+        # (fetching) leaves an operator's stop alone. An existing file (update.sh's
+        # own rollback record) is never replaced.
+        FAILURE_FILE="$HOME/.genesis/last_update_failure.json"
+        if [ "$STATE_SERVER_STOPPED" = "1" ] && [ ! -e "$FAILURE_FILE" ]; then
+            _crash_new_tag="untagged"
+            _crash_new_commit=""
+            if [ -n "$DEPLOY_HEAD" ]; then
+                _crash_new_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_HEAD" 2>/dev/null || echo "untagged")"
+                _crash_new_commit="$(git -C "$GENESIS_ROOT" rev-parse --short "$DEPLOY_HEAD" 2>/dev/null || true)"
+            fi
+            if python3 -I - "$UPDATE_STATE" "$FAILURE_FILE" "$_crash_new_tag" "$_crash_new_commit" \
+                "$recovery_branch" <<'PY'
+import json
+import sys
+from datetime import datetime
+
+state_path, failure_path, new_tag, new_commit, branch = sys.argv[1:]
+with open(state_path, encoding="utf-8") as f:
+    state = json.load(f)
+phase = state.get("phase", "unknown")
+rollback_tag = state.get("rollback_tag", "")
+# The keys and value types of update.sh's writer (its _do_rollback).
+data = {
+    "old_tag": state.get("old_tag", ""),
+    "new_tag": new_tag,
+    "old_commit": state.get("old_commit", ""),
+    "new_commit": new_commit,
+    "rollback_tag": rollback_tag,
+    "reason": (
+        f"Update crashed in phase '{phase}' after stopping genesis-server; "
+        f"recovered by bootstrap.sh, which returned the code to {rollback_tag}. "
+        "genesis-server was not restarted; the next update restarts and health-checks it."
+    ),
+    "degraded_subsystems": "",
+    "original_branch": branch,
+    # The checkout is back at the rollback tag (recovered above); the rest of
+    # this bootstrap reinstalls that code.
+    "rollback_complete": True,
+    "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+}
+# "x": never replace a file another writer created since the check above.
+with open(failure_path, "x", encoding="utf-8") as f:
+    json.dump(data, f, indent=4)
+PY
+            then
+                echo "  genesis-server was stopped by the crashed update; the next update.sh run restarts and health-checks it."
+            else
+                echo "  WARNING: could not write $FAILURE_FILE; the next update.sh run will treat the stopped genesis-server as operator-stopped. Start it with: systemctl --user start genesis-server.service" >&2
             fi
         fi
 
