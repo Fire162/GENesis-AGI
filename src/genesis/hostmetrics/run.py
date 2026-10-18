@@ -442,8 +442,8 @@ class OwnedProcess:
         """Thread-safe request only; watchdogs never dispatch or reap.
 
         ``escalate_after`` arms a one-shot deadline, measured from the request's
-        dispatch: if the child is still alive then, the request escalates to
-        SIGKILL. Watchdogs use it so a TERM-ignoring job cannot hold a pressured
+        dispatch: if the child or its acknowledged scope remains alive, the request
+        escalates to SIGKILL. Watchdogs use it so a TERM-ignoring job cannot hold a pressured
         box open; caller cancellation stays cooperative and never sets it.
         """
         self._requests.append((False, sig, escalate_after))
@@ -468,7 +468,7 @@ class OwnedProcess:
         if (
             self._escalate_at is not None
             and self.proc is not None
-            and not self.reaped
+            and (not self.reaped or self._scope_authorized)
             and self._sent == signal.SIGTERM
             and time.monotonic() >= self._escalate_at
         ):
