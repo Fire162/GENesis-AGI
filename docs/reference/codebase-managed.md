@@ -195,6 +195,11 @@ supported physical main/state path. Binary, interpreter, runtime, sentinel and
 settings paths retain their existing literal-path handling; this restriction
 applies to provider-consumed repository/cache identities.
 
+Runtime entry points validate those identities before cache checks, readiness
+retries or provider execution. An incompatible path therefore refuses promptly
+when enabling, launching, serving or checking readiness. Structural settings
+reads remain available for diagnosis and retirement.
+
 No service is enabled, no unit is rendered and no sentinel is removed.
 Configuration uses schema 2: paths and build identity, with no mutable `enabled`
 flag. Native systemd enablement owns operational state. The lifecycle lock coordinates cooperating same-user tools;
@@ -254,6 +259,26 @@ and FalkorDB rendering retain their existing behavior. Install preserves existin
 regular units; bootstrap follows the shared managed-unit ownership policy.
 
 ## Diagnose and recover
+
+The read-only `available --repo /absolute/main --persistence true|false` command
+checks configured main identity, cache and completed query-service startup, plus writer
+prerequisites in the caller's filesystem namespace. It creates no probe files or
+queue rows and does not index repositories. It validates the loaded startup
+contract, accepted executable and active constrained backend without invoking the
+native CLI. Current RPC responsiveness is checked again by final worker admission.
+Persistence checks include the artifact destination
+and the pinned provider's fixed snapshot scratch directory; false omits both.
+The immutable `_config.db` stays a reader surface, while index databases and their
+WAL/SHM sidecars require writes. Existing writable descendants can remain usable
+under a read-only parent.
+
+Availability is advisory: a runner with filesystem restrictions must perform its
+own checks. Custom state roots need an operator-owned `ReadWritePaths` allowlist;
+persistent snapshot scratch can use an operator-owned disk `BindPaths` mapping.
+Genesis does not install a policy drop-in or broaden the runner sandbox. Preserve
+paths masked by a mapping and assess its capacity before using it. The separate
+worker/queue integration performs final admission; this command grants no right
+to index and does not activate providers.
 
 ```bash
 .venv/bin/python -I scripts/codebase_managed.py status
