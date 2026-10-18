@@ -60,6 +60,31 @@ guard remains in force for non-quarantined databases.
 If restore cannot determine that quarantine state (for example, the integrity
 checker cannot start), it aborts instead of treating the database as healthy.
 
+### Restored peer permissions
+
+Full and database-only backup restores disable peer access, clear capability
+grants, and renew relationship epochs in the staged database before installation.
+Identities and historical records remain; saved jobs and approval consent cannot
+be replayed as current authority. Incompatible peer schemas refuse before the
+live database is touched. Older databases without peer state remain compatible.
+Peer-bearing candidates require SQLite 3.37 or newer to verify that reset targets
+are ordinary tables. Reset refuses triggers or foreign-key actions that could
+change other rows; the staged transaction rolls back instead of publishing those
+effects. Unrelated triggers, foreign keys and full-text tables remain supported.
+An owner must explicitly configure peer access and grant capabilities again;
+a runtime that started disabled also requires a restart to enable execution.
+
+Update prepares a separate, guarded `.pre-update.peer-restore` candidate before
+stopping services or changing code, retaining the original `.pre-update` snapshot.
+Migration rollback uses the guarded candidate; an incomplete database rollback
+does not explicitly restart services. External watchdog recovery is unchanged.
+
+Guardian whole-container snapshot rollback is different: its existing second
+approval prompt warns that saved peer permissions, jobs and consent return.
+Approving that specific action explicitly reauthorizes the saved peers. Both
+existing approval gates still apply; failed prompt delivery or denial cannot
+authorize rollback.
+
 ### Restore preconditions and the holder scan
 
 Database-only recovery refuses unless it can establish that no process still
@@ -134,7 +159,9 @@ The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
 "strip and stage" step. Leak protection is enforced on every PR by the
 `leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + gitleaks
 with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
-+ email scans).
++ email scans), and on every push to any non-main branch by
+`.github/workflows/branch-leak-scan.yml`, so a branch is scanned the moment it
+is published, PR or not. Both run the same steps from `scripts/ci/leak_scan.sh`.
 
 Releases are cut on a **release branch**, never on `main` — the pre-commit hook
 rejects direct commits there and branch discipline requires a PR, so the fold
@@ -415,6 +442,20 @@ next tick). The container drainer maps the outreach result: `DELIVERED`/
 treating it otherwise would wedge the entry forever); `FAILED`/`HELD`/`PENDING`
 → keep. `prune()` bounds the queue (200 files / 14 days).
 
+**A file no reader can use is quarantined, never read.** `list_queued` checks every
+file with `v1_entry_problem`: `schema` is the int 1, `ts` a finite number (not a
+bool), `title`/`body`/`severity`/`source` strings, at least one of `title`/`body`
+non-empty, `dedupe_key` a string or null, `meta` an object, null or absent, and its
+`likely_cause`/`proposed_action`/`approval_url` strings or null. A file that fails
+is renamed `<name>.corrupt` with a WARNING naming the field (a file that cannot be
+read at the moment, say a permission or I/O error, is kept for the next pass), so drain, prune and
+the enqueue-time dedupe scan all see only usable entries. (Before this check, one
+file with a non-numeric `ts` made every drain raise and every prune fail, and every
+keyed Python `enqueue_alert` returned False: the queue stopped draining, the file
+was never pruned, and keyed Python alerts were dropped while it sat there.) `prune()` deletes `*.corrupt` files older than 14 days. The shell writer's
+dedupe scan applies the same check, so a same-key file the drainer would
+quarantine never suppresses a new alert.
+
 **What pages vs. what stays quiet.** `tmp_watchgod` pages only the **emergency
 (red)** tier, transition-only (once per red episode, gated on the shared
 `tmp_emergency` flag). The **warning (orange)** tier stays dashboard-only — it is
@@ -525,3 +566,10 @@ non-standard topologies): `CCTMPVOL_SIZE_GIB` (2), `CCTMPVOL_CONTAINER` (resolve
 from guardian.yaml, else `genesis`), `CCTMPVOL_POOL` (root device's pool),
 `CCTMPVOL_VOLUME_NAME` (`<container>-cc-tmp`), `CCTMPVOL_USER` (`ubuntu`),
 `CCTMPVOL_DISABLE` (opt out).
+
+Pooled transcript recovery over SMB uses the same temporary credential file for
+snapshot selection, manifest/object downloads and later extra payloads. Restore
+loads library definitions before creating that credential lease; function-return
+cleanup retires it when the pull returns; the script EXIT handler provides a
+fallback for early exit. An existing status-write failure can interrupt that EXIT
+handler before credential cleanup, so that fallback is not unconditional.

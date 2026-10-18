@@ -44,6 +44,18 @@ import os  # noqa: E402
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
 
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup():
+    """Complete an already-loaded dashboard before any subtree's fixtures run.
+
+    Route-only imports leave api's page route unbound; Flask rejects its late
+    decorator after registration. Pure tests must not import the dashboard's
+    dependency/logging closure just to participate in this safety net.
+    """
+    if "genesis.dashboard._blueprint" in sys.modules:
+        import genesis.dashboard.api  # noqa: F401 — canonical route registration
+
 # ── Safety: prevent os.killpg(1, ...) from killing all processes ─────────
 _real_killpg = os.killpg
 
@@ -394,8 +406,14 @@ def pytest_configure(config):
     from genesis.util import pytest_lock
     from genesis.util.tmp import big_tmp_dir, should_redirect_pytest_basetemp
 
+    global _BOX_LOCK
     lock = pytest_lock.acquire()
     config._genesis_pytest_lock = lock
+    _BOX_LOCK = lock
+    if not config.pluginmanager.hasplugin("timeout"):
+        # The holder record says so, which the stall report quotes: nothing
+        # will end a hung test in this run.
+        lock.note_suffix = "per-test timeout: none (pytest-timeout is not active)"
     if lock.blocked and not _is_introspection_only(config):
         pytest.exit(lock.message, returncode=pytest_lock.EXIT_LOCK_HELD)
     elif lock.blocked:
@@ -507,6 +525,47 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
     monkeypatch.setattr(cb_mod, "_STATE_FILE", tmp_path / "cb_state.json")
 
 
+# ── The dashboard update routes: one sandbox for every test that imports them ──
+@pytest.fixture
+def updates_sandbox(tmp_path, monkeypatch):
+    """HOME, GENESIS_HOME and every path constant of
+    ``genesis.dashboard.routes.updates`` in a temporary home, its ``Popen``
+    refusing, and a scratch git repository as ``_GENESIS_ROOT``. See
+    tests/_update_routes_sandbox.py; tests/test_dashboard/
+    test_update_sandbox_coverage.py requires it of every module importing the routes."""
+    from tests._update_routes_sandbox import isolate_update_routes, scratch_repo
+
+    return isolate_update_routes(
+        monkeypatch, tmp_path / "sandbox-home", scratch_repo(tmp_path / "sandbox-repo")
+    )
+
+
+# ── Graph-traversal telemetry is OFF unless a test opts in ─────────────────
+@pytest.fixture(autouse=True, scope="session")
+def _graph_telemetry_off():
+    """Most traversal tests build minimal databases with no ``eval_events``
+    table, and several assert an exact count of WARNING records on the degraded
+    path. A telemetry write there would fail and log, changing what those tests
+    measure. Telemetry tests opt back in with
+    ``monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED")``.
+
+    Session-scoped and without ``monkeypatch`` on purpose. pytest sets up
+    same-scope autouse fixtures in NAME order, and this name sorts before
+    ``_guard_db_crud_not_mocked``: requesting the shared ``monkeypatch`` here
+    created it before the guard, so it was undone only AFTER the guard's check,
+    and the guard reported the legitimate ``monkeypatch.setattr(obs_crud, ...)``
+    patches in ``tests/test_awareness/`` as leaks (15 errors in
+    ``test_cc_slot_alert.py`` alone, measured with ``--setup-show``)."""
+    key = "GENESIS_GRAPH_TELEMETRY_DISABLED"
+    prior = os.environ.get(key)
+    os.environ[key] = "1"
+    yield
+    if prior is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = prior
+
+
 # ── Safety: prevent tests from writing REAL durable alerts ──────────────────
 @pytest.fixture(autouse=True)
 def _isolate_alert_queue(tmp_path):
@@ -536,6 +595,9 @@ def _isolate_alert_queue(tmp_path):
     # machine must not become an observation.
     mp.setenv("GENESIS_TSWD_STATE_FILE", str(tmp_path / "no-tailscale-watchdog.json"))
     mp.setenv("GENESIS_TSWD_SYSTEMCTL", "/bin/false")
+    # At >= 80% of the live PID budget the tick would also write a breakdown of
+    # the real /proc into the real ~/.genesis/logs/pid_snapshots.
+    mp.setenv("GENESIS_PID_BREAKDOWN_DISABLED", "1")
     yield
     mp.undo()
 
@@ -564,6 +626,29 @@ def _isolate_boundary_key(tmp_path):
     mp = pytest.MonkeyPatch()
     mp.setattr("genesis.env.boundary_key_path", lambda: tmp_path / "boundary_key")
     mp.setattr(sanitizer, "_boundary_key", None)
+    yield
+    mp.undo()
+
+
+# ── Safety: a ticking test must not start the REAL daily git fsck ──────────
+@pytest.fixture(autouse=True)
+def _skip_daily_git_deep_scan():
+    """Mark the awareness loop's daily deep scan as just run, so a test that
+    drives a real tick never launches `git fsck --full` over the real repo as a
+    background task that outlives the test's event loop (and writes the real
+    verdict file). Tests of the scan reset the guard themselves. Applied only
+    when the module is already loaded: importing it here costs ~5 s per test
+    process, and a test that imports it lazily runs the scan as it always did."""
+    import time
+
+    awareness_loop = sys.modules.get("genesis.awareness.loop")
+    if awareness_loop is None:
+        yield
+        return
+    mp = pytest.MonkeyPatch()
+    mp.setattr(awareness_loop, "_last_git_deep_run_at", time.monotonic())
+    mp.setattr(awareness_loop, "_git_deep_task", None)
+    mp.setattr(awareness_loop, "_git_deep_stopped", False)
     yield
     mp.undo()
 
@@ -995,6 +1080,50 @@ with contextlib.suppress(Exception):  # see the best-effort note above
     _claim_active_test_breadcrumb()
 
 
+# The box lock this session holds, for the per-test hooks below (they get no
+# ``config``). Set in ``pytest_configure``; ``BoxLock.note`` is a no-op unless
+# this process actually holds the lock.
+_BOX_LOCK = None
+
+_NO_TIMEOUT_WARNING = (
+    "genesis: pytest-timeout is not active (not installed, or disabled with "
+    "-p no:timeout), so the per-test timeout in pyproject.toml does nothing: a "
+    "hung test runs until killed and holds the box-wide test lock (every other "
+    "session's pytest waits). Install it into this venv: pytest-timeout, or the "
+    "package's [test] extra."
+)
+
+
+def pytest_sessionstart(session):
+    """Say LOUDLY, at the top of the run, when no per-test timeout applies.
+
+    pytest's own signal for this is ``Unknown config option: timeout`` in the
+    warnings summary at the END of the run, which is exactly when it no longer
+    helps. Nothing installs the ``[test]`` extra on an install (bootstrap's
+    editable install names no extras), so the plugin is present only where
+    someone put it, and a hang observed on 2026-10-11 held the box lock for
+    about 40 minutes in a venv without it.
+    """
+    config = session.config
+    if config.pluginmanager.hasplugin("timeout"):
+        return
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(_NO_TIMEOUT_WARNING, yellow=True, bold=True)
+    else:
+        sys.stderr.write(_NO_TIMEOUT_WARNING + "\n")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Tell a contender that the tests are done and teardown is running.
+
+    Without this the record keeps naming the LAST test through basetemp removal
+    (``pytest_unconfigure``), so a slow teardown would read as that test hung.
+    """
+    if _BOX_LOCK is not None:
+        _BOX_LOCK.note("(session teardown)")
+
+
 def pytest_runtest_logstart(nodeid, location):
     """Record the test about to run, for a crash that never writes a report.
 
@@ -1012,6 +1141,8 @@ def pytest_runtest_logstart(nodeid, location):
     throughout -- a breadcrumb that could fail the suite it exists to diagnose
     would be a poor trade.
     """
+    if _BOX_LOCK is not None:
+        _BOX_LOCK.note(nodeid)
     path = os.environ.get(ACTIVE_TEST_FILE_ENV)
     if not path or not _owns_active_test_breadcrumb():
         return

@@ -51,6 +51,9 @@ fi
 _SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
+# Load definitions before the off-site credential lease and its RETURN cleanup.
+# shellcheck source=scripts/lib/transcript_pool.sh
+source "$_SCRIPT_DIR/lib/transcript_pool.sh"
 
 # ── Args ─────────────────────────────────────────────────────────────
 BACKUP_REPO_OVERRIDE=""
@@ -154,7 +157,7 @@ trap '_cleanup_plaintext; _write_status; _release_deploy_marker; backend_cleanup
 # ── Setup ────────────────────────────────────────────────────────────
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
 BACKUP_DIR="$HOME/backups/genesis-backups"
-_CC_PROJECT_ID=${GENESIS_DIR//\//-}
+_CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
 # shellcheck source=scripts/lib/backup_core_paths.sh
@@ -556,7 +559,6 @@ PYBOUNDARY
         fi
     fi
     if [ "$transcript_mode" = pooled ]; then
-        source "$_SCRIPT_DIR/lib/transcript_pool.sh"
         mkdir -p "$BACKUP_DIR/transcripts" "$_RESTORE_WORKSPACE/cache/transcripts"
         if ! _TRANSCRIPTS_PULLED=$(transcript_pool_pull "$host_dir" "$snap" "$BACKUP_DIR/transcripts" "$_RESTORE_WORKSPACE/cache/transcripts"); then warn "off-site: transcript pooled inventory/object recovery incomplete"; fi
     elif [ "$transcript_mode" = legacy ]; then
@@ -727,6 +729,9 @@ PY
                 [ "${_schema_count:-0}" -gt 0 ] \
                     || die "SQLite staged database has no application schema — live database left untouched"
                 log "SQLite: staged candidate passed integrity, foreign-key, and schema checks"
+
+                PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.crud.peer_restore "$_DB_STAGE" \
+                    || die "SQLite peer authority reset failed — live database left untouched"
 
                 _quiesce_genesis_server
                 # Durable crash fence. If power is lost anywhere in the swap,
@@ -1256,7 +1261,7 @@ log "--- Memory ---"
 if [ -d "$BACKUP_DIR/memory" ]; then
     mkdir -p "$MEMORY_DIR"
     while IFS= read -r -d '' src; do
-        rel="${src#"$BACKUP_DIR"/memory/}"
+        rel="${src#$BACKUP_DIR/memory/}"
         dst_rel="${rel%.gpg}"
         dst="$MEMORY_DIR/$dst_rel"
         if [ -f "$dst" ] && [ "$dst" -nt "$src" ] && ! $FORCE; then
