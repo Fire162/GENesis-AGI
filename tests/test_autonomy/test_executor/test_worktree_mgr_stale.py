@@ -340,12 +340,15 @@ async def test_a_task_path_linked_to_another_worktree_is_not_registered(repo):
     assert a.is_dir() and b.is_symlink()
 
 
-@pytest.mark.parametrize("leave_stale_registration", [False, True])
+@pytest.mark.parametrize(
+    "registration",
+    ["clean-removal", "real-prunable", "unlocked-stale"],
+)
 @pytest.mark.asyncio
 async def test_cleanup_retains_unpushed_commit_as_recoverable_ref(
     repo,
     monkeypatch,
-    leave_stale_registration,
+    registration,
 ):
     base = repo / ".claude" / "worktrees"
     wt = await worktree_mgr.create_worktree(TASK, repo, base)
@@ -358,34 +361,39 @@ async def test_cleanup_retains_unpushed_commit_as_recoverable_ref(
         ["git", "-C", str(wt), "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    if leave_stale_registration:
+    if registration == "clean-removal":
+        await worktree_mgr.cleanup_worktree(wt, repo)
+    else:
         shutil.rmtree(wt)
         real_records = worktree_mgr._worktree_records
-        first_read = True
+        records = await real_records(repo)
+        stale = worktree_mgr._listed_record(records, wt)
+        assert stale is not None and "prunable" in stale
 
-        async def report_unlocked_registration(root):
-            nonlocal first_read
-            records = await real_records(root)
-            if first_read:
-                first_read = False
-                return [
-                    {
-                        key: value
-                        for key, value in record.items()
-                        if key != "prunable"
-                    }
-                    if worktree_mgr._as_named(Path(record["worktree"]))
-                    == worktree_mgr._as_named(wt)
-                    else record
-                    for record in records
-                ]
-            return records
+        if registration == "unlocked-stale":
+            first_read = True
 
-        monkeypatch.setattr(
-            worktree_mgr, "_worktree_records", report_unlocked_registration,
-        )
-    else:
-        await worktree_mgr.cleanup_worktree(wt, repo)
+            async def report_unlocked_registration(root):
+                nonlocal first_read
+                current_records = await real_records(root)
+                if first_read:
+                    first_read = False
+                    return [
+                        {
+                            key: value
+                            for key, value in record.items()
+                            if key != "prunable"
+                        }
+                        if worktree_mgr._as_named(Path(record["worktree"]))
+                        == worktree_mgr._as_named(wt)
+                        else record
+                        for record in current_records
+                    ]
+                return current_records
+
+            monkeypatch.setattr(
+                worktree_mgr, "_worktree_records", report_unlocked_registration,
+            )
     subprocess.run(
         ["git", "-C", str(repo), "reflog", "expire", "--expire=now", "--all"],
         check=True,
