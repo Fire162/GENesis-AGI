@@ -271,6 +271,19 @@ def test_guard_listed_root_with_glob_chars(tmp_path):
     assert _guard(home, str(bracketed), str(tmp_path / "live1")).returncode == 0
 
 
+def test_guard_listed_root_with_a_newline(tmp_path):
+    """A listed root whose name holds a literal newline still fences: a
+    line-oriented split (``read``) would drop everything after the first
+    line and allow the fenced tree."""
+    newline_root = tmp_path / "live\nroot"
+    (newline_root / "sub").mkdir(parents=True)
+    home = tmp_path / "h"
+    home.mkdir()
+    proc = _guard(home, str(newline_root), str(newline_root / "sub"))
+    assert proc.returncode == 1, proc.stderr
+    assert _guard(home, str(newline_root), str(tmp_path / "other")).returncode == 0
+
+
 def test_guard_filesystem_root_fences_everything(tmp_path):
     """A listed ``/`` fences every absolute target — the descendant match must
     not degenerate to a ``//`` prefix."""
