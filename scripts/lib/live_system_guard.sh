@@ -105,13 +105,18 @@ EOF
 refuse_if_test_fenced_live() {
     [ -n "${GENESIS_TEST_FENCE_LIVE_ROOTS:-}" ] || return 0
     local _candidate _listed _hit=""
-    local IFS=:
+    # Split into an array with `read`: unquoted expansion in `for` would glob —
+    # a literal root like /tmp/live[1] must compare as itself, not its matches.
+    local -a _roots=()
+    IFS=: read -ra _roots <<< "$GENESIS_TEST_FENCE_LIVE_ROOTS"
     for _candidate in "$1" "${HOME:-}" "${GENESIS_HOME:-}"; do
         [ -n "$_candidate" ] || continue
         _candidate="$(realpath -m "$_candidate" 2>/dev/null)" || continue
-        for _listed in $GENESIS_TEST_FENCE_LIVE_ROOTS; do
+        for _listed in "${_roots[@]}"; do
             [ -n "$_listed" ] || continue
-            if [ "$_candidate" = "$_listed" ] || [[ "$_candidate" == "$_listed"/* ]]; then
+            # "${_listed%/}/" * covers the listed-root-is-/ case: "/" trims to
+            # "" so the pattern is /* — every absolute descendant.
+            if [ "$_candidate" = "$_listed" ] || [[ "$_candidate" == "${_listed%/}/"* ]]; then
                 _hit="$_candidate"
                 break 2
             fi

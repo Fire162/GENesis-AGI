@@ -29,15 +29,28 @@ SCRIPTS = REPO_ROOT / "scripts"
 GUARD_LIB = SCRIPTS / "lib" / "live_system_guard.sh"
 REFUSED = "REFUSED (test fence)"
 
-# (script file, extra env mapping the fixture's acting root, argv)
+# (script file, extra env mapping the fixture's acting root, argv,
+#  expected rc on the normal path, a marker proving the run got past the guard)
 # backup.sh/restore.sh act on ${GENESIS_DIR:-$HOME/genesis}, not their checkout.
+# A bare "rc != 97" would also pass on a fixture that failed to load the script
+# at all, so the normal-path test asserts each script's own observable outcome.
 DEPLOY_SCRIPTS = [
-    ("update.sh", {}, ["--definitely-bad"]),
-    ("deploy_code_only.sh", {}, ["bogus-mode"]),
-    ("backup.sh", {"GENESIS_DIR": "{fixture}"}, []),
-    ("restore.sh", {"GENESIS_DIR": "{fixture}"}, ["--help"]),
-    ("bootstrap.sh", {}, []),
-    ("deploy_candidates", {}, ["bogus-command"]),
+    ("update.sh", {}, ["--definitely-bad"], 1, "unknown argument"),
+    # Arg parsing sits after the lib sourcing; "bogus-mode" reaches its own
+    # `die` usage line.
+    ("deploy_code_only.sh", {}, ["bogus-mode"], 1, "unknown argument"),
+    # GENESIS_DIR names the fixture, which has no data/genesis.db: the first
+    # real step fails cleanly after the guard has already run.
+    ("backup.sh", {"GENESIS_DIR": "{fixture}"}, [], 1, "SQLite source database not found"),
+    ("restore.sh", {"GENESIS_DIR": "{fixture}"}, ["--help"], 0, ""),
+    # Bootstrap's onward path varies by box (package probes, git checks), so
+    # assert only that it started its normal path: the banner it prints BEFORE
+    # the fence check could pass trivially, so the marker is the managed-units
+    # probe output, which only runs after both guards.
+    ("bootstrap.sh", {}, [], None, "managed_units"),
+    # The fixture has no deploy_candidates.py: the exec fails inside the engine
+    # launch, proving the shell wrapper ran past the guard.
+    ("deploy_candidates", {}, ["bogus-command"], 2, "deploy_candidates.py"),
 ]
 
 
@@ -59,11 +72,13 @@ def _env(home: Path, fixture: Path | None, log: Path | None, extra: dict) -> dic
 
 @pytest.fixture()
 def fixture_tree(tmp_path: Path) -> Path:
-    """scripts/<each deploy script> + scripts/lib/live_system_guard.sh."""
+    """scripts/<each deploy script> with scripts/lib symlinked to the real lib
+    dir — the guard plus every lib a script sources — so the normal-path tests
+    run the script's own code end to end rather than dying on a missing lib."""
     tree = tmp_path / "fixture"
-    (tree / "scripts" / "lib").mkdir(parents=True)
-    shutil.copy2(GUARD_LIB, tree / "scripts" / "lib" / "live_system_guard.sh")
-    for name, _extra, _argv in DEPLOY_SCRIPTS:
+    (tree / "scripts").mkdir(parents=True)
+    (tree / "scripts" / "lib").symlink_to(SCRIPTS / "lib", target_is_directory=True)
+    for name, _extra, _argv, _rc, _marker in DEPLOY_SCRIPTS:
         shutil.copy2(SCRIPTS / name, tree / "scripts" / name)
     return tree
 
@@ -77,8 +92,11 @@ def _run(argv: list[str], env: dict, **kw) -> subprocess.CompletedProcess:
 # ── per-script refusal on the fixture ────────────────────────────────
 
 
-@pytest.mark.parametrize(("name", "extra", "argv"), DEPLOY_SCRIPTS)
-def test_script_refuses_fenced_root(fixture_tree, tmp_path, name, extra, argv):
+@pytest.mark.parametrize(
+    ("name", "extra", "argv", "normal_rc", "marker"), DEPLOY_SCRIPTS
+)
+def test_script_refuses_fenced_root(fixture_tree, tmp_path, name, extra, argv,
+                                    normal_rc, marker):
     home = tmp_path / f"home-{name}"
     home.mkdir()
     log = tmp_path / f"hits-{name}.log"
@@ -91,16 +109,29 @@ def test_script_refuses_fenced_root(fixture_tree, tmp_path, name, extra, argv):
     assert REFUSED in log.read_text()
 
 
-@pytest.mark.parametrize(("name", "extra", "argv"), DEPLOY_SCRIPTS)
-def test_script_unset_takes_normal_path(fixture_tree, tmp_path, name, extra, argv):
-    """Variable unset: the guard is a no-op, the script takes its normal path —
-    observable as ANY outcome other than the fence's refusal."""
+@pytest.mark.parametrize(
+    ("name", "extra", "argv", "normal_rc", "marker"), DEPLOY_SCRIPTS
+)
+def test_script_unset_takes_normal_path(fixture_tree, tmp_path, name, extra,
+                                        argv, normal_rc, marker):
+    """Variable unset: the guard is a no-op and the script takes its normal
+    path — proven by the script's OWN outcome (rc + marker), not merely the
+    absence of a refusal, so a fixture that failed to load the script could
+    not pass."""
     home = tmp_path / f"home-normal-{name}"
     home.mkdir()
     env = _env(home, None, None, extra)
     proc = _run(["bash", str(fixture_tree / "scripts" / name), *argv], env)
-    assert proc.returncode != 97
-    assert REFUSED not in proc.stderr
+    combined = proc.stdout + proc.stderr
+    if normal_rc is None:
+        assert proc.returncode != 97, combined
+    else:
+        assert proc.returncode == normal_rc, (
+            f"{name} on its normal path should exit {normal_rc}:\n{combined}"
+        )
+    assert REFUSED not in combined
+    if marker:
+        assert marker in combined, f"{name} did not reach its normal path:\n{combined}"
 
 
 def test_empty_variable_takes_normal_path(fixture_tree, tmp_path):
@@ -224,6 +255,29 @@ def test_guard_symlinked_and_nonexistent_candidate(tmp_path):
     home.mkdir()
     assert _guard(home, str(root), str(link)).returncode == 1
     assert _guard(home, str(root), str(root / "not" / "there" / "yet")).returncode == 1
+
+
+def test_guard_listed_root_with_glob_chars(tmp_path):
+    """A listed root whose name holds glob characters compares as itself: the
+    colon-split list must not pathname-expand (for-unquoted would turn
+    ``live[1]`` into an existing ``live1`` and allow the fenced tree)."""
+    bracketed = tmp_path / "live[1]"
+    (bracketed / "sub").mkdir(parents=True)
+    (tmp_path / "live1").mkdir()  # the path the unquoted expansion would yield
+    home = tmp_path / "h"
+    home.mkdir()
+    proc = _guard(home, str(bracketed), str(bracketed / "sub"))
+    assert proc.returncode == 1, proc.stderr
+    assert _guard(home, str(bracketed), str(tmp_path / "live1")).returncode == 0
+
+
+def test_guard_filesystem_root_fences_everything(tmp_path):
+    """A listed ``/`` fences every absolute target — the descendant match must
+    not degenerate to a ``//`` prefix."""
+    home = tmp_path / "h"
+    home.mkdir()
+    assert _guard(home, "/", "/").returncode == 1
+    assert _guard(home, "/", str(tmp_path)).returncode == 1
 
 
 def test_guard_appends_to_log(tmp_path):
