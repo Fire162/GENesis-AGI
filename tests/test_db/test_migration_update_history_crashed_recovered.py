@@ -258,3 +258,96 @@ async def test_full_migration_chain_accepts_crashed_recovered(tmp_path, monkeypa
         await db.commit()
         cursor = await db.execute("SELECT status FROM update_history WHERE id='r-crash'")
         assert (await cursor.fetchone())[0] == "crashed_recovered"
+
+
+# ── Install-added schema the fixed rebuild template would lose (PR review) ──
+
+
+async def _recreate_with(conn: aiosqlite.Connection, old: str | None, new: str) -> None:
+    """Recreate update_history from its live DDL with one textual edit, rows kept.
+
+    ``old=None`` appends ``new`` as a table-level clause before the closing paren.
+    """
+    ddl = await _ddl(conn)
+    if old is None:
+        cut = ddl.rindex(")")
+        edited = ddl[:cut].rstrip() + ",\n " + new + "\n)"
+    else:
+        assert old in ddl, f"fixture edit anchor {old!r} not in live DDL"
+        edited = ddl.replace(old, new, 1)
+    rows = await _rows(conn)
+    await conn.execute("DROP TABLE update_history")
+    await conn.execute(edited)
+    for row in rows:
+        await conn.execute(_INSERT, row)
+    await conn.commit()
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "named"),
+    [
+        (None, "UNIQUE (old_commit, started_at)", "UNIQUE"),
+        (None, "CHECK (length(id) > 0)", "CHECK"),
+        ("rollback_tag TEXT", "rollback_tag TEXT DEFAULT 'none'", "DEFAULT"),
+        ("failure_reason TEXT", "failure_reason TEXT COLLATE NOCASE", "COLLATE"),
+        (None, "FOREIGN KEY (rollback_tag) REFERENCES tags(name)", "FOREIGN KEY"),
+    ],
+    ids=["unique", "extra-check", "default", "collate", "own-foreign-key"],
+)
+@pytest.mark.asyncio
+async def test_refuses_a_constraint_the_rebuild_would_drop(conn, old, new, named) -> None:
+    await _recreate_with(conn, old, new)
+    ddl_before = await _ddl(conn)
+    mod = importlib.import_module(MIGRATION)
+    with pytest.raises(RuntimeError, match="Nothing was changed") as exc:
+        await mod.up(conn)
+    assert named in str(exc.value)
+    assert await _ddl(conn) == ddl_before
+    assert await _rows(conn) == sorted(_EXISTING)
+
+
+@pytest.mark.asyncio
+async def test_refuses_a_cascading_child_with_foreign_keys_on(conn) -> None:
+    """DROP TABLE under foreign_keys=ON deletes child rows: refuse first."""
+    await conn.execute(
+        "CREATE TABLE uh_child (uid TEXT REFERENCES update_history(id) ON DELETE CASCADE)"
+    )
+    await conn.execute("INSERT INTO uh_child VALUES ('r-success')")
+    await conn.commit()
+    await conn.execute("PRAGMA foreign_keys = ON")
+    mod = importlib.import_module(MIGRATION)
+    with pytest.raises(RuntimeError, match="uh_child") as exc:
+        await mod.up(conn)
+    assert "Nothing was changed" in str(exc.value)
+    await conn.rollback()
+    cursor = await conn.execute("SELECT uid FROM uh_child")
+    assert [r[0] for r in await cursor.fetchall()] == ["r-success"]
+    assert "'crashed_recovered'" not in await _ddl(conn)
+
+
+@pytest.mark.asyncio
+async def test_a_view_over_the_table_survives(conn) -> None:
+    await conn.execute("CREATE VIEW recent_updates AS SELECT id, status FROM update_history")
+    mod = importlib.import_module(MIGRATION)
+    await mod.up(conn)
+    await conn.execute(_INSERT, _CRASH_ROW)
+    cursor = await conn.execute("SELECT status FROM recent_updates WHERE id = 'r-crash'")
+    assert (await cursor.fetchone())[0] == "crashed_recovered"
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_on_another_table_naming_update_history_is_recreated(conn) -> None:
+    await conn.execute("CREATE TABLE ping (x TEXT)")
+    await conn.execute(
+        "CREATE TRIGGER trg_ping AFTER INSERT ON ping BEGIN "
+        "INSERT INTO update_history (id, old_tag, new_tag, old_commit, new_commit, status, "
+        "started_at, completed_at) VALUES (NEW.x, '', '', '', '', 'crashed_recovered', "
+        "'2026-10-06T00:00:00+00:00', '2026-10-06T00:00:01+00:00'); END"
+    )
+    mod = importlib.import_module(MIGRATION)
+    await mod.up(conn)
+    cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+    assert [r[0] for r in await cursor.fetchall()] == ["trg_ping"]
+    await conn.execute("INSERT INTO ping VALUES ('via-trigger')")
+    cursor = await conn.execute("SELECT status FROM update_history WHERE id = 'via-trigger'")
+    assert (await cursor.fetchone())[0] == "crashed_recovered"
