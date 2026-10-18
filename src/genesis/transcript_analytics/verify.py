@@ -65,19 +65,20 @@ def verify(data):
             "coverage": {"included": len(keys), "excluded": excluded},
             "snapshot_current": False,
         }
-    try:
-        snap = _snapshot_connection(data)
-    except Exception as exc:  # noqa: BLE001 — a corrupt snapshot falls back to live
-        print(f"transcript-analytics verify: snapshot unreadable ({exc!r}); live views only", file=sys.stderr)
-        snap = None
     with contextlib.closing(query.connect(data)) as live:
         comparisons = {v: {"live": _digest(live, v)} for v in query._DERIVED}
-    if snap is not None:
-        with contextlib.closing(snap):
+    snapshot_ok = False
+    try:
+        # DuckDB can bind a read_parquet view without scanning it; damage can
+        # surface at row-read time, so the whole digest pass stays inside try.
+        with contextlib.closing(_snapshot_connection(data)) as snap:
             for v in query._DERIVED:
                 comparisons[v]["snapshot"] = _digest(snap, v)
+        snapshot_ok = True
+    except Exception as exc:  # noqa: BLE001 — a corrupt snapshot falls back to live
+        print(f"transcript-analytics verify: snapshot unreadable ({exc!r}); live views only", file=sys.stderr)
     return {
-        "ok": snap is not None
+        "ok": snapshot_ok
         and all(v["snapshot"] == v["live"] for v in comparisons.values())
         and not excluded,
         "coverage": {"included": len(keys), "excluded": excluded},
