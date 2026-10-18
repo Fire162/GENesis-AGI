@@ -44,6 +44,10 @@ _REPORT_SH = (
     '"$(sed -n "s/^oom_kill //p" "$cg/memory.events" 2>/dev/null)" >&"$fd"; exit $rc'
 )
 _SYSTEMD_TIMEOUT = 15  # a local D-Bus round trip; a hang means no reachable manager
+#: Grace between the watchdog's TERM and its forced SIGKILL: long enough for a
+#: cooperative job to shut down, short enough that a TERM-ignoring job cannot
+#: hold a box that has already been over the line for the watchdog's grace.
+_WATCHDOG_STOP_DEADLINE = 10.0
 # The probe runs inside its scope and prints the limits the kernel actually applies:
 # systemd accepts MemoryMax/CPUQuota even where the controller is not delegated to
 # the user manager, and the scope's memory.max then stays `max`.
@@ -400,6 +404,7 @@ class OwnedProcess:
         self._registration_fd = -1
         self._scope_authorized = False
         self._scope_retry_at = 0.0
+        self._escalate_at = None
 
     def __enter__(self):
         if sys.platform != "linux":
@@ -431,11 +436,17 @@ class OwnedProcess:
         self._previous.clear()
 
     def _forward(self, signum, _frame):
-        self._requests.append((True, signum))
+        self._requests.append((True, signum, None))
 
-    def stop(self, sig=signal.SIGTERM):
-        """Thread-safe request only; watchdogs never dispatch or reap."""
-        self._requests.append((False, sig))
+    def stop(self, sig=signal.SIGTERM, *, escalate_after=None):
+        """Thread-safe request only; watchdogs never dispatch or reap.
+
+        ``escalate_after`` arms a one-shot deadline, measured from the request's
+        dispatch: if the child is still alive then, the request escalates to
+        SIGKILL. Watchdogs use it so a TERM-ignoring job cannot hold a pressured
+        box open; caller cancellation stays cooperative and never sets it.
+        """
+        self._requests.append((False, sig, escalate_after))
 
     def checkpoint(self):
         if self._finished:
@@ -444,7 +455,7 @@ class OwnedProcess:
             raise ProbeRefused("only the main CLI thread may supervise children")
         while True:
             try:
-                caller, value = self._requests.popleft()
+                caller, value, escalate_after = self._requests.popleft()
             except IndexError:
                 break
             if caller:
@@ -452,6 +463,17 @@ class OwnedProcess:
                 self.last_signal = value
                 value = signal.SIGTERM if self.signals == 1 else signal.SIGKILL
             self._dispatch(value)
+            if escalate_after is not None and self._sent != signal.SIGKILL:
+                self._escalate_at = time.monotonic() + escalate_after
+        if (
+            self._escalate_at is not None
+            and self.proc is not None
+            and not self.reaped
+            and self._sent == signal.SIGTERM
+            and time.monotonic() >= self._escalate_at
+        ):
+            self._escalate_at = None
+            self._dispatch(signal.SIGKILL)
         self._receive_registration()
         self._dispatch_scope()
 
@@ -485,6 +507,7 @@ class OwnedProcess:
         self._numeric_sent, self._scope_sent = None, None
         self._registration_fd = registration_fd
         self._scope_authorized, self._scope_retry_at = False, 0.0
+        self._escalate_at = None
 
     def start_scoped(self, argv, unit, *, report_fd=None, **options):
         """Spawn through the private registration gate; retain child on errors."""
@@ -768,7 +791,12 @@ def launch(
                     )
                 os.close(write_fd)
                 write_fd = -1
-                watchdog = Watchdog(over, owned.stop)
+                # A pressured box cannot wait on a TERM-ignoring job: the
+                # watchdog's stop escalates to SIGKILL after a short deadline.
+                # Caller cancellation stays cooperative; only this request arms it.
+                watchdog = Watchdog(
+                    over, lambda: owned.stop(escalate_after=_WATCHDOG_STOP_DEADLINE)
+                )
                 threading.Thread(target=watchdog.run, args=(done,), daemon=True).start()
                 rc = owned.wait()
                 try:

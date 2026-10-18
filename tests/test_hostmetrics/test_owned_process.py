@@ -82,6 +82,52 @@ def test_second_cancellation_forces_without_deadline(monkeypatch):
     assert owner.outcome(0) == 130
 
 
+def test_watchdog_stop_escalates_term_ignorer_to_sigkill():
+    with run.OwnedProcess() as owner:
+        child = subprocess.Popen(
+            [sys.executable, '-c',
+             'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+             'print("armed", flush=True); time.sleep(60)'],
+            start_new_session=True, stdout=subprocess.PIPE)
+        assert child.stdout.readline() == b'armed\n'  # TERM must not land before SIG_IGN
+        owner.bind(child)
+        owner.stop(escalate_after=0.3)
+        assert owner.wait(timeout=15) == -signal.SIGKILL
+    # A watchdog request is not a caller signal: it never selects the outcome.
+    assert owner.outcome(0) == 0
+
+
+def test_watchdog_stop_without_escalation_stays_term(monkeypatch):
+    sent = []
+    monkeypatch.setattr(run, 'kill_group', lambda *args: sent.append(args))
+    with run.OwnedProcess() as owner:
+        owner.bind(_child())
+        owner.stop()
+        for _ in range(3):
+            owner.checkpoint()
+            time.sleep(0.05)
+        assert sent == [(owner.proc.pid, signal.SIGTERM)]
+        owner.wait(timeout=5)
+
+
+def test_caller_escalation_supersedes_armed_watchdog_deadline(monkeypatch):
+    sent = []
+    monkeypatch.setattr(run, 'kill_group', lambda *args: sent.append(args))
+    with run.OwnedProcess() as owner:
+        owner.bind(_child(60))
+        owner.stop(escalate_after=0.01)
+        owner._forward(signal.SIGINT, None)
+        owner._forward(signal.SIGINT, None)
+        time.sleep(0.05)
+        for _ in range(3):
+            owner.checkpoint()
+        # The caller's second signal already forced SIGKILL; the watchdog's
+        # armed deadline adds no duplicate dispatch.
+        pid = owner.proc.pid
+        assert sent == [(pid, signal.SIGTERM), (pid, signal.SIGKILL)]
+        owner.wait(timeout=15)
+
+
 def test_first_cancellation_after_reap_remains_cooperative_for_owned_scope(monkeypatch):
     sent = []
     monkeypatch.setattr(run, 'kill_group', lambda *_args: pytest.fail('reaped PID cannot be signalled'))
