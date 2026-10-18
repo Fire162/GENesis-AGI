@@ -78,6 +78,7 @@ _EVENT_SUBTYPES = frozenset(
         "api_error",
         "compact_boundary",
         "model_refusal_fallback",
+        "model_refusal_no_fallback",
         "informational",
     }
 )
@@ -115,7 +116,8 @@ def _ms_between(a: str | None, b: str | None) -> int | None:
     try:
         da = datetime.fromisoformat(a.replace("Z", "+00:00"))
         db = datetime.fromisoformat(b.replace("Z", "+00:00"))
-        return round((db - da).total_seconds() * 1000)
+        milliseconds = (db - da).total_seconds() * 1000
+        return round(milliseconds) if milliseconds >= 0 else None
     except (ValueError, TypeError):  # TypeError: naive minus aware timestamp
         return None
 
@@ -216,7 +218,7 @@ def _status(v) -> int | None:
     return _int(v.get("status")) if isinstance(v, dict) else _int(v)
 
 
-def _token(v) -> int | None:
+def _nonnegative_int(v) -> int | None:
     value = _int(v)
     return value if value is not None and value >= 0 else None
 
@@ -282,14 +284,15 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
     )
 
     first_sid: str | None = None  # from ANY record, even ones no table keeps
+    budget = os.path.getsize(path) if stop_at is None else stop_at
     counter = {"consumed": 0, "digest": hashlib.sha256()}
-    for line_no, raw in enumerate(_complete_lines(path, stop_at, counter), start=1):
+    for line_no, raw in enumerate(_complete_lines(path, budget, counter), start=1):
         res.stats["lines"] += 1
         if not raw.strip():
             continue
         try:
             r = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             res.chronology_known = False
             res.stats["malformed"] += 1
             continue
@@ -366,13 +369,13 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     # Preserve the producer assertion for whole-terminal agreement;
                     # has_usage and is_api_error independently prohibit its vector.
                     "stop_reason": _str(msg.get("stop_reason")),
-                    "input_tokens": _token(usage.get("input_tokens")),
-                    "output_tokens": _token(usage.get("output_tokens")),
-                    "cache_read": _token(usage.get("cache_read_input_tokens")),
-                    "cache_create": _token(usage.get("cache_creation_input_tokens")),
-                    "cache_create_5m": _token(cc.get("ephemeral_5m_input_tokens")),
-                    "cache_create_1h": _token(cc.get("ephemeral_1h_input_tokens")),
-                    "thinking_tokens": _token(otd.get("thinking_tokens")),
+                    "input_tokens": _nonnegative_int(usage.get("input_tokens")),
+                    "output_tokens": _nonnegative_int(usage.get("output_tokens")),
+                    "cache_read": _nonnegative_int(usage.get("cache_read_input_tokens")),
+                    "cache_create": _nonnegative_int(usage.get("cache_creation_input_tokens")),
+                    "cache_create_5m": _nonnegative_int(cc.get("ephemeral_5m_input_tokens")),
+                    "cache_create_1h": _nonnegative_int(cc.get("ephemeral_1h_input_tokens")),
+                    "thinking_tokens": _nonnegative_int(otd.get("thinking_tokens")),
                     "is_sidechain": _bool(r.get("isSidechain")),
                     "entrypoint": _str(r.get("entrypoint")),
                     "attribution_skill": _str(r.get("attributionSkill")),
@@ -612,7 +615,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "hook_name": _str(att.get("hookName")),
                     "command": hcmd,
                     "exit_code": _int(att.get("exitCode")),
-                    "duration_ms": _int(att.get("durationMs")),
+                    "duration_ms": _nonnegative_int(att.get("durationMs")),
                     "timed_out": att.get("timedOut")
                     if isinstance(att.get("timedOut"), bool)
                     else None,
@@ -644,6 +647,10 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "error",
                     "level",
                     "status",
+                    "originalModel",
+                    "requestId",
+                    "apiRefusalCategory",
+                    "apiRefusalExplanation",
                 )
                 if r.get(k) is not None
             }
@@ -668,11 +675,11 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                         }
                     ),
                     "level": _str(r.get("level")),
-                    "duration_ms": _int(r.get("durationMs")),
-                    "message_count": _int(r.get("messageCount")),
+                    "duration_ms": _nonnegative_int(r.get("durationMs")),
+                    "message_count": _nonnegative_int(r.get("messageCount")),
                     "status": _status(r.get("status")),
-                    "pre_tokens": _token(cm.get("preTokens")),
-                    "post_tokens": _token(cm.get("postTokens")),
+                    "pre_tokens": _nonnegative_int(cm.get("preTokens")),
+                    "post_tokens": _nonnegative_int(cm.get("postTokens")),
                     "trigger": _str(cm.get("trigger")),
                     "detail": dtext,
                     "scrub_failed": dfailed,
@@ -711,7 +718,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
 
     res.content_sha256 = counter["digest"].hexdigest()
     res.stats["bytes_read"] = counter["consumed"]
-    if counter["consumed"] != (path.stat().st_size if stop_at is None else stop_at):
+    if counter["consumed"] != budget:
         res.chronology_known = False  # Torn/truncated captured prefix has unknown chronology.
     t["tool_calls"].extend(
         row for calls in pending.values() for row in calls
@@ -721,7 +728,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
         meta_path = path.with_name(f"agent-{agent_id_from_name}.meta.json")
         try:
             meta = json.loads(meta_path.read_text())
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             meta = None
         if isinstance(meta, dict):
             description, desc_failed = scrub_text(_str(meta.get("description")))
@@ -738,7 +745,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "description": description,
                     "scrub_failed": desc_failed,
                     "tool_use_id": _str(meta.get("toolUseId")) or None,
-                    "spawn_depth": _int(meta.get("spawnDepth")),
+                    "spawn_depth": _nonnegative_int(meta.get("spawnDepth")),
                     "request_shape": _str(meta.get("requestShape")),
                     "non_interactive": meta.get("requestNonInteractive")
                     if isinstance(meta.get("requestNonInteractive"), bool)
