@@ -79,3 +79,52 @@ To run bootstrap for deliberate live repair anyway:
 EOF
     return 1
 }
+
+# refuse_if_test_fenced_live <acting-root>
+#
+# The suite-wide test fence (tests/_live_fence.py) exports
+# GENESIS_TEST_FENCE_LIVE_ROOTS: a colon-separated list of real paths no test
+# may let a deploy script act on (this checkout, the real ~/.genesis and
+# ~/genesis). The decision lives HERE, inside the script, because only the
+# script knows the root it will act on after bash's own expansion — no amount
+# of argv or shell-string prediction from outside converges (BASH_ENV,
+# --rcfile, nested -c, a path built in a variable all defeat it).
+#
+#   unset/empty  → return 0 immediately: production behaviour never changes.
+#   set          → realpath -m the acting root, $HOME and ${GENESIS_HOME:-};
+#                  any of them equal to or under a listed root prints
+#                  "REFUSED (test fence): <script> would act on <path>" to
+#                  stderr, appends the same line to $GENESIS_TEST_FENCE_LOG
+#                  when set (so the offending test fails at teardown), and
+#                  returns 1.
+#
+# Callers run `refuse_if_test_fenced_live "$ROOT" || exit 97` as the FIRST
+# statement after resolving the root they act on, before any side effect —
+# 97 so a fenced refusal can't be mistaken for an ordinary script failure.
+
+refuse_if_test_fenced_live() {
+    [ -n "${GENESIS_TEST_FENCE_LIVE_ROOTS:-}" ] || return 0
+    local _candidate _listed _hit=""
+    local IFS=:
+    for _candidate in "$1" "${HOME:-}" "${GENESIS_HOME:-}"; do
+        [ -n "$_candidate" ] || continue
+        _candidate="$(realpath -m "$_candidate" 2>/dev/null)" || continue
+        for _listed in $GENESIS_TEST_FENCE_LIVE_ROOTS; do
+            [ -n "$_listed" ] || continue
+            if [ "$_candidate" = "$_listed" ] || [[ "$_candidate" == "$_listed"/* ]]; then
+                _hit="$_candidate"
+                break 2
+            fi
+        done
+    done
+    [ -n "$_hit" ] || return 0
+    # Name the script that sourced this lib (BASH_SOURCE[1]), not $0: under a
+    # BASH_ENV/--rcfile launch $0 is "bash" while the script still names itself.
+    local _script="${BASH_SOURCE[1]:-$0}"
+    local _msg="REFUSED (test fence): ${_script##*/} would act on $_hit"
+    printf '%s\n' "$_msg" >&2
+    if [ -n "${GENESIS_TEST_FENCE_LOG:-}" ]; then
+        printf '%s\n' "$_msg" >> "$GENESIS_TEST_FENCE_LOG" 2>/dev/null || true
+    fi
+    return 1
+}
