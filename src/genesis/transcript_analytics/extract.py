@@ -158,7 +158,7 @@ def _result_agent_ids(content, structured) -> list[str]:
     return sorted(value for value in candidates if scrub_text(value) == (value, False))
 
 
-def _complete_lines(path: Path, stop_at: int | None, counter: dict):
+def _complete_lines(path: Path, stop_at: int | None, counter: dict, fh=None):
     """Yield complete lines (newline stripped) within the first ``stop_at`` bytes.
 
     Streams one line at a time (a 400 MB transcript is never held whole). A
@@ -166,20 +166,31 @@ def _complete_lines(path: Path, stop_at: int | None, counter: dict):
     next read; ``stop_at`` is the size observed BEFORE reading, so bytes appended
     during the read are not half-consumed. ``counter["consumed"]`` ends at the
     byte offset just past the last line yielded.
+
+    ``fh`` is an already-open binary handle for ``path``: callers that must
+    fingerprint the inode actually read pass one in, closing the path-vs-read
+    TOCTOU. The caller keeps ownership; it is not closed here.
     """
     budget = os.path.getsize(path) if stop_at is None else stop_at
+    if fh is not None:
+        yield from _complete_lines_in(fh, budget, counter)
+        return
     with open(path, "rb") as fh:
-        while True:
-            remaining = budget - counter["consumed"]
-            if remaining <= 0:
-                return
-            line = fh.readline(remaining)
-            if "digest" in counter:
-                counter["digest"].update(line)
-            if not line or not line.endswith(b"\n") or counter["consumed"] + len(line) > budget:
-                return
-            counter["consumed"] += len(line)
-            yield line[:-1]
+        yield from _complete_lines_in(fh, budget, counter)
+
+
+def _complete_lines_in(fh, budget: int, counter: dict):
+    while True:
+        remaining = budget - counter["consumed"]
+        if remaining <= 0:
+            return
+        line = fh.readline(remaining)
+        if "digest" in counter:
+            counter["digest"].update(line)
+        if not line or not line.endswith(b"\n") or counter["consumed"] + len(line) > budget:
+            return
+        counter["consumed"] += len(line)
+        yield line[:-1]
 
 
 def _str(v) -> str | None:
@@ -262,7 +273,7 @@ def actor_identity(context, agent):
     )
 
 
-def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractResult:
+def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None) -> ExtractResult:
     res = ExtractResult()
     t = res.tables
     pending: dict[str, list[dict]] = {}  # tool_use_id -> row awaiting its result
@@ -272,7 +283,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
 
     first_sid: str | None = None  # from ANY record, even ones no table keeps
     counter = {"consumed": 0, "digest": hashlib.sha256()}
-    for line_no, raw in enumerate(_complete_lines(path, stop_at, counter), start=1):
+    for line_no, raw in enumerate(_complete_lines(path, stop_at, counter, fh), start=1):
         res.stats["lines"] += 1
         if not raw.strip():
             continue
