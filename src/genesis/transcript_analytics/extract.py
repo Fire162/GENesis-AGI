@@ -132,8 +132,11 @@ def _block_text(content) -> str:
     return ""
 
 
-def _result_agent_ids(content, structured) -> list[str]:
-    """Retain every recognized ID before association, preserving text boundaries."""
+def _result_agent_ids(content, structured) -> tuple[list[str], bool]:
+    """Retain every recognized ID before association, preserving text boundaries.
+
+    Returns the kept IDs and whether the scrubber failed on any candidate.
+    """
     candidates = set()
     if isinstance(structured, dict):
         value = _str(structured.get("agentId"))
@@ -154,8 +157,16 @@ def _result_agent_ids(content, structured) -> list[str]:
     # These come from untrusted result payloads and are stored in identity
     # columns, which are never text-scrubbed. Keep only values the scrubber
     # leaves byte-identical; a credential-shaped value (or a scrubber failure)
-    # drops the candidate rather than persisting it.
-    return sorted(value for value in candidates if scrub_text(value) == (value, False))
+    # drops the candidate rather than persisting it. Only a scrubber failure
+    # is reported: a value the scrubber changed was judged, not withheld.
+    kept = []
+    failed = False
+    for value in candidates:
+        scrubbed, value_failed = scrub_text(value)
+        failed = failed or value_failed
+        if scrubbed == value and not value_failed:
+            kept.append(value)
+    return sorted(kept), failed
 
 
 def _complete_lines(path: Path, stop_at: int | None, counter: dict):
@@ -497,7 +508,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                         exit_code = None
                 hook = parse_hook_block(content) if cls == "hook_block" else None
                 hook_cmd, hook_failed = scrub_text(hook["hook_command"]) if hook else (None, False)
-                result_agent_ids = _result_agent_ids(b.get("content"), tur)
+                result_agent_ids, ids_failed = _result_agent_ids(b.get("content"), tur)
                 if hook:  # name the script from the SCRUBBED command only (review SF-1)
                     hook["hook_script"] = _hook_script(hook_cmd) if hook_cmd else None
                 row.update(
@@ -541,7 +552,10 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                         "hook_tool": hook["hook_tool"] if hook else None,
                         "hook_command": hook_cmd,
                         "hook_script": hook["hook_script"] if hook else None,
-                        "scrub_failed": bool(row.get("scrub_failed")) or err_failed or hook_failed,
+                        "scrub_failed": bool(row.get("scrub_failed"))
+                        or err_failed
+                        or hook_failed
+                        or ids_failed,
                     }
                 )
                 t["tool_calls"].append(row)
@@ -657,8 +671,8 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "duration_ms": _int(r.get("durationMs")),
                     "message_count": _int(r.get("messageCount")),
                     "status": _status(r.get("status")),
-                    "pre_tokens": _int(cm.get("preTokens")),
-                    "post_tokens": _int(cm.get("postTokens")),
+                    "pre_tokens": _token(cm.get("preTokens")),
+                    "post_tokens": _token(cm.get("postTokens")),
                     "trigger": _str(cm.get("trigger")),
                     "detail": dtext,
                     "scrub_failed": dfailed,

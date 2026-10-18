@@ -78,15 +78,75 @@ _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _INTERPRETERS = ("bash", "sh", "python3", "python", "node")
 
 
+# GNU env options that take a value: as the next token, attached to a short
+# option (``-uNAME``) or after ``=`` on a long one (``--unset=NAME``).
+_ENV_VALUE_SHORT = frozenset("uC")
+_ENV_VALUE_LONG = ("--unset", "--chdir")
+_ENV_SPLIT_LONG = "--split-string"
+_QUOTES = "'\""
+
+
+def _strip_quotes(tokens: list[str]) -> list[str]:
+    return [tok.strip(_QUOTES) for tok in tokens if tok.strip(_QUOTES)]
+
+
+def _skip_env_options(tokens: list[str]) -> list[str]:
+    """The tokens after ``env``'s own options (``tokens[0]`` is ``env``).
+
+    ``-S``/``--split-string`` carries the command itself, so its value is kept
+    as the following tokens (with the quoting that grouped it removed) and
+    option parsing continues inside it, as env does.
+    """
+    rest = tokens[1:]
+    while rest:
+        tok = rest[0]
+        if tok == "--":
+            return rest[1:]
+        if not tok.startswith("-"):
+            return rest
+        if tok == "-":  # same as -i
+            rest = rest[1:]
+            continue
+        if tok.startswith("--"):
+            name, eq, value = tok.partition("=")
+            if name == _ENV_SPLIT_LONG:
+                split = [value] if eq else []
+                rest = _strip_quotes(split + rest[1:])
+            elif name in _ENV_VALUE_LONG and not eq:
+                rest = rest[2:]
+            else:
+                rest = rest[1:]
+            continue
+        # A cluster of short options, e.g. ``-iu NAME`` or ``-S'cmd arg'``.
+        rest = rest[1:]
+        for i, ch in enumerate(tok[1:], start=1):
+            attached = tok[i + 1 :]
+            if ch == "S":
+                rest = _strip_quotes(([attached] if attached else []) + rest)
+                break
+            if ch in _ENV_VALUE_SHORT:
+                if not attached:
+                    rest = rest[1:]
+                break
+    return rest
+
+
 def _hook_script(command: str) -> str:
     """Name of the hook script, never an argument value.
 
-    Leading ``NAME=value`` assignments and ``env`` are skipped: the first token
-    of ``GH_TOKEN=… guard.sh`` is a credential, not the script (review SF-1).
+    Leading ``NAME=value`` assignments and ``env`` with its options are
+    skipped: the first token of ``GH_TOKEN=… guard.sh`` is a credential, and
+    in ``env -u GH_TOKEN guard.sh`` it is an option, not the script (review
+    SF-1).
     """
     tokens = command.split()
-    while tokens and (tokens[0] == "env" or _ENV_ASSIGN.match(tokens[0])):
-        tokens = tokens[1:]
+    while tokens:
+        if tokens[0].rsplit("/", 1)[-1] == "env":
+            tokens = _skip_env_options(tokens)
+        elif _ENV_ASSIGN.match(tokens[0]):
+            tokens = tokens[1:]
+        else:
+            break
     if not tokens:
         return "<empty>"
     if "-c" in tokens[:2] and tokens[0] in ("bash", "sh"):
