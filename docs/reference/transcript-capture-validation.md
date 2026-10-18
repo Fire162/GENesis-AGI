@@ -43,9 +43,10 @@ replacement is not proof that its parent-directory fence succeeded. Synthetic
 fault checks and disposable GPG fixtures test those paths without promising
 recovery from arbitrary physical storage failures.
 
-Local capture validation does not establish remote pool integrity. Pool transfer
-uses remote names only to avoid initial uploads, then rereads every referenced
-object and verifies its digest and size. A corrupt object is repairable only from
+Local capture validation does not establish remote pool integrity. Pool publication freezes a dated epoch and verifies every referenced remote
+object against its validated ciphertext before COMPLETE. A pending epoch retains
+earlier verification receipts across runs; restore independently verifies the
+bytes it reads. A corrupt object is repairable only from
 the exact validated local ciphertext, followed by another verified read. Failed
 transport remains incomplete. Marker and manifest readback are also required.
 This candidate's final combined tests remain pending; local certificates alone
@@ -61,3 +62,67 @@ Only a missing path establishes this empty-source case. Permission, symlink-loop
 and other inspection failures report incomplete coverage. Pool host labels accept
 letters, digits, dots, underscores and hyphens in a single component, including
 non-alphanumeric prefixes; the special components `.` and `..` are rejected.
+
+
+## Publication across backup runs
+
+`scripts/lib/transcript_publication.py` stores one authenticated pending epoch
+under `~/backups/.genesis-backup-publication/pending`, outside the private Git
+clone and temporary storage. Required core files are copied and fenced before
+the initial journal becomes authoritative. Transcript copies then advance from
+the accepted inventory. Mutable producer outputs never replace frozen inputs.
+Keep this directory when interrupting a backup; deleting it discards publication
+progress and is an explicit operator action, not automatic recovery.
+
+The epoch binds the installation, backend root/share, host, selected source
+scope, current validation contract and capture-index digest. A changed key,
+unreadable history, or incompatible binding reports incomplete and retains the
+epoch for recovery or explicit resolution. Do not remove it to hide a coverage
+gap. Finished epochs retire by a fenced rename followed by owned cleanup.
+
+Timer and manual backups resume pending publication before fresh producers.
+Update-triggered backups first produce and verify current SQL; completion of an
+older off-site epoch never substitutes for that update prerequisite. All runs
+retain the two-hour whole-backup window. The original snapshot timestamp and
+age remain visible in stdout/journald and `backup_status.json`'s
+`pending_publication` object (phase, byte/object totals and verified progress).
+`snapshot_id` remains the original timestamp. The public dashboard keeps its
+existing safe projection; it does not display the new raw progress object.
+Newer transcript source changes wait for the next epoch.
+
+Uploads retry whole files; no upload-resume transport was added. If one upload
+cannot fit, that file remains incomplete for a later run. Downloads append via
+SMB `reget` or a local byte suffix. After a child finishes, including a failed
+transfer, exact comparison may checkpoint its verified prefix. Fsync precedes
+journal authority. Retry retains only checkpointed received bytes and continues
+unverified comparison before requesting more data; replaced downloads lose only
+their own progress. A partial prefix never grants an object receipt.
+Each publication backend call retains its configured operation timeout and also
+ends before the whole-run deadline, reserving time for checkpointing. Automatic
+expiry keeps the existing ten-second force margin. The whole-run wrapper does
+not start an earlier force timer on first cancellation; existing per-operation
+limits remain. Backup helper timers stay in the whole-run process group, while
+restore retains its standalone timer groups.
+
+Initialization publishes `TRANSCRIPT_POOL` and its authenticated manifest before
+pool objects, preserving conservative GC protection. Existing metadata must
+match frozen bytes; unexpected remote content refuses adoption. COMPLETE needs
+all required receipts, a verified staged marker and exact final-name
+acknowledgement. An interrupted acknowledgement resumes the same recovery point.
+Optional extras preserve the existing core-complete/extras-incomplete contract.
+
+Initial source capture, encryption and core freezing still need to fit one
+allowed run. An indivisible local input or whole-file upload exceeding the window
+is reported incomplete; resumability does not promise universal convergence.
+Ordinary readbacks use an installation-specific directory under the chosen large
+temp location; cleanup and the next lock owner reclaim only its named files.
+Both durable pending and retired spool directories are excluded from extra-dir
+capture through the existing overlap guard.
+
+The frozen epoch also preserves the existing payment-vault producer state. A
+failed or missing vault capture keeps its last-good archive under the explicit
+last-good remote name and records the original gap in COMPLETE, as before. A
+resumed epoch never relabels that older archive fresh; local status describes the
+current run, while the publication progress object records the frozen vault
+state. Restore continues to stage accepted fresh vaults rather than activate
+them, and reports a gap instead of installing a last-good fallback.

@@ -573,7 +573,7 @@ def test_incomplete_capture_skips_pool_and_preserves_prior_complete(backup_env, 
     transcripts.mkdir()
     (transcripts / "retained.jsonl.gpg").write_bytes(b"not current-key ciphertext")
     result = _run_local(backup_env, offsite, {"GENESIS_BACKUP_NAS_HOST": "archive-host"})
-    assert "skipping transcript pool after incomplete capture" in result.stdout
+    assert "transcript preflight incomplete — skipping Tier 2 before remote creation" in result.stdout
     assert (prior / "COMPLETE").read_bytes() == b"genesis-snapshot 1\n"
     assert not list(offsite.rglob("manifest-v1.json.gpg"))
     assert list(offsite.rglob("COMPLETE")) == [prior / "COMPLETE"]

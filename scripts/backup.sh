@@ -48,6 +48,18 @@ fi
 # Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
 # (backward-compat: a configured GENESIS_BACKUP_NAS with no selector → smb).
 _SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Timer and manual invocations share the same monotonic two-hour window.
+# The inherited internal deadline also bounds publication decisions; timeout
+# retains the ten-second TERM-to-KILL margin for automatic expiry. Separate
+# timers keep a user's first cancellation from starting an early force timer;
+# the foreground inner timer leaves all descendants in the outer owned group.
+if [ -z "${_GENESIS_BACKUP_DEADLINE:-}" ]; then
+    _GENESIS_BACKUP_DEADLINE=$(python3 -c 'import time;print(time.monotonic()+7200)')
+    export _GENESIS_BACKUP_DEADLINE
+    exec timeout --preserve-status --signal=KILL 7210 \
+        timeout --foreground --preserve-status 7200 bash "$_SCRIPT_DIR/backup.sh" "$@"
+fi
+_BACKUP_DEADLINE="$_GENESIS_BACKUP_DEADLINE"
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
 # Durable alert queue (F.3): if a Telegram alert can't send, persist it so the
@@ -114,6 +126,10 @@ _SQLITE_LINES=0
 _QDRANT_COUNT=0
 _TRANSCRIPT_COUNT=0
 _TRANSCRIPTS_COMPLETE=true
+_PUBLICATION_WORK=""
+_PUBLICATION_ACTIVE=false
+_PUBLICATION_SUMMARY=""
+_BACKUP_READBACK_DIR=""
 _MEMORY_COUNT=0
 _EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
 _EXTRA_PARTIAL_LABELS=()
@@ -181,7 +197,7 @@ _write_status() {
     if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_PARTIAL:-0})) -gt 0 ]; then _extras_complete=false; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED,"pending_publication":${_PUBLICATION_SUMMARY:-null}}
 STATUSEOF
 }
 
@@ -215,9 +231,14 @@ Duration: $(( $(date +%s) - _STARTED_AT ))s" || true
 _on_exit() {
     # Exit handler: every step best-effort so a failure in one never skips the
     # rest (status write + plaintext cleanup must always run).
+    if declare -F publication_checkpoint >/dev/null; then publication_checkpoint || true; fi
     _alert_backup_failed || true
     _write_status || true
     backend_cleanup || true
+    if [ -n "${_PUBLICATION_WORK:-}" ]; then rm -rf -- "$_PUBLICATION_WORK"; fi
+    if [ -n "${_BACKUP_READBACK_DIR:-}" ]; then
+        rm -f -- "$_BACKUP_READBACK_DIR"/.backend-readback.* 2>/dev/null || true
+    fi
     # N2: the credential-bearing plaintext SQL dump must not outlive the script
     # if it died mid-section (before its inline rm).
     rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
@@ -228,6 +249,8 @@ _on_exit() {
     return 0
 }
 trap _on_exit EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
 BACKUP_DIR="$HOME/backups/genesis-backups"
@@ -288,6 +311,14 @@ _send_telegram() {
 GENESIS_BIG_TMP="${GENESIS_BACKUP_TMPDIR:-$HOME/tmp}"
 mkdir -p "$GENESIS_BIG_TMP"
 log "big-temp dir: $GENESIS_BIG_TMP"
+# All ordinary readbacks belong to this installation's held DR lock. Reclaim
+# only our named files, including leftovers from SIGKILL; never sweep big-temp.
+_READBACK_BINDING=$(printf '%s' "$DR_LOCK_FILE" | sha256sum | cut -c1-32)
+_BACKUP_READBACK_DIR="$GENESIS_BIG_TMP/.genesis-backup-readback-$_READBACK_BINDING"
+[ ! -L "$_BACKUP_READBACK_DIR" ] || die "Backup readback directory is a symlink"
+mkdir -p -- "$_BACKUP_READBACK_DIR"
+rm -f -- "$_BACKUP_READBACK_DIR"/.backend-readback.*
+find "$_BACKUP_READBACK_DIR" -mindepth 1 -maxdepth 1 -type d -name 'publication.*' -exec rm -rf -- {} +
 
 # ── Encryption helpers ───────────────────────────────────────────────
 # All PII-bearing payloads (SQLite dump, transcripts, memory) use the
@@ -305,6 +336,51 @@ if [ -n "$_BACKUP_PASSPHRASE" ]; then
     _ENCRYPT_READY=true
 fi
 
+# One durable off-site epoch; a pending timer/manual run gets its progress
+# opportunity before fresh SQL/Qdrant work. Updates first produce fresh SQL.
+_PUBLICATION_SPOOL="$HOME/backups/.genesis-backup-publication"
+_PUBLICATION_RESUMED=false
+_T2_OK=false
+_T2_STATUS="skipped"
+_T2_HOST_DIR="Genesis/${GENESIS_BACKUP_NAS_HOST:-$(hostname)}"
+# shellcheck source=scripts/lib/transcript_publication.sh
+source "$_SCRIPT_DIR/lib/transcript_publication.sh"
+# shellcheck source=scripts/lib/transcript_pool.sh
+source "$_SCRIPT_DIR/lib/transcript_pool.sh"
+backend_init
+_T2_BACKEND="$(backend_name)"
+if [ "$_T2_BACKEND" != none ] && ! _pool_host_safe "$_T2_HOST_DIR"; then
+    die "Unsafe off-site host path"
+fi
+_publish_offsite() {
+    local probe=0
+    _T2_STATUS="partial"
+    _T2_OK=false
+    if [ "$1" = create ]; then
+        backend_list_strict "$2" >/dev/null || probe=$?
+        case "$probe" in
+            3) ;;
+            0) die "off-site snapshot already exists: $2; retry with a fresh timestamp" ;;
+            *) die "cannot verify off-site snapshot absence: $2" ;;
+        esac
+    fi
+    if backend_available && publication_run "$@"; then
+        _T2_OK=true
+        _T2_STATUS="ok"
+    else
+        log "WARNING: frozen off-site snapshot incomplete; retained for the next run"
+        if [ "$1" = open ] && [ "${_PUBLICATION_ACTIVE:-false}" != true ]; then
+            _TRANSCRIPTS_COMPLETE=false
+            _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }pending transcript publication authority unavailable"
+            _FAILURE_STAGE="transcripts"
+        fi
+    fi
+}
+if [ -e "$_PUBLICATION_SPOOL/pending" ] || [ -L "$_PUBLICATION_SPOOL/pending" ]; then
+    _PUBLICATION_RESUMED=true
+    if [ "$_TRIGGER" != update ]; then _publish_offsite open ""; fi
+fi
+
 # encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
 encrypt_file() {
     local src="$1"
@@ -320,7 +396,7 @@ encrypt_file() {
 # (named failure: stalled push/pull/clone holding the DR lock). GENESIS-
 # overridable for slow links; -k SIGKILLs a SIGTERM-ignoring git.
 _GIT_NET_TIMEOUT="${GENESIS_BACKUP_GIT_TIMEOUT:-300}"
-_git_net() { timeout -k 10 "$_GIT_NET_TIMEOUT" git "$@"; }
+_git_net() { timeout --foreground -k 10 "$_GIT_NET_TIMEOUT" git "$@"; }
 
 # _roundtrip_ok <passphrase> <artifact.gpg> [stderr_file] — prove that the exact
 # encrypted candidate decrypts, imports into a new database, and passes full
@@ -550,6 +626,10 @@ else
     log "WARNING: genesis.db not found at $DB_FILE"
 fi
 
+if $_PUBLICATION_RESUMED && [ "$_TRIGGER" = update ]; then
+    _publish_offsite open ""
+fi
+
 # --- 2. Qdrant snapshots (encrypted — snapshots contain embedding vectors
 #       and payloads derived from memory/DB content) ---
 log "Backing up Qdrant collections..."
@@ -667,7 +747,9 @@ case "${GENESIS_BACKUP_TRANSCRIPT_SCOPE:-main}" in
        _FAILURE_STAGE="transcripts"
        log "WARNING: transcript scope must be main or all" ;;
 esac
-if $_TRANSCRIPTS_COMPLETE; then
+if $_PUBLICATION_RESUMED; then
+    log "Retaining frozen transcript inventory; newer sources wait for the next snapshot"
+elif $_TRANSCRIPTS_COMPLETE; then
     if ! printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" backup \
         "$HOME/.claude/projects" --destination transcripts --scratch "$GENESIS_BIG_TMP" "${_transcript_flags[@]}"; then
         _TRANSCRIPTS_COMPLETE=false
@@ -821,6 +903,7 @@ else
     # Compare RESOLVED paths: a symlinked or slash-terminated $HOME must not reject every entry.
     _home_real="$(realpath -- "$HOME")"
     _home_lex="$(realpath -s -m -- "$HOME")"
+    _publication_real="$(realpath -m -- "$_PUBLICATION_SPOOL")"
     _bdir_real="$(realpath -m -- "$BACKUP_DIR")"
     _btmp_real="$(realpath -m -- "$GENESIS_BIG_TMP")"
     _lroot_real=""
@@ -884,7 +967,7 @@ else
             continue
         fi
         _overlap=""
-        for _guard in "$_bdir_real" "$_btmp_real" "$_lroot_real"; do
+        for _guard in "$_bdir_real" "$_btmp_real" "$_lroot_real" "$_publication_real"; do
             [ -n "$_guard" ] || continue
             if backup_paths_overlap "$_abs" "$_guard"; then
                 _overlap="$_guard"
@@ -1047,10 +1130,6 @@ if {
 else
     rm -f .extra-manifest.tmp .extra-manifest 2>/dev/null || true
     log "WARNING: could not write .extra-manifest; a restore from this checkout will not restore its extra archives (the off-site snapshot is unaffected)"
-fi
-
-if [ -n "${_ANALYTICS_BACKUP_FD:-}" ]; then
-    exec {_ANALYTICS_BACKUP_FD}>&-
 fi
 
 # --- 6d. Hook audit stores (Tier 1) ---
@@ -1261,327 +1340,84 @@ fi
 # written through the backend interface, not a backend binary directly. The
 # _T2_STATUS value strings (ok/partial/not_configured/no_smbclient) are unchanged
 # — they're read by the dashboard + health alerts.
-_T2_STATUS="skipped"
-backend_init
-_T2_BACKEND="$(backend_name)"
-if [ "$_T2_BACKEND" = "none" ]; then
+if $_PUBLICATION_RESUMED; then
+    : # Same original epoch already attempted before fresh producers.
+elif [ "$_T2_BACKEND" = none ]; then
     log "Tier 2 backup target not configured — large files are local-only"
     _T2_STATUS="not_configured"
 elif ! backend_available; then
-    if [ "$_T2_BACKEND" = "smb" ]; then
-        log "WARNING: smbclient not installed — Tier 2 backup skipped"
-        _T2_STATUS="no_smbclient"
-    else
-        log "WARNING: Tier 2 backend '$_T2_BACKEND' is not available — Tier 2 backup skipped"
-        _T2_STATUS="not_configured"
-    fi
+    if [ "$_T2_BACKEND" = smb ]; then _T2_STATUS="no_smbclient"; else _T2_STATUS="not_configured"; fi
+elif ! $_TRANSCRIPTS_COMPLETE; then
+    log "WARNING: transcript preflight incomplete — skipping Tier 2 before remote creation"
+    _T2_STATUS="partial"
+elif ! $_SQL_FRESH || ! $_SQL_RESTORABLE; then
+    log "WARNING: SQL is stale or failed round-trip verify — no new off-site epoch"
+    _T2_STATUS="partial"
 else
-    # Off-site host dir. Defaults to $(hostname), but an explicit
-    # GENESIS_BACKUP_NAS_HOST override is REQUIRED when two machines share a
-    # hostname AND a Tier-2 target: the GFS prune below deletes stale COMPLETE
-    # snapshots under _T2_HOST_DIR, so two same-hostname machines writing to one
-    # NAS would prune each other's history. Symmetric with restore.sh, which
-    # already reads GENESIS_BACKUP_NAS_HOST to locate the source snapshot dir.
-    _T2_HOST_DIR="Genesis/${GENESIS_BACKUP_NAS_HOST:-$(hostname)}"
-    # Per-run DATED snapshot dir — a consistent point-in-time copy that restore.sh
-    # selects the latest COMPLETE of (and GFS retention prunes).
     _T2_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-    _T2_DIR="${_T2_HOST_DIR}/${_T2_STAMP}"
+    _publish_offsite create "$_T2_HOST_DIR/$_T2_STAMP"
+fi
+if [ -f "${_PUBLICATION_WORK:-}/session.json" ]; then
+    if ! publication_apply_gaps; then _T2_OK=false; _T2_STATUS="partial"; fi
+fi
+if [ "$_T2_OK" = true ] && [ $((_EXTRA_UPLOAD_FAILED + _EXTRA_SKIPPED + _EXTRA_PARTIAL)) -gt 0 ]; then
+    _T2_STATUS="partial"
+    _T2_EXTRAS_ONLY_PARTIAL=true
+    log "WARNING: original snapshot $_T2_STAMP is COMPLETE but extra dirs are incomplete"
+elif [ "$_T2_OK" = true ]; then
+    log "Tier 2 backup copied to original off-site snapshot $_T2_STAMP (backend: $_T2_BACKEND)"
+fi
 
-    # Published and incomplete snapshots are immutable. A repeated timestamp
-    # (including clock rollback) must never overwrite a prior recovery point.
-    # Retry with a fresh timestamp; listing uncertainty also forbids writes.
-    _T2_PROBE_RC=0
-    backend_list_strict "$_T2_DIR" >/dev/null || _T2_PROBE_RC=$?
-    case "$_T2_PROBE_RC" in
-        3) ;;
-        0) die "off-site snapshot already exists: $_T2_DIR; retry with a fresh timestamp" ;;
-        *) die "cannot verify off-site snapshot absence: $_T2_DIR" ;;
-    esac
-
-    # Create the snapshot directory tree (backend_mkdir creates ancestors;
-    # pre-existing levels are idempotent).
-    backend_mkdir "${_T2_DIR}/data"
-    backend_mkdir "${_T2_DIR}/qdrant"
-    backend_mkdir "${_T2_DIR}/transcripts"
-
-    _T2_OK=true
-    if ! $_TRANSCRIPTS_COMPLETE; then _T2_OK=false; fi
-    # Upload Qdrant snapshots — FRESH ones only (SF3). A .gpg left on disk by
-    # a prior run (this run's snapshot failed) must not be stamped into a new
-    # dated snapshot: it would misrepresent recency, and GFS retention would
-    # age out the snapshots holding the genuinely-fresh copy. The stale local
-    # file is kept (last-good copy); the failure already pages via
-    # _QDRANT_FAILED above.
-    for f in data/qdrant/*.gpg; do
-        [ -f "$f" ] || continue
-        fname=$(basename "$f")
-        _coll="${fname%.snapshot.gpg}"
-        case " $_QDRANT_FRESH " in
-            *" $_coll "*) ;;
-            *)
-                log "WARNING: $fname is stale (not regenerated this run) — excluded from off-site snapshot"
-                continue
-                ;;
-        esac
-        if backend_put_verified "$f" "${_T2_DIR}/qdrant/$fname" "$GENESIS_BIG_TMP"; then
-            log "  off-site: uploaded $fname"
-        else
-            log "WARNING: off-site upload failed for $fname"
-            _T2_OK=false
-        fi
-    done
-
-    # Upload SQL dump — freshness AND restorability gated (SF3 + SF4). The
-    # off-site snapshot is what a fresh DR box auto-selects, so it must only
-    # ever carry a dump that box can actually decrypt: _SQL_RESTORABLE is true
-    # only when the round-trip verified with the DR passphrase (escrow if
-    # present). A stale (not-regenerated) OR round-trip-failed (corrupt, or
-    # escrow-drift → DR box can't decrypt) dump is withheld, forcing NO COMPLETE
-    # this run so restore keeps falling back to the last verified-good snapshot.
-    if [ -f data/genesis.sql.gpg ] && $_SQL_FRESH && $_SQL_RESTORABLE; then
-        if backend_put_verified "data/genesis.sql.gpg" "${_T2_DIR}/data/genesis.sql.gpg" "$GENESIS_BIG_TMP"; then
-            log "  off-site: uploaded genesis.sql.gpg"
-        else
-            log "WARNING: off-site upload failed for genesis.sql.gpg"
-            _T2_OK=false
-        fi
-    elif [ -f data/genesis.sql.gpg ] && $_SQL_FRESH; then
-        # Regenerated but not restorable with the DR passphrase — do NOT stamp a
-        # COMPLETE snapshot around an undecryptable/corrupt dump.
-        log "WARNING: genesis.sql.gpg failed round-trip verify — withheld from off-site (no COMPLETE this run; last-good retained)"
-        _T2_OK=false
-    elif [ -f data/genesis.sql.gpg ]; then
-        log "WARNING: genesis.sql.gpg is stale (not regenerated this run) — excluded from off-site snapshot"
-        _T2_OK=false
-    fi
-
-    # Publish authenticated inventory and upload only missing immutable captures.
-    # shellcheck source=scripts/lib/transcript_pool.sh
-    source "$_SCRIPT_DIR/lib/transcript_pool.sh"
-    if ! $_TRANSCRIPTS_COMPLETE; then
-        # A failed capture/checkpoint must not re-enter enrollment or publication.
-        log "WARNING: skipping transcript pool after incomplete capture"
-        _T2_OK=false
-    elif ! transcript_pool_backup transcripts "$_T2_HOST_DIR" "$_T2_DIR"; then
-        log "WARNING: transcript pooled snapshot incomplete"
-        _T2_OK=false
-    fi
-
-    # Upload memory / config overlays / secrets — previously git-Tier-1 only. Including
-    # them here makes the off-site snapshot a COMPLETE copy, so a no-git fresh-box DR can
-    # rehydrate everything (restore.sh §4/§6/§7 read them from the pulled snapshot). Memory
-    # is flat (MEMORY_DIR has no subdirs); config overlays ship as-is (plaintext, mirroring
-    # the existing Tier-1 + private-repo posture); secrets is the encrypted blob. A failed
-    # upload of a present file flips _T2_OK so COMPLETE is gated on these landing too.
-    #
-    # Enumerate with `find` (not a `*.gpg` shell glob): §4/§6 stage these via `find`, which
-    # includes DOTFILES (e.g. a transient .consolidate-lock), so a glob would silently drop
-    # leading-dot names and leave the off-site copy short of Tier-1. Process substitution
-    # (not `find | while`) keeps the loop in THIS shell so the _T2_OK flip survives.
-    backend_mkdir "${_T2_DIR}/memory"
-    while IFS= read -r -d '' f; do
-        fname=$(basename "$f")
-        if backend_put_verified "$f" "${_T2_DIR}/memory/$fname" "$GENESIS_BIG_TMP"; then
-            log "  off-site: uploaded memory/$fname"
-        else
-            log "WARNING: off-site upload failed for memory/$fname"
-            _T2_OK=false
-        fi
-    done < <(find memory -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
-
-    # Upload eval golden sets (§6c) into the COMPLETE off-site snapshot so a
-    # no-git fresh-box DR rehydrates them (restore §4b) — without this they were
-    # Tier-1-git-only. Encrypted; nests under eval/golden/, so mirror the
-    # relative path (backend_mkdir is idempotent). A failed upload of a present
-    # file flips _T2_OK, same contract as the payloads above.
-    if [ -d eval ]; then
-        backend_mkdir "${_T2_DIR}/eval"
-        while IFS= read -r -d '' f; do
-            rel="${f#eval/}"
-            _sub="$(dirname "$rel")"
-            [ "$_sub" != "." ] && backend_mkdir "${_T2_DIR}/eval/${_sub}"
-            if backend_put_verified "$f" "${_T2_DIR}/eval/${rel}" "$GENESIS_BIG_TMP"; then
-                log "  off-site: uploaded eval/${rel}"
-            else
-                log "WARNING: off-site upload failed for eval/${rel}"
-                _T2_OK=false
+# --- Tier 2 GFS retention prune (off-site dated snapshots only) --------------
+# Keep daily 7 / weekly 4 / monthly 6 of the COMPLETE off-site snapshots. gfs_select
+# ALWAYS keeps the newest (restore.sh selects the latest COMPLETE); we also skip the
+# current run's stamp explicitly. Best-effort — a prune failure never fails the backup.
+# Shared transcript objects remain while referenced by retained or incomplete
+# pooled inventories. A safe sweep runs only after retention and publication.
+# Only the off-site dated tree is touched; the local ~/backups git repo
+# is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run, or
+# one whose core is COMPLETE and only opt-in extra dirs are missing: otherwise a
+# listed directory that stays missing would stop retention for good.
+if { [ "${_T2_STATUS:-}" = "ok" ] || [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; } && backend_available; then
+    # DR-safety: the host segment flows into a DESTRUCTIVE backend_delete (smb deltree /
+    # local rm -rf), so refuse to prune unless it is the plain filename charset — then a
+    # pathological hostname can never break out of the snapshot path. (The stamps below
+    # are already grep-restricted to the timestamp charset.)
+    if ! printf '%s' "$_T2_HOST_DIR" | grep -qE '^Genesis/[A-Za-z0-9._-]+$'; then
+        log "WARNING: GFS prune skipped — unsafe off-site host path '$_T2_HOST_DIR'"
+    else
+        _gfs_complete="$(
+            for _st in $(backend_list_dirs "$_T2_HOST_DIR" 2>/dev/null \
+                            | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -u || true); do
+                backend_exists "$_T2_HOST_DIR/$_st/COMPLETE" && printf '%s\n' "$_st"
+            done
+            true
+        )"
+        _gfs_delete="$(printf '%s\n' "$_gfs_complete" \
+            | python3 "$_SCRIPT_DIR/gfs_select.py" --daily 7 --weekly 4 --monthly 6)" || _gfs_delete=""
+        # Count COMPLETE snapshots present this run (grep -c . not `wc -l`,
+        # which counts 1 for an empty var). _T2_PRUNED tracks successful
+        # deletes; retained = total - pruned, surfaced in backup_status.json.
+        _T2_PRUNED=0
+        _T2_COMPLETE_TOTAL=$(printf '%s\n' "$_gfs_complete" | grep -c . || true)
+        for _st in $_gfs_delete; do
+            if [ "$_st" = "$_T2_STAMP" ]; then
+                continue   # never the current run's snapshot
             fi
-        done < <(find eval -type f -name '*.gpg' -print0 2>/dev/null)
-    fi
-
-    # Upload opt-in extra-dir archives (§6f). Flat by construction — one file
-    # per directory — so restore's single-level off-site pull reads them back.
-    # Only the archives THIS run built (never whatever else sits in extra/), so a
-    # stale file can never reach a new snapshot under a new date.
-    if [ "${#_EXTRA_BUILT[@]}" -gt 0 ]; then
-        backend_mkdir "${_T2_DIR}/extra" || true  # a failed put below is counted per archive
-        for fname in "${_EXTRA_BUILT[@]}"; do
-            f="extra/$fname"
-            if backend_put_verified "$f" "${_T2_DIR}/extra/${fname}" "$GENESIS_BIG_TMP"; then
-                _EXTRA_UPLOADED+=("$fname")
-                log "  off-site: uploaded extra/${fname}"
+            if backend_delete "$_T2_HOST_DIR/$_st"; then
+                _T2_PRUNED=$(( _T2_PRUNED + 1 ))
+                log "GFS prune: removed off-site snapshot $_st"
             else
-                # Opt-in payload: it never withholds the core snapshot's COMPLETE marker
-                # (restore would then skip the core data too), but it does mark the off-site
-                # copy unconfirmed below (tier2_status=partial, offsite_confirmed=false).
-                log "WARNING: off-site upload failed for extra/${fname} (core snapshot still COMPLETE)"
-                # Named in COMPLETE (written after this loop) so restore reports the gap.
-                _EXTRA_SKIP_LABELS+=("${fname} (upload failed)")
-                _EXTRA_UPLOAD_FAILED=$((_EXTRA_UPLOAD_FAILED + 1))
+                log "WARNING: GFS prune failed for off-site snapshot $_st"
             fi
         done
+        _T2_SNAPSHOT_COUNT=$(( _T2_COMPLETE_TOTAL - _T2_PRUNED ))
     fi
-
-    backend_mkdir "${_T2_DIR}/config_overrides"
-    while IFS= read -r -d '' f; do
-        fname=$(basename "$f")
-        if backend_put_verified "$f" "${_T2_DIR}/config_overrides/$fname" "$GENESIS_BIG_TMP"; then
-            log "  off-site: uploaded config_overrides/$fname"
-        else
-            log "WARNING: off-site upload failed for config_overrides/$fname"
-            _T2_OK=false
-        fi
-    done < <(find config_overrides -maxdepth 1 -type f -name '*.local.yaml' -print0 2>/dev/null)
-
-    # Secrets is best-effort: a MISSING payload (no passphrase → no .gpg) is not an
-    # off-site failure (that path already fails the backup via _SQLITE_LINES=0); only a
-    # failed upload of a PRESENT payload flips _T2_OK.
-    if [ -f secrets/secrets.env.gpg ]; then
-        backend_mkdir "${_T2_DIR}/secrets"
-        if backend_put_verified "secrets/secrets.env.gpg" "${_T2_DIR}/secrets/secrets.env.gpg" "$GENESIS_BIG_TMP"; then
-            log "  off-site: uploaded secrets/secrets.env.gpg"
-        else
-            log "WARNING: off-site upload failed for secrets/secrets.env.gpg"
-            _T2_OK=false
-        fi
+fi
+if [ "$_T2_OK" = true ]; then
+    if ! transcript_pool_gc "$_T2_HOST_DIR" "$_T2_STAMP"; then
+        log "WARNING: transcript object GC deferred: incomplete or unreadable inventory; objects retained"
     fi
-
-    # Upload creds (encrypted credential + wiring files) so the COMPLETE snapshot
-    # genuinely includes them — a no-git fresh box pulls them from here (restore
-    # §8). One level of nesting: creds/*.gpg + creds/ssh/*.gpg (the card vault is
-    # the flat creds/payment_vault.tar.gpg); a failed upload of a present file
-    # flips _T2_OK, same contract as the payloads above.
-    if [ -d creds ]; then
-        backend_mkdir "${_T2_DIR}/creds"
-        [ -d creds/ssh ] && backend_mkdir "${_T2_DIR}/creds/ssh"
-        while IFS= read -r -d '' f; do
-            rel="${f#creds/}"
-            # The clone keeps the last good vault archive when this run's vault step
-            # did not succeed. The snapshot carries it under another name, so it is
-            # never presented as this run's vault, and never lost to GFS pruning of
-            # the earlier snapshot that holds it; COMPLETE records the gap.
-            if [ "$rel" = "$PAYMENT_VAULT_ARCHIVE" ] && [ "$_PV_STATUS" != ok ]; then
-                rel="$PAYMENT_VAULT_LAST_GOOD"
-            fi
-            if backend_put_verified "$f" "${_T2_DIR}/creds/${rel}" "$GENESIS_BIG_TMP"; then
-                log "  off-site: uploaded creds/${rel}"
-            else
-                log "WARNING: off-site upload failed for creds/${rel}"
-                _T2_OK=false
-            fi
-        done < <(find creds -type f -name '*.gpg' -print0 2>/dev/null)
-    fi
-
-    # Mark the snapshot COMPLETE only when every upload succeeded, so restore never
-    # picks a half-uploaded snapshot (it selects the latest COMPLETE one). If the
-    # marker itself fails to upload, the snapshot is unusable for restore — treat
-    # that as an off-site failure (partial + alert), not ok.
-    if [ "$_T2_OK" = true ]; then
-        _T2_MARKER=$(mktemp)  # uploaded only after a full snapshot
-        # The marker lists the extra archives this snapshot holds. restore.sh reads it
-        # back to know what to expect, because a failed off-site LISTING looks the same
-        # as an empty one, while a failed download of this file is detectable.
-        {
-            printf 'genesis-snapshot 1\ntranscript-pool 1\n'
-            for _n in "${_EXTRA_UPLOADED[@]+"${_EXTRA_UPLOADED[@]}"}"; do
-                printf 'extra %s\n' "$_n"
-            done
-            for _n in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do
-                printf 'skipped %s\n' "$_n"
-            done
-            for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do
-                printf 'partial %s\n' "$_n"
-            done
-            case "$_PV_STATUS" in
-                ok | absent) ;;
-                *) printf 'payment_vault %s\n' "$_PV_STATUS" ;;
-            esac
-        } > "$_T2_MARKER"
-        if ! backend_put_atomic "$_T2_MARKER" "${_T2_DIR}/COMPLETE" "$GENESIS_BIG_TMP"; then
-            log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
-            _T2_OK=false
-        fi
-        rm -f "$_T2_MARKER"
-    fi
-
-    if [ "$_T2_OK" = true ] && [ $((_EXTRA_UPLOAD_FAILED + _EXTRA_SKIPPED + _EXTRA_PARTIAL)) -gt 0 ]; then
-        # Core snapshot is COMPLETE and restorable, but the off-site copy is not the
-        # full set the operator asked for (an extra dir was not archived this run, or
-        # its archive did not upload), so it is not reported as confirmed.
-        _T2_STATUS="partial"
-        _T2_EXTRAS_ONLY_PARTIAL=true  # core is complete: retention still runs (below)
-        log "WARNING: Tier 2 snapshot ${_T2_STAMP} is COMPLETE but extra dirs are incomplete (${_EXTRA_SKIPPED} not archived, ${_EXTRA_PARTIAL} partial, ${_EXTRA_UPLOAD_FAILED} not uploaded)"
-    elif [ "$_T2_OK" = true ]; then
-        _T2_STATUS="ok"
-        log "Tier 2 backup copied to off-site snapshot ${_T2_STAMP} (backend: ${_T2_BACKEND})"
-    else
-        _T2_STATUS="partial"
-        log "WARNING: Tier 2 backup partially failed"
-    fi
-
-    # --- Tier 2 GFS retention prune (off-site dated snapshots only) --------------
-    # Keep daily 7 / weekly 4 / monthly 6 of the COMPLETE off-site snapshots. gfs_select
-    # ALWAYS keeps the newest (restore.sh selects the latest COMPLETE); we also skip the
-    # current run's stamp explicitly. Best-effort — a prune failure never fails the backup.
-    # Shared transcript objects remain while referenced by retained or incomplete
-    # pooled inventories. A safe sweep runs only after retention and publication.
-    # Only the off-site dated tree is touched; the local ~/backups git repo
-    # is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run, or
-    # one whose core is COMPLETE and only opt-in extra dirs are missing: otherwise a
-    # listed directory that stays missing would stop retention for good.
-    if { [ "${_T2_STATUS:-}" = "ok" ] || [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; } && backend_available; then
-        # DR-safety: the host segment flows into a DESTRUCTIVE backend_delete (smb deltree /
-        # local rm -rf), so refuse to prune unless it is the plain filename charset — then a
-        # pathological hostname can never break out of the snapshot path. (The stamps below
-        # are already grep-restricted to the timestamp charset.)
-        if ! printf '%s' "$_T2_HOST_DIR" | grep -qE '^Genesis/[A-Za-z0-9._-]+$'; then
-            log "WARNING: GFS prune skipped — unsafe off-site host path '$_T2_HOST_DIR'"
-        else
-            _gfs_complete="$(
-                for _st in $(backend_list_dirs "$_T2_HOST_DIR" 2>/dev/null \
-                                | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -u || true); do
-                    backend_exists "$_T2_HOST_DIR/$_st/COMPLETE" && printf '%s\n' "$_st"
-                done
-                true
-            )"
-            _gfs_delete="$(printf '%s\n' "$_gfs_complete" \
-                | python3 "$_SCRIPT_DIR/gfs_select.py" --daily 7 --weekly 4 --monthly 6)" || _gfs_delete=""
-            # Count COMPLETE snapshots present this run (grep -c . not `wc -l`,
-            # which counts 1 for an empty var). _T2_PRUNED tracks successful
-            # deletes; retained = total - pruned, surfaced in backup_status.json.
-            _T2_PRUNED=0
-            _T2_COMPLETE_TOTAL=$(printf '%s\n' "$_gfs_complete" | grep -c . || true)
-            for _st in $_gfs_delete; do
-                if [ "$_st" = "$_T2_STAMP" ]; then
-                    continue   # never the current run's snapshot
-                fi
-                if backend_delete "$_T2_HOST_DIR/$_st"; then
-                    _T2_PRUNED=$(( _T2_PRUNED + 1 ))
-                    log "GFS prune: removed off-site snapshot $_st"
-                else
-                    log "WARNING: GFS prune failed for off-site snapshot $_st"
-                fi
-            done
-            _T2_SNAPSHOT_COUNT=$(( _T2_COMPLETE_TOTAL - _T2_PRUNED ))
-        fi
-    fi
-    if [ "$_T2_OK" = true ]; then
-        if ! transcript_pool_gc "$_T2_HOST_DIR" "$_T2_STAMP"; then
-            log "WARNING: transcript object GC deferred: incomplete or unreadable inventory; objects retained"
-        fi
-    fi
-
 fi
 backend_cleanup
 
