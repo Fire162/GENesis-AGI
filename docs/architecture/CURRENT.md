@@ -3782,6 +3782,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   exact readback prefixes and completed receipts survive interruption. Original
   timestamp/age remain in stdout/status; COMPLETE requires all core receipts and
   exact final-marker acknowledgement. Optional extras retain their gap contract.
+  SMB command paths are admitted before durable freeze; incompatible required
+  names/transfer roots report incomplete without poisoning a new epoch. Existing
+  invalid pending state is retained, while failed optional extras remain gaps.
   The spool is outside Git/temp and excluded by extra-dir overlap checks.
   Initial freeze and indivisible upload limits remain explicit; native/live
   rollout and final post-review verification are not implied by local tests.

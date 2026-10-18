@@ -24,6 +24,15 @@ import transcript_archive as archive
 
 VERSION = 1
 CHUNK = 1024 * 1024
+_SMB_REFUSED = frozenset('";\\\r\n')
+
+
+def check_backend_paths(backend, *paths):
+    """Match backup_backends.sh _smb_paths_ok before freezing its arguments."""
+    if backend == "smb":
+        for value in paths:
+            if not _SMB_REFUSED.isdisjoint(value):
+                raise ValueError("backend: refusing smb path " + json.dumps(value))
 
 
 def regular(path):
@@ -106,6 +115,7 @@ class Publication:
                 or binding["host"] in ("Genesis/.", "Genesis/..")
                 or any(not isinstance(x, str) or not x for x in binding.values())):
             raise ValueError("invalid publication binding")
+        check_backend_paths(binding["backend"], str(self.spool), str(self.scratch))
         if (not isinstance(doc, dict) or type(doc.get("version")) is not int
                 or doc["version"] != VERSION or doc.get("binding") != binding
                 or not re.fullmatch(r"Genesis/[A-Za-z0-9._-]+/[0-9]{8}T[0-9]{6}Z", doc.get("snapshot", ""))
@@ -153,6 +163,9 @@ class Publication:
                 raise ValueError("required input was not frozen")
             if row["frozen"] is not None and regular(self.frozen(row)) != row["frozen"]:
                 raise ValueError("frozen publication input changed")
+            # Old failed extras are terminal gaps, never another transfer.
+            if not (row["role"] == "extra" and not row["required"] and row["failed"]):
+                check_backend_paths(binding["backend"], row["remote"])
 
     def open(self, binding, captures):
         self.reclaim()
@@ -232,6 +245,7 @@ class Publication:
         """Freeze core before authority; transcript copies then progress by row."""
         if self.pending.exists() or self.pending.is_symlink():
             raise ValueError("pending publication already exists")
+        check_backend_paths(binding["backend"], str(self.spool), str(self.scratch))
         backup = Path(backup).resolve()
         self.reclaim()
         stage = self.spool / (".freeze-" + uuid.uuid4().hex)
@@ -255,6 +269,8 @@ class Publication:
                        first_progress=True)
 
             def add(source, remote, role="core", required=True, digest=None, size=None):
+                remote = relative(remote)
+                check_backend_paths(binding["backend"], remote)
                 source = Path(source)
                 info = regular(source)
                 if size is not None and info[2] != size:
@@ -266,7 +282,7 @@ class Publication:
                         raise ValueError("conflicting publication targets")
                     return
                 row = dict(id=str(len(doc["rows"])), source=str(source), source_stat=info,
-                           remote=relative(remote), role=role, required=required,
+                           remote=remote, role=role, required=required,
                            size=info[2], digest=digest, frozen=None, put=role != "pool",
                            received=0, verified=0, generation=0, download_stat=None,
                            receipt=False, failed=False)

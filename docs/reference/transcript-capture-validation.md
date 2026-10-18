@@ -90,6 +90,24 @@ age remain visible in stdout/journald and `backup_status.json`'s
 existing safe projection; it does not display the new raw progress object.
 Newer transcript source changes wait for the next epoch.
 
+Initial inventory generation and all-core freezing must fit an allowed initial
+run. An interrupted unpublished freeze is reclaimed and that initial phase is
+repeated; cross-run row/receipt progress starts after pending becomes durable.
+There is no promise that arbitrarily large initial inventories or core inputs
+can finish within one two-hour window.
+
+SMB rejects quotes, semicolons, backslashes and CR/LF in its command path arguments.
+Required remote names and local transfer workspace roots are checked before a
+new frozen epoch becomes durable. Correcting an unsupported managed filename in
+the backups clone allows a later initialization attempt instead of retaining that
+unusable target. Renaming a plaintext producer alone does not remove an older
+encrypted filename already retained in that clone.
+An older authenticated pending epoch with an unusable required path is retained
+and reports incomplete for explicit resolution; it is never automatically
+discarded. Unsupported new optional extras become explicit gaps. Existing failed
+optional extras remain terminal gaps and do not acquire new core requirements.
+The local backend retains its ordinary filesystem pathname support.
+
 Uploads retry whole files; no upload-resume transport was added. If one upload
 cannot fit, that file remains incomplete for a later run. Downloads append via
 SMB `reget` or a local byte suffix. After a child finishes, including a failed

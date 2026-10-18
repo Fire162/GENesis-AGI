@@ -1200,7 +1200,7 @@ def test_the_local_manifest_is_rewritten_when_extras_are_unset(backup_env, tmp_p
 
 
 @pytest.mark.parametrize("component,name,diagnostic", [
-    ("memory", "semi;colon.md", r"semi\;colon.md"),
+    ("memory", "semi;colon.md", "semi;colon.md"),
     ("creds", 'q"uote.gpg', r'q\"uote.gpg'),
 ])
 def test_smb_offsite_refuses_a_name_that_could_leave_its_quotes(backup_env, component, name, diagnostic):
@@ -1221,5 +1221,5 @@ def test_smb_offsite_refuses_a_name_that_could_leave_its_quotes(backup_env, comp
     status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
     assert status["tier2_status"] == "partial", status
     assert status["offsite_confirmed"] is False and status["offsite_core_complete"] is False
-    assert (_repo(backup_env).parent / ".genesis-backup-publication/pending").is_dir()
+    assert not (_repo(backup_env).parent / ".genesis-backup-publication/pending").exists()
     assert not any("COMPLETE" in ln and "put" in ln for ln in cmds.splitlines()), cmds
