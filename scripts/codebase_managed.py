@@ -47,7 +47,6 @@ from codebase_managed_unit import (  # noqa: E402,F401
     loaded_properties,
     native_env,
     native_install,
-    parse_arguments as native_parse_arguments,
     parent_identity,
     sentinel_armed,
     systemctl_env,
@@ -56,6 +55,9 @@ from codebase_managed_unit import (  # noqa: E402,F401
     validate_frontend_boundary,
     validate_provider_paths,
     validate_source_identity,
+)
+from codebase_managed_unit import (  # noqa: E402
+    parse_arguments as native_parse_arguments,
 )
 
 SCRIPT = Path(__file__).resolve()
