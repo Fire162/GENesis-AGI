@@ -3260,8 +3260,9 @@ _write_state "health_check"
 # a recovery re-run — the server SHOULD come back and be health-verified; or (b)
 # the operator deliberately stopped it before updating — respect that, don't
 # start what they stopped. Distinguish via failure artifacts: a leftover
-# last_update_failure.json, or a last update_history status of rolled_back/failed
-# (or one that cannot be read), marks a recovery. Without the recovery push, the restart+health block below is
+# last_update_failure.json, or a last update_history status of rolled_back/failed,
+# or crashed_recovered (bootstrap undid a crashed update but never restarts the
+# server that update stopped), or one that cannot be read, marks a recovery. Without the recovery push, the restart+health block below is
 # skipped and we'd record "success" with the server down and no health check.
 _OPERATOR_STOP=false
 if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
@@ -3273,7 +3274,7 @@ if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
         # writes, not a fixed home path, and any interpreter that can read it.
         _last_status="$(_latest_update_status)"
         case "$_last_status" in
-            rolled_back | failed) _recovery=true ;;
+            rolled_back | failed | crashed_recovered) _recovery=true ;;
             unreadable)
                 # Unknown is not "nothing failed". Recovering costs a restart and
                 # a health check (with rollback on failure); guessing "operator

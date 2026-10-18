@@ -147,7 +147,9 @@ def test_p6_treats_an_unreadable_status_as_a_recovery() -> None:
 
     Recovery costs a restart plus a health check with rollback on failure;
     reading unknown as an operator stop would record success over what may be a
-    live failure. Allowlist: exactly these three statuses recover, nothing else.
+    live failure. Allowlist: exactly these four statuses recover, nothing else
+    (crashed_recovered: bootstrap undid a crashed update and left its stopped
+    server down).
     """
     text = UPDATE.read_text()
     # Word boundary: `_nd_last_status=…` (the no-delta site) contains this name.
@@ -162,7 +164,7 @@ def test_p6_treats_an_unreadable_status_as_a_recovery() -> None:
         if "_recovery=true" in body
         for status in label.split("|")
     )
-    assert recovering == ["failed", "rolled_back", "unreadable"]
+    assert recovering == ["crashed_recovered", "failed", "rolled_back", "unreadable"]
 
 
 def test_no_delta_path_never_records_success_over_an_unresolved_failure() -> None:

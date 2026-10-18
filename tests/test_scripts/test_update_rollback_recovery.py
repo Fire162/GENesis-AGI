@@ -81,7 +81,7 @@ def test_recovery_detection_forces_server_restart(text: str) -> None:
     # Between health_check state and the restart block.
     seg = text[text.find('_write_state "health_check"') : text.find("# ── Restart services")]
     assert "last_update_failure.json" in seg, "recovery detection checks the failure artifact"
-    assert "rolled_back | failed)" in seg, "and the last update_history status"
+    assert "rolled_back | failed | crashed_recovered)" in seg, "and the last update_history status"
     assert 'WERE_RUNNING+=("genesis-server")' in seg, (
         "a recovery run forces genesis-server to restart"
     )
@@ -179,6 +179,9 @@ def test_recovery_run_from_failure_artifact(tmp_path: Path, text: str) -> None:
 def test_recovery_run_from_failed_status(tmp_path: Path, text: str) -> None:
     assert _run_recovery(tmp_path, text, artifact=False, last_status="failed") is True
     assert _run_recovery(tmp_path, text, artifact=False, last_status="rolled_back") is True
+    # bootstrap's crash recovery records this and never restarts genesis-server,
+    # so the server an update stopped is still down: the next run must restore it.
+    assert _run_recovery(tmp_path, text, artifact=False, last_status="crashed_recovered") is True
 
 
 def test_operator_stop_is_not_a_recovery(tmp_path: Path, text: str) -> None:
