@@ -1475,6 +1475,10 @@ the shared banner is not an assertion about all concurrent sessions.
   independently of the boot manifest. External health accepts only a sample from
   the active primary server's MainPID observed within 90 seconds. Authenticated
   health probes return 503 with readiness details when enabled but unready.
+  The existing awareness tick records readiness incidents and sends ordered
+  outage/recovery Telegram notices. Unknown readings preserve an open incident;
+  deliberate disablement closes it quietly. Incident/phase delivery history
+  supplies durable retry deduplication without a second queue.
   `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
   existing Flask/runtime loop: it atomically persists native receipts, binds
   contexts and retries to relationship epochs, and admits at most two
