@@ -30,7 +30,8 @@ Every refusal raises BEFORE anything is changed:
 - with ``foreign_keys=ON``, a table declaring a FOREIGN KEY to update_history:
   DROP TABLE would run an implicit DELETE that fails or cascades into its rows.
 
-Idempotent: skipped when the live DDL already allows ``'crashed_recovered'``.
+Idempotent: skipped when the live table already carries this migration's
+status CHECK (compared as parsed expressions, not as a substring).
 No ``db.commit()`` — the runner owns the transaction.
 """
 
@@ -384,11 +385,23 @@ async def _rebuild(db: aiosqlite.Connection, *, statuses: str, remap_crashed: bo
         await db.execute(stmt)
 
 
+def _has_wide_status_check(ddl: str) -> bool:
+    """Does the live table carry THIS migration's status CHECK?
+
+    Compared as parsed CHECK expressions, never as a substring: the literal
+    'crashed_recovered' elsewhere in the DDL (a DEFAULT, a comment, another
+    column's CHECK) must not mark a still-narrow status constraint as migrated.
+    Any other shape is rebuilt, and the rebuild refuses what it does not know.
+    """
+    live_checks = set(_ddl_features(ddl)[0])
+    return set(_canonical_shape(_WIDE_STATUSES)["checks"]) <= live_checks
+
+
 async def up(db: aiosqlite.Connection) -> None:
     ddl = await _live_ddl(db)
     if ddl is None:
         return  # Table absent — defensive guard for non-sequential edge cases
-    if "'crashed_recovered'" in ddl:
+    if _has_wide_status_check(ddl):
         return  # Already has the expanded constraint
     await _rebuild(db, statuses=_WIDE_STATUSES)
 
@@ -401,6 +414,6 @@ async def down(db: aiosqlite.Connection) -> None:
     what happened, so the row is kept under the closest older status.
     """
     ddl = await _live_ddl(db)
-    if ddl is None or "'crashed_recovered'" not in ddl:
+    if ddl is None or not _has_wide_status_check(ddl):
         return  # Absent or already reverted
     await _rebuild(db, statuses=_NARROW_STATUSES, remap_crashed=True)

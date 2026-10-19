@@ -351,3 +351,34 @@ async def test_a_trigger_on_another_table_naming_update_history_is_recreated(con
     await conn.execute("INSERT INTO ping VALUES ('via-trigger')")
     cursor = await conn.execute("SELECT status FROM update_history WHERE id = 'via-trigger'")
     assert (await cursor.fetchone())[0] == "crashed_recovered"
+
+
+@pytest.mark.asyncio
+async def test_the_literal_in_another_clause_does_not_skip_the_migration(conn) -> None:
+    """The skip test reads the status CHECK, not the whole DDL: a DEFAULT naming
+    'crashed_recovered' beside a still-narrow status CHECK must not be recorded
+    as migrated. Here the rebuild refuses the DEFAULT it would drop, loudly."""
+    await _recreate_with(conn, "failure_reason TEXT", "failure_reason TEXT DEFAULT 'crashed_recovered'")
+    mod = importlib.import_module(MIGRATION)
+    with pytest.raises(RuntimeError, match="Nothing was changed"):
+        await mod.up(conn)
+
+
+@pytest.mark.asyncio
+async def test_the_literal_in_a_comment_does_not_skip_the_migration(conn) -> None:
+    await _recreate_with(conn, "rollback_tag TEXT", "rollback_tag TEXT -- not 'crashed_recovered'\n")
+    mod = importlib.import_module(MIGRATION)
+    await mod.up(conn)
+    await conn.execute(_INSERT, _CRASH_ROW)
+    await conn.commit()
+    assert _CRASH_ROW in await _rows(conn)
+
+
+@pytest.mark.asyncio
+async def test_down_reads_the_status_check_too(conn) -> None:
+    """down() on a narrow table that mentions the literal elsewhere is a no-op."""
+    await _recreate_with(conn, "rollback_tag TEXT", "rollback_tag TEXT -- not 'crashed_recovered'\n")
+    ddl_before = await _ddl(conn)
+    mod = importlib.import_module(MIGRATION)
+    await mod.down(conn)
+    assert await _ddl(conn) == ddl_before

@@ -1296,3 +1296,21 @@ def test_a_failed_crash_record_is_reported_on_stderr_and_stays_non_fatal(tmp_pat
     _assert_recovered(proc, state_path, root, rollback)
     assert "failed to record crash recovery" in proc.stderr
     assert "no such table: update_history" in proc.stderr
+
+
+def test_a_crash_recovered_twice_from_the_same_state_is_recorded_once(tmp_path):
+    """A bootstrap killed after the INSERT commits but before the state file is
+    removed re-reads the same state; the row id is derived from that run, so the
+    second recovery adds nothing. A different run still gets its own row."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    db = _migrated_genesis_root(tmp_path, root)
+    run = {"own_head": deploy, "deploy_head": deploy, "started_at": "2026-10-18T20:00:00+00:00"}
+    first, _ = _recover(tmp_path, root, **run)
+    assert first.returncode == 0, first.stderr
+    again, state_path = _recover(tmp_path, root, **run)  # same state, as if re-read
+    _assert_recovered(again, state_path, root, rollback)
+    assert len(_history(db)) == 1
+    other, _ = _recover(tmp_path, root, **{**run, "started_at": "2026-10-18T21:00:00+00:00"})
+    assert other.returncode == 0, other.stderr
+    assert len(_history(db)) == 2
