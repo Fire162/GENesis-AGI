@@ -1,1 +1,1 @@
-- Add read-only managed worker availability checks for configuration, readiness and namespace-local write prerequisites, including persistence-specific storage.
+- Add read-only managed worker availability checks for configuration, readiness and namespace-local write prerequisites, including persistence-specific storage. Preserve the installed virtualenv selection in the indexing runner's checks.

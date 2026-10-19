@@ -44,8 +44,10 @@ starting, rechecks and refreshes accepted sources again, then starts and verifie
 native readiness. Backend argv must match
 the installed positional bridge, including its `no-env-expand` flag; auxiliary
 execution commands refuse. A custom installation must supply the same absolute
-`VENV_PATH` used by `install.sh` when invoking `enable`; otherwise the configured
-main checkout's `.venv` is expected. Disable/remove do not require that variable.
+`VENV_PATH` used by `install.sh` when invoking `enable` or `available`; otherwise
+the configured main checkout's `.venv` is expected. The rendered indexing runner
+exports that same literal selection to its child processes.
+Disable/remove do not require that variable.
 Missing typed manager properties, unsupported native namespace layouts or unavailable
 `busctl` refuse activation. Installation calls cannot fall back to a client-side
 reader. Current canonical templates are the authority, not a partial directive
