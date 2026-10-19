@@ -251,6 +251,77 @@ PY
     _STATE_PHASE="$phase"
 }
 
+# BEGIN restart-owed (extracted by tests/test_scripts/test_bootstrap_crash_restart.py)
+# The restart an update owes genesis-server (#3451). Written immediately before
+# this run stops the server; removed only by update.sh, once the server is back
+# (health-checked on the success and no-delta paths, active after the pre-stop
+# interrupt handler restarted it), or when the unit has come up since it was
+# written (_server_recovery_pending). Present while genesis-server is not running, it
+# tells the next run "an update stopped this and nothing brought it back". A kill
+# anywhere after the stop leaves it, a power loss included (which runs no handler),
+# whatever state file that kill left and whether or not bootstrap's crash recovery
+# ever reads one: the next update overwrites a "fetching" state it is allowed past,
+# so that recovery often never runs. A server no update stopped has no such file,
+# so an operator's stop stays a stop. Nothing else reads it, and nothing consumes
+# it: the alert record (last_update_failure.json) is separate, because the version
+# collector archives that one.
+SERVER_RESTART_OWED="$HOME/.genesis/server_restart_owed.json"
+_owe_server_restart() {
+    mkdir -p "$HOME/.genesis" 2>/dev/null || true
+    if ! { printf '{"pid": %s, "started_at": "%s", "timestamp": "%s"}\n' \
+            "$$" "${STARTED_AT:-}" "$(date -Iseconds)" > "$SERVER_RESTART_OWED.tmp" \
+        && mv -f "$SERVER_RESTART_OWED.tmp" "$SERVER_RESTART_OWED"; } 2>/dev/null; then
+        echo "  WARNING: could not write $SERVER_RESTART_OWED: if this run dies after the stop, the next update reads the stopped genesis-server as operator-stopped." >&2
+    fi
+}
+# Is genesis-server, which is NOT running, owed a restart? Prints why and returns
+# 0; returns 1 when nothing says an update left it down, so it stays as the
+# operator left it. The one predicate for recovery detection and the no-delta
+# dispatch, so the two cannot disagree. (_latest_update_status is defined below.)
+_server_recovery_pending() {
+    if [ -e "$SERVER_RESTART_OWED" ]; then
+        # Paid already if the unit came up AFTER the file was written: something
+        # else restarted the server since (the watchdog, a deploy_code_only.sh
+        # restart, a start by hand, this script's conflict exit or rollback), and
+        # a server down now was stopped after that, by someone else. Derived from
+        # the unit's own record, so every restarter is covered without each one
+        # having to retire the file. Anything unreadable (no bus, "n/a", a unit
+        # never started) reads as "not since", which keeps the restart owed. An
+        # empty value must not reach `date -d`, which reads "" as midnight today.
+        local _owed_at _up _up_at=0
+        _owed_at="$(stat -c %Y "$SERVER_RESTART_OWED" 2>/dev/null || echo 0)"
+        _up="$(systemctl --user show genesis-server.service -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+        if [ -n "$_up" ]; then
+            _up_at="$(date -d "$_up" +%s 2>/dev/null || echo 0)"
+        fi
+        if [ "$_up_at" -gt "$_owed_at" ] 2>/dev/null; then
+            rm -f "$SERVER_RESTART_OWED"
+        else
+            echo "an earlier update stopped genesis-server and never verified it back"
+            return 0
+        fi
+    fi
+    if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
+        echo "a prior update's failure record is present"
+        return 0
+    fi
+    case "$(_latest_update_status)" in
+        rolled_back | failed)
+            echo "the last update did not complete cleanly"
+            return 0
+            ;;
+        unreadable)
+            # Unknown is not "nothing failed". Recovering costs a restart and a
+            # health check (with rollback on failure); guessing "operator stop"
+            # would record success over what may be a live failure.
+            echo "the last update's status could not be read"
+            return 0
+            ;;
+    esac
+    return 1
+}
+# END restart-owed
+
 # The marker half of _clear_deploy_state, alone: what a run releases when the
 # state file is not its to delete.
 _clear_deploy_marker() {
@@ -331,6 +402,12 @@ _on_signal_prestop() {
             systemctl --user start "$_svc.service" 2>/dev/null || true
         fi
     done
+    # The server is running again, so the restart owed for it (restart-owed) is
+    # paid. A server still down keeps the file for the next update to restore.
+    if [ -e "${SERVER_RESTART_OWED:-}" ] \
+        && systemctl --user is-active --quiet genesis-server.service 2>/dev/null; then
+        rm -f "$SERVER_RESTART_OWED"
+    fi
     # On `live` this run writes no state before the stop, so a state file on disk
     # is another run's and stays; the rebuild may have moved `live` already.
     [ "${ON_LIVE:-0}" != 1 ] || _live_abandon 1
@@ -1889,6 +1966,17 @@ done
 
 # Now stop them. From here a SIG* runs _on_signal_prestop, which restarts
 # WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
+#
+# First put on disk what is about to be stopped, so a kill at any point after the
+# stop leaves a record of it (#3451): the state's services_stopped, which
+# bootstrap's crash recovery reports the crash from (the "fetching" state above was
+# written before anything was inspected), and below, for genesis-server, the
+# restart this run now owes. Same phase, so every reader of the state treats it as
+# before. Not on `live`, which writes no state before the stop (see the "fetching"
+# write); the restart obligation is written there too.
+if [ "${ON_LIVE:-0}" != 1 ]; then
+    _write_state "fetching"
+fi
 if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # Pause the host Guardian BEFORE the stop so it never sees the restart as an
     # outage. Best-effort. The resume rides the EXIT trap, COMPOSED with the
@@ -1902,6 +1990,7 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
         trap '_live_prestop_exit; _guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
     fi
     _guardian_pause
+    _owe_server_restart
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
     # back during the merge/migration window. The ERR-trap rollback is not armed
@@ -2940,6 +3029,14 @@ if _nothing_new && [ -n "$GENESIS_TAKE_TEMPLATES" ]; then
 elif _nothing_new && _tier2_pending_since_baseline; then
     echo "  No new commits, but update.sh-only paths changed since the last recorded"
     echo "  update — running full activation (bootstrap + migrations + restart)."
+elif _nothing_new && [[ " ${WERE_RUNNING[*]} " != *" genesis-server "* ]] \
+    && _nd_recovery_why="$(_server_recovery_pending)"; then
+    # The branch below restarts only what this run stopped and verifies nothing,
+    # so a server a prior update left down (#3451) would stay down. Run the full
+    # activation: its recovery detection restores genesis-server, and the restart
+    # block health-checks it and rolls back on failure.
+    echo "  No new commits, but genesis-server is down and $_nd_recovery_why —"
+    echo "  running full activation (bootstrap + migrations + restart + health check)."
 elif _nothing_new; then
     echo "  Already up to date ($NEW_COMMIT)."
     # Clean up unnecessary rollback tag and disarm trap
@@ -3010,6 +3107,8 @@ elif _nothing_new; then
     _nd_server_not_restarted=true
     if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]] && _server_health_ok; then
         _nd_server_not_restarted=false
+        # Back and answering: the restart this run owed (restart-owed) is paid.
+        rm -f "$SERVER_RESTART_OWED"
     fi
     _nd_base_degraded="${HOST_CC_DEGRADED:-$PRE_UPDATE_DEGRADED}"
     _nd_degraded="$(_success_degraded_subsystems \
@@ -3255,38 +3354,25 @@ fi
 _write_state "health_check"
 
 # ── Recovery detection ────────────────────────────────────
-# An empty WERE_RUNNING means the server wasn't running when THIS update started.
-# Two very different causes: (a) a PRIOR failed update left it stopped and this is
-# a recovery re-run — the server SHOULD come back and be health-verified; or (b)
-# the operator deliberately stopped it before updating — respect that, don't
-# start what they stopped. Distinguish via failure artifacts: a leftover
-# last_update_failure.json, or a last update_history status of rolled_back/failed
-# (or one that cannot be read), marks a recovery. Without the recovery push, the restart+health block below is
-# skipped and we'd record "success" with the server down and no health check.
+# genesis-server absent from WERE_RUNNING means it wasn't running when THIS update
+# started. Two very different causes: (a) a PRIOR update left it stopped and this
+# is a recovery re-run — the server SHOULD come back and be health-verified; or (b)
+# the operator deliberately stopped it before updating — respect that, don't start
+# what they stopped. _server_recovery_pending (restart-owed) tells them apart: the
+# restart an update owes it, a leftover last_update_failure.json, or a last
+# update_history status of rolled_back/failed (or one that cannot be read) marks a
+# recovery. Without the recovery push, the restart+health block below is skipped
+# and we'd record "success" with the server down and no health check.
+#
+# The test is genesis-server's MEMBERSHIP, not an empty WERE_RUNNING: genesis-bridge
+# is the fallback that runs precisely while the server is down, so a running bridge
+# used to hide every recovery (#3451). The server goes FIRST, so the bridge started
+# after it yields to it (the verification below expects that).
 _OPERATOR_STOP=false
-if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
-    _recovery=false
-    if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
-        _recovery=true
-    else
-        # The shared reader (deploy-outcome-probes): the database update.sh itself
-        # writes, not a fixed home path, and any interpreter that can read it.
-        _last_status="$(_latest_update_status)"
-        case "$_last_status" in
-            rolled_back | failed) _recovery=true ;;
-            unreadable)
-                # Unknown is not "nothing failed". Recovering costs a restart and
-                # a health check (with rollback on failure); guessing "operator
-                # stop" would record success over what may be a live failure.
-                echo "  Last update status could not be read — treating this as a recovery run."
-                _recovery=true
-                ;;
-            *) : ;;
-        esac
-    fi
-    if [ "$_recovery" = "true" ]; then
-        echo "  Recovery run: a prior update did not complete cleanly — restoring genesis-server."
-        WERE_RUNNING+=("genesis-server")
+if [[ " ${WERE_RUNNING[*]} " != *" genesis-server "* ]]; then
+    if _recovery_why="$(_server_recovery_pending)"; then
+        echo "  Recovery run: $_recovery_why — restoring genesis-server."
+        WERE_RUNNING=("genesis-server" "${WERE_RUNNING[@]}")
     else
         _OPERATOR_STOP=true
     fi
@@ -3562,6 +3648,13 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     for svc in "${WERE_RUNNING[@]}"; do
         if systemctl --user is-active --quiet "$svc.service" 2>/dev/null; then
             echo "  OK: $svc"
+        elif [ "$svc" = "genesis-bridge" ] \
+            && [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]] \
+            && systemctl --user is-active --quiet genesis-server.service 2>/dev/null; then
+            # The bridge is the fallback for a DOWN server: started after the
+            # server, it exits by design (exit 200, never restarted). Reached when a
+            # recovery run restores the server the bridge was standing in for.
+            echo "  OK: $svc yielded to genesis-server (it runs only while the server is down)"
         else
             echo "  FAILED: $svc — check: systemctl --user status $svc.service"
             SVC_FAILED+=("$svc")
@@ -3663,6 +3756,11 @@ if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
     rm -f "$HOME/.genesis/last_update_failure.json"
     echo "  Cleared previous update failure context"
 fi
+# genesis-server was restarted and passed the health check above (a failure there
+# rolled back): the restart owed for it (restart-owed) is paid.
+if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+    rm -f "$SERVER_RESTART_OWED"
+fi
 
 # ── Record success in update_history ─────────────────────
 # Container update succeeded; $HOST_CC_DEGRADED (if set) flags a host-side
@@ -3672,13 +3770,11 @@ if [ -n "$HOST_CC_DEGRADED" ]; then
 fi
 # If genesis-server was not restarted, it was NOT health-verified either — record
 # that in the degraded column so this isn't a bare "success" that hides a down
-# server. The test is MEMBERSHIP of genesis-server in WERE_RUNNING, not
-# `_OPERATOR_STOP`: that flag is true only when WERE_RUNNING is ENTIRELY empty,
-# and genesis-bridge also populates the array — the bridge runs precisely WHEN
-# genesis-server is down, so a bridge-up/server-down run left `_OPERATOR_STOP`
-# false and wrote a bare success row. The no-delta writers use the same helper,
-# so all three success writers agree on what the marker means. `_OPERATOR_STOP`
-# keeps its own, narrower meaning for the operator-stopped NOTE just below.
+# server. The test is MEMBERSHIP of genesis-server in WERE_RUNNING, the same test
+# recovery detection uses (it sets `_OPERATOR_STOP` exactly when it leaves the
+# server out), so a bridge-up/server-down run is covered either way. The no-delta
+# writers use the same helper, so all three success writers agree on what the
+# marker means. `_OPERATOR_STOP` drives the operator-stopped NOTE just below.
 _p6_server_not_restarted=false
 [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]] \
     || _p6_server_not_restarted=true

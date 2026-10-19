@@ -191,6 +191,8 @@ PY
                 printf '%s\n' "$dirty_paths" | sed 's/^/    /'
             fi
             echo "  The checkout is already at $ROLLBACK_TAG on $recovery_branch; nothing to undo."
+            _crash_code_action="unmoved"
+            [ -z "$dirty_paths" ] || _crash_code_action="unmoved-dirty"
         elif [ "$ORIGINAL_BRANCH_PRESENT" != "1" ]; then
             _crash_recovery_refuse "old-format update state and the checkout has moved from its rollback tag"
         else
@@ -221,6 +223,7 @@ PY
                 _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"
             fi
             echo "  Recovery checkout returned $ORIGINAL_BRANCH to $ROLLBACK_TAG."
+            _crash_code_action="returned"
         fi
 
         # Record crash recovery
@@ -274,15 +277,17 @@ PY
             fi
         fi
 
-        # bootstrap never starts genesis-server. If the crashed update had stopped
-        # it, the next update.sh finds nothing running, and without a failure
-        # artifact it reads that as an operator stop: server left down, success
-        # recorded, no health check (#3451). So leave update.sh's own artifact,
-        # last_update_failure.json in its writer's format, which its recovery
-        # detection reads as "restore genesis-server and health-check it". Only
-        # when the state says the server was stopped: a crash before the stop
-        # (fetching) leaves an operator's stop alone. An existing file (update.sh's
-        # own rollback record) is never replaced.
+        # bootstrap never starts genesis-server. What restores a server the crashed
+        # update stopped is the restart that update recorded it owed, before the
+        # stop (update.sh, restart-owed), which only update.sh retires (#3451).
+        # This reports the crash: update.sh's own failure record,
+        # last_update_failure.json in its writer's format, which the dashboard
+        # shows and the version collector alerts on (and then archives; the
+        # restart does not depend on it). update.sh's recovery detection also reads
+        # it, which an update.sh from before restart-owed relies on. Only when the
+        # state says the server was stopped: a crash before the stop leaves an
+        # operator's stop alone. An existing file (update.sh's own rollback record)
+        # is never replaced.
         FAILURE_FILE="$HOME/.genesis/last_update_failure.json"
         if [ "$STATE_SERVER_STOPPED" = "1" ] && [ ! -e "$FAILURE_FILE" ]; then
             _crash_new_tag="untagged"
@@ -292,16 +297,26 @@ PY
                 _crash_new_commit="$(git -C "$GENESIS_ROOT" rev-parse --short "$DEPLOY_HEAD" 2>/dev/null || true)"
             fi
             if python3 -I - "$UPDATE_STATE" "$FAILURE_FILE" "$_crash_new_tag" "$_crash_new_commit" \
-                "$recovery_branch" <<'PY'
+                "$recovery_branch" "${_crash_code_action:-returned}" <<'PY'
 import json
 import sys
 from datetime import datetime
 
-state_path, failure_path, new_tag, new_commit, branch = sys.argv[1:]
+state_path, failure_path, new_tag, new_commit, branch, action = sys.argv[1:]
 with open(state_path, encoding="utf-8") as f:
     state = json.load(f)
 phase = state.get("phase", "unknown")
 rollback_tag = state.get("rollback_tag", "")
+# What the recovery above did to the code: moved it back to the tag, found it
+# there already, or found it there with tracked paths changed (left as they are).
+done = {
+    "returned": f"which returned the code to {rollback_tag}",
+    "unmoved": f"which found the code still at {rollback_tag}",
+    "unmoved-dirty": (
+        f"which found the code at {rollback_tag} with tracked files changed, "
+        "and left them as they are"
+    ),
+}[action]
 # The keys and value types of update.sh's writer (its _do_rollback).
 data = {
     "old_tag": state.get("old_tag", ""),
@@ -311,14 +326,14 @@ data = {
     "rollback_tag": rollback_tag,
     "reason": (
         f"Update crashed in phase '{phase}' after stopping genesis-server; "
-        f"recovered by bootstrap.sh, which returned the code to {rollback_tag}. "
+        f"recovered by bootstrap.sh, {done}. "
         "genesis-server was not restarted; the next update restarts and health-checks it."
     ),
     "degraded_subsystems": "",
     "original_branch": branch,
-    # The checkout is back at the rollback tag (recovered above); the rest of
-    # this bootstrap reinstalls that code.
-    "rollback_complete": True,
+    # The checkout is at the rollback tag (recovered above), and the rest of this
+    # bootstrap reinstalls that code; not complete when tracked files differ.
+    "rollback_complete": action != "unmoved-dirty",
     "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
 }
 # "x": never replace a file another writer created since the check above.
@@ -328,7 +343,7 @@ PY
             then
                 echo "  genesis-server was stopped by the crashed update; the next update.sh run restarts and health-checks it."
             else
-                echo "  WARNING: could not write $FAILURE_FILE; the next update.sh run will treat the stopped genesis-server as operator-stopped. Start it with: systemctl --user start genesis-server.service" >&2
+                echo "  WARNING: could not write $FAILURE_FILE; this crash is not reported as an update failure. genesis-server may still be down; start it with: systemctl --user start genesis-server.service" >&2
             fi
         fi
 
