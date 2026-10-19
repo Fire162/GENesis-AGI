@@ -3395,7 +3395,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: da43da6e4f73 2026-10-17
+verified: 96e0a4de31a8 2026-10-18
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3425,8 +3425,18 @@ tool-disabled CC probe without changing its schedule or routing authority.
   short-lived subprocess so the event loop never waits on it (a thread stalled
   the loop for the whole decrypt here). Every unlock, lock,
   refusal and relock lands in `payment_vault_events` with the requesting pid
-  and process names; unlock fails closed without that audit row. Nothing
-  decrypts a card yet. Backup: `scripts/lib/payment_vault_backup.sh` from
+  and process names; unlock fails closed without that audit row.
+  `approval.py` `PaymentApprovalRegistry` (created in `serve()`, audited
+  through the vault service's own connection, bot attached after Telegram
+  starts) asks the owner to approve a card release: a code-built,
+  `parse_mode=None` message with one `payapprove:<nonce>` button. A tap
+  grants only from the first `TELEGRAM_ALLOWED_USERS` id, on that exact chat,
+  message id and text, unedited and accessible, once; anything else, a missing
+  bot or audit, or 10 minutes without a tap refuses. Nonces live in memory
+  only; no `approval_requests` row is written, and the type is in the gate's
+  approve-all denylist, `refuse_generic` and both dashboard filters. Nothing
+  calls it or decrypts a card yet.
+  Backup: `scripts/lib/payment_vault_backup.sh` from
   backup.sh §8 writes the three files as ONE GPG-encrypted tar,
   `creds/payment_vault.tar.gpg`, renamed into place once (cards.db via SQLite
   online backup, under the vault's directory lock, only when the set passes the
