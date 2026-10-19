@@ -268,11 +268,19 @@ PY
 # so an operator's stop stays a stop. Nothing consumes it: the alert record
 # (last_update_failure.json) is separate, because the version collector archives
 # that one.
+#
+# Its "stage" says whether the stop it records was CONFIRMED. "stopping" is
+# written before the stop: the stop's own kill can make systemd's
+# Restart=on-failure bring the server back before _ensure_server_down stops it for
+# good, so an activation after a "stopping" record may be the stop's own and pays
+# nothing. "stopped" is rewritten (with a fresh mtime) once the server is
+# confirmed down: only an activation after THAT pays the debt.
 SERVER_RESTART_OWED="$HOME/.genesis/server_restart_owed.json"
 _owe_server_restart() {
+    local stage="${1:-stopping}"
     mkdir -p "$HOME/.genesis" 2>/dev/null || true
-    if ! { printf '{"pid": %s, "started_at": "%s", "timestamp": "%s"}\n' \
-            "$$" "${STARTED_AT:-}" "$(date -Iseconds)" > "$SERVER_RESTART_OWED.tmp" \
+    if ! { printf '{"pid": %s, "started_at": "%s", "timestamp": "%s", "stage": "%s"}\n' \
+            "$$" "${STARTED_AT:-}" "$(date -Iseconds)" "$stage" > "$SERVER_RESTART_OWED.tmp" \
         && mv -f "$SERVER_RESTART_OWED.tmp" "$SERVER_RESTART_OWED"; } 2>/dev/null; then
         rm -f "$SERVER_RESTART_OWED.tmp" 2>/dev/null || true
         echo "  ERROR: could not write $SERVER_RESTART_OWED." >&2
@@ -311,7 +319,10 @@ _server_recovery_pending() {
     case "$_up_at" in '' | *[!0-9]*) _up_at=0 ;; esac
     if [ -e "$SERVER_RESTART_OWED" ]; then
         _at="$(stat -c %Y "$SERVER_RESTART_OWED" 2>/dev/null || echo 0)"
-        if _evidence_current "$_at" "$_up_at"; then
+        # Only a record of a CONFIRMED stop can be paid by an activation: one
+        # still "stopping" (or unreadable, or of no known stage) stays owed.
+        if ! grep -q '"stage": "stopped"' "$SERVER_RESTART_OWED" 2>/dev/null \
+            || _evidence_current "$_at" "$_up_at"; then
             echo "an earlier update stopped genesis-server and never verified it back"
             return 0
         fi
@@ -381,10 +392,11 @@ _clear_deploy_state() {
 # clear this run's state/marker and exit. Swapped for _on_signal (rollback)
 # once the ERR trap arms. Defined here so it exists before its trap install.
 _on_signal_prestop() {
-    local sig="$1"
+    # $2: why, when called directly rather than by a signal.
+    local sig="$1" why="${2:-}"
     trap - INT TERM
     echo "" >&2
-    echo "  Update interrupted by SIG$sig before the merge — restoring any stopped services and cleaning up." >&2
+    echo "  ${why:-Update interrupted by SIG$sig} before the merge — restoring any stopped services and cleaning up." >&2
     # The interrupt may have landed mid-stop (the stop polls up to ~10s), so a
     # service may already be down. Restart exactly what was detected running —
     # WERE_RUNNING is populated BEFORE the physical stop — so the server is never
@@ -2047,6 +2059,16 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
         # we are intentionally leaving stopped (we could not cleanly stop it).
         trap - INT TERM
         exit 1
+    fi
+    # The stop is confirmed: date the record from NOW, as "stopped" (see
+    # restart-owed). The stop's own kill may have let systemd restart the server
+    # before _ensure_server_down stopped it for good, and that activation must not
+    # read as someone else bringing it back. If the record cannot be rewritten,
+    # the run must not go on with a debt that is still "stopping", and must not
+    # leave the server down either: restore what was stopped and exit, exactly as
+    # an interrupt here does (nothing is merged yet).
+    if ! _owe_server_restart stopped; then
+        _on_signal_prestop TERM "Could not record the confirmed stop of genesis-server"
     fi
 fi
 for svc in "${WERE_RUNNING[@]}"; do

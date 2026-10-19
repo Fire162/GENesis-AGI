@@ -372,8 +372,14 @@ PY
         # stopped.
         OWED_FILE="$HOME/.genesis/server_restart_owed.json"
         if [ "$STATE_SERVER_STOPPED" = "1" ] && [ ! -e "$OWED_FILE" ]; then
-            if printf '{"pid": %s, "started_at": "", "timestamp": "%s"}\n' \
-                    "$STATE_PID" "$(date -Iseconds)" > "$OWED_FILE.tmp" 2>/dev/null \
+            # A "fetching" state was written before the stop, so its time does not
+            # mark a CONFIRMED stop: "stopping", which no activation pays (the stop's
+            # own kill can let systemd restart the server). Every later phase is
+            # written after the confirmed stop: "stopped".
+            _owed_stage="stopped"
+            [ "$STATE_PHASE" != "fetching" ] || _owed_stage="stopping"
+            if printf '{"pid": %s, "started_at": "", "timestamp": "%s", "stage": "%s"}\n' \
+                    "$STATE_PID" "$(date -Iseconds)" "$_owed_stage" > "$OWED_FILE.tmp" 2>/dev/null \
                 && touch -r "$UPDATE_STATE" "$OWED_FILE.tmp" 2>/dev/null \
                 && mv -f "$OWED_FILE.tmp" "$OWED_FILE" 2>/dev/null; then
                 echo "  Recorded the restart the crashed update owes genesis-server."

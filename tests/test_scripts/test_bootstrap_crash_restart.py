@@ -256,7 +256,12 @@ case "$name" in
 esac
 for arg in "$@"; do
     if [ "$arg" = show ]; then
-        printf '%s\n' "${FAKE_ACTIVE_ENTER:-}"
+        # A unit the test restarts mid-run keeps its activation time in a file.
+        if [ -n "${FAKE_ACTIVE_ENTER_FILE:-}" ] && [ -f "$FAKE_ACTIVE_ENTER_FILE" ]; then
+            cat "$FAKE_ACTIVE_ENTER_FILE"
+        else
+            printf '%s\n' "${FAKE_ACTIVE_ENTER:-}"
+        fi
         exit 0
     fi
     if [ "$arg" = is-active ]; then
@@ -289,6 +294,7 @@ def _sh(tmp_path: Path, home: Path, script: str, *, active: str = "", active_ent
         PATH=f"{bin_}{os.pathsep}{env['PATH']}",
         FAKE_ACTIVE=active,
         FAKE_ACTIVE_ENTER=active_enter,
+        FAKE_ACTIVE_ENTER_FILE=str(tmp_path / "active-enter"),
         FAKE_LOG=str(tmp_path / "fake.log"),
         GIT_CEILING_DIRECTORIES=str(tmp_path),
     )
@@ -318,6 +324,7 @@ def _run_update_until_stop(
     on_live: str = "0",
     pre: str = "",
     post_merge: str = "false",
+    tail: str = "echo REACHED-END\n",
 ) -> subprocess.CompletedProcess:
     """update.sh from its "fetching" state through the service stop, as shipped.
 
@@ -353,7 +360,7 @@ def _run_update_until_stop(
                 '[[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped:'
             )
         ]
-        + "echo REACHED-END\n"
+        + tail
     )
     return _sh(tmp_path, home, script, active=active)
 
@@ -575,7 +582,8 @@ def test_no_delta_with_the_server_running_is_unchanged(tmp_path):
 
 def _with_owed(home: Path) -> None:
     _owed(home).parent.mkdir(parents=True, exist_ok=True)
-    _owed(home).write_text("{}")
+    # A confirmed stop's record (see the round-3 tests for a "stopping" one).
+    _owed(home).write_text('{"stage": "stopped"}')
 
 
 def test_a_successful_update_retires_the_obligation(tmp_path):
@@ -628,12 +636,42 @@ def test_the_prestop_handler_retires_it_only_when_the_server_is_back(tmp_path):
         assert _owed(home).exists() is kept, active
 
 
+def _crash_after_confirmed_stop(tmp_path: Path):
+    """The run stops the server (no restart during the stop), confirms it down,
+    and is killed before "merging"."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    db = _migrated_genesis_root(tmp_path, root)
+    home = tmp_path / "home"
+    proc = _run_update_until_stop(
+        tmp_path,
+        home,
+        active="genesis-server",
+        rollback=rollback,
+        pre="_stop_genesis_server() { :; }\n",
+        tail="kill -KILL $$\n",
+    )
+    assert '"stage": "stopped"' in _owed(home).read_text()
+    return root, db, home, proc
+
+
+def test_a_kill_at_the_stop_leaves_an_unconfirmed_record_no_activation_pays(tmp_path):
+    """Killed during the stop: the stop was never confirmed, so a later activation
+    may be the stop's own restart. The record stays owed (the price: a server
+    revived after such a kill and then stopped by the operator is restarted by
+    the next update)."""
+    root, _, home, proc = _crash_at_stop(tmp_path)
+    assert proc.returncode == -9, proc.stdout + proc.stderr
+    assert '"stage": "stopping"' in _owed(home).read_text()
+    later = _systemd_time(time.time() + 120)
+    assert _detect(tmp_path, home, root, active_enter=later) == (["genesis-server"], "false")
+
+
 def test_a_restart_owed_is_paid_once_anything_else_brought_the_server_back(tmp_path):
     """Architect review: the watchdog (or a hand start, deploy_code_only.sh, the
     conflict exit, a rollback) revived the server after the crash; the operator
-    then stopped it. The unit came up after the obligation was written, so the
-    stop is the operator's and stays; the stale file is retired."""
-    root, _, home, proc = _crash_at_stop(tmp_path)
+    then stopped it. The unit came up after the obligation was dated (at the
+    confirmed stop), so the stop is the operator's and stays; the file is retired."""
+    root, _, home, proc = _crash_after_confirmed_stop(tmp_path)
     assert proc.returncode == -9, proc.stdout + proc.stderr
     later = time.strftime("%a %Y-%m-%d %H:%M:%S %Z", time.localtime(time.time() + 120))
     assert _detect(tmp_path, home, root, active_enter=later) == ([], "true")
@@ -641,7 +679,7 @@ def test_a_restart_owed_is_paid_once_anything_else_brought_the_server_back(tmp_p
 
 
 def test_a_unit_last_up_before_the_obligation_still_owes_the_restart(tmp_path):
-    root, _, home, proc = _crash_at_stop(tmp_path)
+    root, _, home, proc = _crash_after_confirmed_stop(tmp_path)
     assert proc.returncode == -9, proc.stdout + proc.stderr
     # Written two days ago: an empty value read by `date -d` would be midnight
     # TODAY, which is after it, and would wrongly pay the debt.
@@ -854,3 +892,111 @@ def test_a_later_activation_outranks_an_older_failed_status(tmp_path):
             ["genesis-server"],
             "false",
         )
+
+
+# ── round 3: only an activation after the CONFIRMED stop pays the debt ──────
+
+# The stop's own kill reads as a failure to systemd, so Restart=on-failure can
+# bring the server back between the first kill and _ensure_server_down's final
+# stop. That activation is the stop's, not a restart by someone else.
+_RESURRECTING_STOP = (
+    "_stop_genesis_server() {\n"
+    "    sleep 1.2\n"
+    '    date "+%a %Y-%m-%d %H:%M:%S %Z" > "$FAKE_ACTIVE_ENTER_FILE"\n'
+    "}\n"
+)
+
+
+def _resurrection(tmp_path: Path) -> str:
+    return (tmp_path / "active-enter").read_text().strip()
+
+
+def test_a_restart_during_the_stop_does_not_pay_the_debt(tmp_path):
+    """Codex P1 (4310414810): the unit came back during the stop and was stopped
+    again; the run is then killed before "merging". The next update restores it."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    _migrated_genesis_root(tmp_path, root)
+    home = tmp_path / "home"
+    proc = _run_update_until_stop(
+        tmp_path,
+        home,
+        active="genesis-server",
+        rollback=rollback,
+        pre=_RESURRECTING_STOP,
+        tail="kill -KILL $$\n",
+    )
+    assert proc.returncode == -9, proc.stdout + proc.stderr
+    # Re-dated at the confirmed stop, so a revival after it can still pay it.
+    owed = _owed(home)
+    assert '"stage": "stopped"' in owed.read_text()
+    local_time = _resurrection(tmp_path).rsplit(" ", 1)[0]  # drop the zone name
+    revived = time.mktime(time.strptime(local_time, "%a %Y-%m-%d %H:%M:%S"))
+    assert owed.stat().st_mtime >= revived
+    assert _detect(tmp_path, home, root, active_enter=_resurrection(tmp_path)) == (
+        ["genesis-server"],
+        "false",
+    )
+
+
+def test_a_kill_between_the_restart_and_the_confirmed_stop_keeps_the_debt(tmp_path):
+    root, _, rollback = _recovery_repo(tmp_path)
+    _migrated_genesis_root(tmp_path, root)
+    home = tmp_path / "home"
+    proc = _run_update_until_stop(
+        tmp_path,
+        home,
+        active="genesis-server",
+        rollback=rollback,
+        pre=_RESURRECTING_STOP + "_ensure_server_down() { kill -KILL $$; }\n",
+    )
+    assert proc.returncode == -9, proc.stdout + proc.stderr
+    assert _detect(tmp_path, home, root, active_enter=_resurrection(tmp_path)) == (
+        ["genesis-server"],
+        "false",
+    )
+
+
+def test_a_debt_that_cannot_be_dated_after_the_stop_restores_the_server_and_stops(tmp_path):
+    """The record cannot be rewritten once the server is confirmed down: the run
+    must neither go on (the debt could then read as paid) nor leave the server
+    down. It restores what it stopped and exits, like an interrupt there."""
+    text = UPDATE.read_text()
+    root, _, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    proc = _run_update_until_stop(
+        tmp_path,
+        home,
+        active="genesis-server",
+        rollback=rollback,
+        pre=(
+            _func(text, "_on_signal_prestop")
+            + "_start_genesis_server() { echo SERVER-STARTED; }\n"
+            + '_ensure_server_down() { mkdir -p "$HOME/.genesis/server_restart_owed.json.tmp"; }\n'
+            + "_stop_genesis_server() { :; }\n"
+        ),
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "SERVER-STARTED" in out and "REACHED-END" not in out, out
+
+
+def test_bootstrap_does_not_let_a_restart_during_the_stop_pay_the_debt(tmp_path):
+    """A crash in "fetching" with the server in services_stopped: the state was
+    written before the stop, so an activation after it may be the stop's own.
+    The record bootstrap writes for it is not paid by one."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    _migrated_genesis_root(tmp_path, root)
+    home = tmp_path / "home"
+    state = _write_recovery_state(
+        home,
+        phase="fetching",
+        deploy_head=rollback,
+        post_merge=False,
+        services_stopped=["genesis-server"],
+    )
+    written = time.time() - 3600
+    os.utime(state, (written, written))
+    rec = _run_crash_recovery(root, home)
+    assert rec.returncode == 0 and "Crash recovery complete" in rec.stdout, rec.stdout + rec.stderr
+    later = _systemd_time(written + 5)
+    assert _detect(tmp_path, home, root, active_enter=later) == (["genesis-server"], "false")
