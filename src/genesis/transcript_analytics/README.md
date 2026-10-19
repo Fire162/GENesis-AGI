@@ -1,0 +1,50 @@
+# Durable transcript analytics
+
+## Store and concurrency contract
+
+`store.ingest(projects, data)` publishes one complete six-table Parquet record
+under `sources/<key>/<record>/`, then atomically replaces that source's `current`
+symlink. Files and containing directories are fsync'd before the selector is
+published. An interrupted refresh never overwrites the accepted record.
+`build_source`, ingest and prune use the same exclusive writer flock.
+
+This **directory/current-link layout is an owner-approved deviation** from the
+original per-file replacement spec in #3425. Six independent replacements are
+not an atomic replacement of a complete source record.
+
+Readers capture and validate each source once with `select_sources`. A captured
+`SourceRecord` supplies every table path and the original metadata; readers must
+not re-resolve `current` for successive tables or evidence. There is no catalog,
+lease, restore epoch, reader lock or persisted reader registry. Selection is per
+source, not a global all-sources transaction.
+
+All physical revisions remain until explicit prune, including records superseded
+by an hourly refresh. Disk usage therefore grows with refreshes. **Pruning is
+maintenance: stop readers first.** `prune` removes the complete retained history
+of expired sources whose original transcript is gone, after checking the bound
+projects root. Ordinary ingestion never retires accepted history automatically.
+
+## Historical records
+
+Old flat files are read in place and left intact when a newer directory record
+shadows them. `history.py` lists exact audited schema/extraction/scrubber tuples,
+not a wildcard compatibility bridge:
+
+- Flat schema 1 from `27a1513b`.
+- Schema 5 from `f693174b` and the #3002 producer at `1a9c9c22`.
+
+Each format must match all six audited physical schemas and consistent original
+source/fingerprint/record stamps. Unknown or inconsistent formats remain on disk
+and are explicitly excluded; they are never declared current.
+
+Read adapters add typed nulls for absent fields without changing stored data or
+restamping its metadata. Original values, including scrub/error flags, are kept.
+Missing identities, hashes, usage availability and scrub-failure evidence are
+unknown, not synthesized success or attribution. Later query coverage reports the
+original provenance and unavailable facts. A historical record is never current
+for ingestion, even when its transcript fingerprint happens to match: if the
+transcript exists it can be re-extracted; if permanently gone its audited
+historical observations remain usable.
+
+The independent storage tests require no query/reconciliation modules. Query and
+snapshot functionality follow in the dependent A2 and B parts of #3425.
