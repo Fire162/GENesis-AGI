@@ -121,8 +121,8 @@ def test_source_growth_during_extraction_fails_closed(tmp_path, monkeypatch):
     projects, data, path = seed(tmp_path)
     original = store.extract_source
 
-    def grow(path, rel, stop_at=None, fh=None):
-        result = original(path, rel, stop_at=stop_at, fh=fh)
+    def grow(path, rel, stop_at=None, **kwargs):
+        result = original(path, rel, stop_at=stop_at, **kwargs)
         with path.open("a") as stream:
             stream.write("\n")
         return result

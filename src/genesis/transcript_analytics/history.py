@@ -78,6 +78,7 @@ def unknown_facts(adapter):
     return {
         "missing_columns": missing,
         "unrecoverable": [
+            "stored text was scrubbed by the original policy, not the current policy",
             "result-ID scrub-failure evidence",
             "current hook-name and nonnegative-measure semantics",
             "refusal diagnostics omitted by the historical producer",
