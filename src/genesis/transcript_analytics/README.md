@@ -51,5 +51,20 @@ for ingestion, even when its transcript fingerprint happens to match: if the
 transcript exists it can be re-extracted; if permanently gone its audited
 historical observations remain usable.
 
-The independent storage tests require no query/reconciliation modules. Query and
-snapshot functionality follow in the dependent A2 and B parts of #3425.
+## Live queries
+
+`query.connect(data)` binds all raw tables to one captured source selection.
+DuckDB's later lazy reads and query evidence use those same immutable paths and
+metadata. Live and deduplicated views retain the existing reconciliation rules;
+hooks/events aggregate scrub failures over every copy. Recomputed tool latency
+and fallback latency are nonnegative or unknown.
+
+`source_coverage` exposes original per-source provenance and unavailable
+historical facts. `run_query(..., manifest_path=...)` records the same captured
+coverage alongside result denominators and scrubbed query labels. Missing
+historical identity is unresolved, not attributed to a current executor.
+
+Each connection uses its own 0700 spill directory under `TA_DUCKDB_TMP` or
+`~/tmp/transcript-analytics/duckdb`; an unowned or symlinked root is rejected.
+The independent storage tests require no query/reconciliation modules.
+Disposable snapshots follow in the dependent B part of #3425.
