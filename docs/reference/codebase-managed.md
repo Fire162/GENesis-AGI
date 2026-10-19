@@ -271,8 +271,12 @@ native CLI. Current RPC responsiveness is checked again by final worker admissio
 Persistence checks include the artifact destination
 and the pinned provider's fixed snapshot scratch directory; false omits both.
 The immutable `_config.db` stays a reader surface, while index databases and their
-WAL/SHM sidecars require writes. Existing writable descendants can remain usable
-under a read-only parent.
+WAL/SHM and rollback-journal sidecars require read/write access, as does the
+mutable queue database and its sidecars. Cache and queue directories require
+read access for enumeration. The append-only runner log and non-enumerated
+runtime/lock directories do not require read access. The accepted executable
+must also be executable by the caller in this namespace. Existing writable
+descendants can remain usable under a read-only parent.
 
 Availability is advisory: a runner with filesystem restrictions must perform its
 own checks. Custom state roots need an operator-owned `ReadWritePaths` allowlist;

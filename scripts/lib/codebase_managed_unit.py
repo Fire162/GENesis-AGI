@@ -509,7 +509,15 @@ def frontend_command(main: Path, settings: Path, unit: str, backend: str, slice_
     return command
 
 
-def _writable_path(path: Path, *, directory: bool) -> None:
+def verify_binary_access(fd: int, *, execute: bool) -> None:
+    """Retain source mode checks; executing roles also need effective inode access."""
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111
+            or (execute and not os.access(f"/proc/self/fd/{fd}", os.X_OK, effective_ids=True))):
+        raise ValueError("managed binary must be a regular executable")
+
+
+def _writable_path(path: Path, *, directory: bool, readable: bool = False) -> None:
     """Observe this caller's namespace without creating a probe or directory."""
     target = path
     while True:
@@ -525,6 +533,8 @@ def _writable_path(path: Path, *, directory: bool) -> None:
     if target == path and not directory and not stat.S_ISREG(info.st_mode):
         raise ValueError(f"managed worker requires a regular file: {path}")
     permission = os.W_OK | (os.X_OK if stat.S_ISDIR(info.st_mode) else 0)
+    if readable and target == path:
+        permission |= os.R_OK
     if (os.statvfs(target).f_flag & os.ST_RDONLY
             or not os.access(target, permission, effective_ids=True)):
         raise ValueError(
@@ -537,15 +547,17 @@ def verify_worker_writes(config: dict, persistence: bool) -> None:
     """Advisory write prerequisites; real IO failures retain their classification."""
     state = absolute(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
     cache = Path(config["cache"])
-    for path in (cache, Path(config["runtime"]), state / "locks", state / "index-requests"):
+    queue = state / "index-requests"
+    for path in (Path(config["runtime"]), state / "locks"):
         _writable_path(path, directory=True)
-    for path in (state / "code-intelligence-runner.log", state / "index-requests/queue.sqlite3"):
-        _writable_path(path, directory=False)
-    for database in cache.glob("*.db"):
+    for path in (cache, queue):
+        _writable_path(path, directory=True, readable=True)
+    _writable_path(state / "code-intelligence-runner.log", directory=False)
+    for database in (queue / "queue.sqlite3", *cache.glob("*.db")):
         if database.name == "_config.db":
             continue  # immutable configuration is validated through the RO reader
-        for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm")):
-            _writable_path(path, directory=False)
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            _writable_path(Path(str(database) + suffix), directory=False, readable=True)
     if persistence:
         _writable_path(Path("/tmp"), directory=True)  # noqa: S108 - observe pinned root; no creation
         _writable_path(Path(config["main"]) / ".codebase-memory", directory=True)

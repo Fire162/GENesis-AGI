@@ -55,6 +55,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     validate_frontend_boundary,
     validate_provider_paths,
     validate_source_identity,
+    verify_binary_access,
     verify_worker_writes,
 )
 from codebase_managed_unit import (  # noqa: E402
@@ -510,15 +511,13 @@ def validate_settings(value: dict, *, require_build: bool = True) -> dict:
     return value
 
 
-def verified_binary(path: Path):
-    """Execute this verified inode, not a later resolution of its pathname."""
+def verified_binary(path: Path, *, execute: bool = True):
+    """Verify this inode; only a staging copy source may omit effective execute access."""
     absolute(str(path))
     fd = os.open(path, os.O_RDONLY | OPEN_FLAGS)
     stream = os.fdopen(fd, "rb")
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
-            raise ValueError("managed binary must be a regular executable")
+        verify_binary_access(fd, execute=execute)
         if hashlib.file_digest(stream, "sha256").hexdigest() != BUILD:
             raise ValueError("unsupported managed executable; repeat acceptance before upgrading")
         stream.seek(0)
@@ -636,7 +635,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         staging_created = False
         try:
             existing_parent = first_existing_parent(state)
-            with verified_binary(source) as executable:
+            with verified_binary(source, execute=False) as executable:
                 state.mkdir(parents=True, mode=0o700)
                 staging_created = True
                 (state / "bin").mkdir(mode=0o700)
