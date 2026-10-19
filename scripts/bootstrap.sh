@@ -711,7 +711,8 @@ if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
     . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
     _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-echo "  Codebase: explicit pinned setup required; see docs/reference/codebase-managed.md"
+# Setup is deliberately manual (configure needs a pinned binary); whether it is
+# still owed is reported at the end of this run, after .mcp.json is rendered.
 
 # GitNexus (blast radius, impact analysis, execution flows)
 # Exact, shared pin — GitNexus index storage formats can change between
@@ -1762,6 +1763,14 @@ if [[ "${_bootstrap_owns_summary:-0}" = "1" ]]; then
 fi
 if [[ "${_mu_kept_count:-0}" -gt 0 ]]; then
     echo "  ${_mu_kept_count} systemd unit(s) KEPT, not overwritten: edited by hand or not a regular file."
+fi
+# codebase-memory-mcp: one line only when it is registered but not set up (or OK).
+# Run by hand only: under update.sh (which hands us its summary) update.sh prints
+# the same line in its own end-of-run summary, so printing here would duplicate it.
+if [[ "${_bootstrap_owns_summary:-0}" = "1" ]]; then
+    # shellcheck source=lib/cbm_setup_notice.sh
+    . "$SCRIPT_DIR/lib/cbm_setup_notice.sh"
+    genesis_cbm_setup_notice "$VENV_DIR/bin/python" "$GENESIS_ROOT" "  "
 fi
 
 # setup-complete written only now that all bootstrap work has finished (B1) — the
