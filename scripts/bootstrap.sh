@@ -378,10 +378,39 @@ PY
             # written after the confirmed stop: "stopped".
             _owed_stage="stopped"
             [ "$STATE_PHASE" != "fetching" ] || _owed_stage="stopping"
-            if printf '{"pid": %s, "started_at": "", "timestamp": "%s", "stage": "%s"}\n' \
-                    "$STATE_PID" "$(date -Iseconds)" "$_owed_stage" > "$OWED_FILE.tmp" 2>/dev/null \
-                && touch -r "$UPDATE_STATE" "$OWED_FILE.tmp" 2>/dev/null \
-                && mv -f "$OWED_FILE.tmp" "$OWED_FILE" 2>/dev/null; then
+            # Durable, as update.sh's writer is: the temporary file is fsynced
+            # before the rename and the directory after it. Its mtime is the
+            # state's, to the nanosecond (update.sh compares at that precision).
+            if python3 -I - "$OWED_FILE" "$UPDATE_STATE" "$STATE_PID" "$_owed_stage" 2>/dev/null <<'PY'
+import json
+import os
+import sys
+from datetime import datetime
+
+path, state_path, pid, stage = sys.argv[1:]
+tmp = path + ".tmp"
+data = {
+    "pid": int(pid),
+    "started_at": "",
+    "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+    "stage": stage,
+}
+crashed_ns = os.stat(state_path).st_mtime_ns
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(fd, (json.dumps(data) + "\n").encode())
+    os.utime(fd, ns=(crashed_ns, crashed_ns))
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(tmp, path)
+dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+try:
+    os.fsync(dfd)
+finally:
+    os.close(dfd)
+PY
+            then
                 echo "  Recorded the restart the crashed update owes genesis-server."
             else
                 rm -f "$OWED_FILE.tmp" 2>/dev/null || true

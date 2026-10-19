@@ -276,22 +276,80 @@ PY
 # nothing. "stopped" is rewritten (with a fresh mtime) once the server is
 # confirmed down: only an activation after THAT pays the debt.
 SERVER_RESTART_OWED="$HOME/.genesis/server_restart_owed.json"
+# Written DURABLY: a rename is atomic but not power-loss durable on its own, so
+# the temporary file is fsynced before the rename and the directory after it
+# (fsync(2); the same pattern as cc_version.sh's settings writer and
+# codebase_managed.py's sync_staging). Only then may the server be stopped: any
+# failure, including either fsync, returns 1 and the caller refuses the stop.
 _owe_server_restart() {
     local stage="${1:-stopping}"
     mkdir -p "$HOME/.genesis" 2>/dev/null || true
-    if ! { printf '{"pid": %s, "started_at": "%s", "timestamp": "%s", "stage": "%s"}\n' \
-            "$$" "${STARTED_AT:-}" "$(date -Iseconds)" "$stage" > "$SERVER_RESTART_OWED.tmp" \
-        && mv -f "$SERVER_RESTART_OWED.tmp" "$SERVER_RESTART_OWED"; } 2>/dev/null; then
+    if ! python3 -I - "$SERVER_RESTART_OWED" "$$" "${STARTED_AT:-}" "$stage" 2>/dev/null <<'PY'
+import json
+import os
+import sys
+from datetime import datetime
+
+path, pid, started_at, stage = sys.argv[1:]
+tmp = path + ".tmp"
+data = {
+    "pid": int(pid),
+    "started_at": started_at,
+    "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+    "stage": stage,
+}
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(fd, (json.dumps(data) + "\n").encode())
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(tmp, path)
+dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+try:
+    os.fsync(dfd)
+finally:
+    os.close(dfd)
+PY
+    then
         rm -f "$SERVER_RESTART_OWED.tmp" 2>/dev/null || true
-        echo "  ERROR: could not write $SERVER_RESTART_OWED." >&2
+        echo "  ERROR: could not write $SERVER_RESTART_OWED durably." >&2
         return 1
     fi
 }
-# Is evidence dated $1 (epoch seconds) still current against the unit's last
-# activation $2? Evidence older than a later activation is stale: something
-# brought the server back after it, so a server down now was stopped after that,
-# by someone else. Either time unreadable (0) keeps the evidence current, which
-# is the recovery side.
+# Times in NANOSECONDS since the epoch, so ordering within one second survives
+# (whole seconds made a stop and a later restart in the same second equal).
+# Each prints 0 when it cannot read the time; 0 always leaves evidence current.
+# A file's mtime: %.9Y, falling back to whole seconds where stat lacks it.
+_mtime_ns() {
+    local t
+    t="$(stat -c %.9Y "$1" 2>/dev/null || true)"
+    if [[ "$t" =~ ^[0-9]+\.[0-9]{9}$ ]]; then
+        echo "${t/./}"
+        return 0
+    fi
+    t="$(stat -c %Y "$1" 2>/dev/null || true)"
+    if [[ "$t" =~ ^[0-9]+$ ]]; then echo "${t}000000000"; else echo 0; fi
+}
+# genesis-server's last activation: microseconds where systemctl offers them
+# (--timestamp=us+utc, systemd 248 and later; MEASURED on systemd 255), whole
+# seconds otherwise. An empty value must not reach `date -d`, which reads "" as
+# midnight today.
+_activation_ns() {
+    local v t
+    v="$(systemctl --user show genesis-server.service -p ActiveEnterTimestamp --value --timestamp=us+utc 2>/dev/null || true)"
+    if [ -z "$v" ]; then
+        v="$(systemctl --user show genesis-server.service -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+    fi
+    [ -n "$v" ] || { echo 0; return 0; }
+    t="$(date -d "$v" +%s%N 2>/dev/null || true)"
+    if [[ "$t" =~ ^[0-9]+$ ]]; then echo "$t"; else echo 0; fi
+}
+# Is evidence dated $1 still current against the unit's last activation $2 (both
+# nanoseconds)? Evidence is stale only when the activation came STRICTLY after it:
+# something brought the server back after it, so a server down now was stopped
+# after that, by someone else. The same instant, an earlier activation, or either
+# time unreadable (0) keeps the evidence current, which is the recovery side.
 _evidence_current() {
     [ "${1:-0}" -eq 0 ] 2>/dev/null || [ "${2:-0}" -eq 0 ] 2>/dev/null \
         || [ "$1" -ge "$2" ] 2>/dev/null
@@ -304,21 +362,17 @@ _evidence_current() {
 # restart by anything (the watchdog, a deploy_code_only.sh restart, a start by
 # hand, this script's conflict exit or rollback) followed by an operator stop is
 # never undone by evidence from before that restart. (_latest_update_status and
-# _latest_update_completed_epoch are defined below.) When an operator "hold"
+# _latest_update_completed_ns are defined below.) When an operator "hold"
 # marker exists (#2718: keep a stopped server stopped), this predicate must
 # check it first.
 _server_recovery_pending() {
-    # The unit's last activation, read once. Anything unreadable (no bus, "n/a",
-    # a unit never started since boot) is 0, which leaves all evidence current.
-    # An empty value must not reach `date -d`, which reads "" as midnight today.
-    local _up _up_at=0 _at
-    _up="$(systemctl --user show genesis-server.service -p ActiveEnterTimestamp --value 2>/dev/null || true)"
-    if [ -n "$_up" ]; then
-        _up_at="$(date -d "$_up" +%s 2>/dev/null || echo 0)"
-    fi
-    case "$_up_at" in '' | *[!0-9]*) _up_at=0 ;; esac
+    # The unit's last activation, read once, in nanoseconds. Anything unreadable
+    # (no bus, "n/a", a unit never started since boot) is 0, which leaves all
+    # evidence current.
+    local _up_at _at
+    _up_at="$(_activation_ns)"
     if [ -e "$SERVER_RESTART_OWED" ]; then
-        _at="$(stat -c %Y "$SERVER_RESTART_OWED" 2>/dev/null || echo 0)"
+        _at="$(_mtime_ns "$SERVER_RESTART_OWED")"
         # Only a record of a CONFIRMED stop can be paid by an activation: one
         # still "stopping" (or unreadable, or of no known stage) stays owed.
         if ! grep -q '"stage": "stopped"' "$SERVER_RESTART_OWED" 2>/dev/null \
@@ -330,7 +384,7 @@ _server_recovery_pending() {
         rm -f "$SERVER_RESTART_OWED"
     fi
     if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
-        _at="$(stat -c %Y "$HOME/.genesis/last_update_failure.json" 2>/dev/null || echo 0)"
+        _at="$(_mtime_ns "$HOME/.genesis/last_update_failure.json")"
         if _evidence_current "$_at" "$_up_at"; then
             echo "a prior update's failure record is present"
             return 0
@@ -338,7 +392,7 @@ _server_recovery_pending() {
     fi
     case "$(_latest_update_status)" in
         rolled_back | failed)
-            if _evidence_current "$(_latest_update_completed_epoch)" "$_up_at"; then
+            if _evidence_current "$(_latest_update_completed_ns)" "$_up_at"; then
                 echo "the last update did not complete cleanly"
                 return 0
             fi
@@ -2048,6 +2102,15 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # yet, so aborting here leaves the repo/DB untouched — safe to exit.
     if ! _ensure_server_down; then
         echo "  Aborting update — could not stop genesis-server; refusing to merge over a live process."
+        # A server still running is owed no restart: a "stopping" record left for
+        # it would make a later update start it after a deliberate stop. One that
+        # did go down keeps the record, still "stopping" (never confirmed), so the
+        # next update restores it.
+        if [ -e "${SERVER_RESTART_OWED:-}" ] \
+            && { systemctl --user is-active --quiet genesis-server.service 2>/dev/null \
+                || pgrep -f "python -m genesis serve" >/dev/null 2>&1; }; then
+            rm -f "$SERVER_RESTART_OWED"
+        fi
         echo "  genesis-server has been stopped and was NOT restarted. Bring it back with:"
         echo "    systemctl --user restart genesis-server.service"
         # On `live` the rebuild has already moved the checkout (and the EXIT
@@ -2293,10 +2356,10 @@ except Exception:
 PYEOF
 }
 
-# When the row _latest_update_status reads was completed, as epoch seconds; ""
-# when it cannot be read or parsed. Read by _server_recovery_pending (restart-owed),
-# which treats "" as current evidence: the recovery side.
-_latest_update_completed_epoch() {
+# When the row _latest_update_status reads was completed, in nanoseconds since
+# the epoch (the unit _server_recovery_pending compares in); "" when it cannot be
+# read or parsed, which that reader treats as current evidence: the recovery side.
+_latest_update_completed_ns() {
     local db_path="$GENESIS_ROOT/data/genesis.db" py=""
     [ -f "$db_path" ] || return 0
     py="$(_metadata_python 12 || true)"
@@ -2304,7 +2367,7 @@ _latest_update_completed_epoch() {
     GH_DB_PATH="$db_path" "$py" - <<'PYEOF' 2>/dev/null || true
 import os
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 
 try:
     con = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True, timeout=5)
@@ -2317,7 +2380,9 @@ try:
         con.close()
     when = datetime.fromisoformat(row[0]) if row and row[0] else None
     if when is not None and when.tzinfo is not None:
-        print(int(when.timestamp()))
+        # Exact integer arithmetic: a float timestamp would round the microseconds.
+        delta = when - datetime(1970, 1, 1, tzinfo=UTC)
+        print((delta.days * 86400 + delta.seconds) * 10**9 + delta.microseconds * 1000)
 except Exception:
     pass
 PYEOF

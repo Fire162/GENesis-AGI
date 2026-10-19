@@ -37,6 +37,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -250,6 +251,10 @@ def test_an_existing_failure_record_is_left_untouched(tmp_path):
 # manager or repository.
 _FAKE_TOOL = r"""#!/bin/bash
 name="${0##*/}"
+# A unit the test stops mid-run reads its running set from a file.
+if [ -n "${FAKE_ACTIVE_FILE:-}" ] && [ -f "$FAKE_ACTIVE_FILE" ]; then
+    FAKE_ACTIVE="$(cat "$FAKE_ACTIVE_FILE")"
+fi
 case "$name" in
     git) echo "fake git refused: $*" >&2; exit 97 ;;
     pgrep) [[ " ${FAKE_ACTIVE:-} " == *" genesis-server "* ]]; exit ;;
@@ -293,6 +298,7 @@ def _sh(tmp_path: Path, home: Path, script: str, *, active: str = "", active_ent
         HOME=str(home),
         PATH=f"{bin_}{os.pathsep}{env['PATH']}",
         FAKE_ACTIVE=active,
+        FAKE_ACTIVE_FILE=str(tmp_path / "active-now"),
         FAKE_ACTIVE_ENTER=active_enter,
         FAKE_ACTIVE_ENTER_FILE=str(tmp_path / "active-enter"),
         FAKE_LOG=str(tmp_path / "fake.log"),
@@ -1000,3 +1006,165 @@ def test_bootstrap_does_not_let_a_restart_during_the_stop_pay_the_debt(tmp_path)
     assert rec.returncode == 0 and "Crash recovery complete" in rec.stdout, rec.stdout + rec.stderr
     later = _systemd_time(written + 5)
     assert _detect(tmp_path, home, root, active_enter=later) == (["genesis-server"], "false")
+
+
+# ── round 5: a durable record; sub-second ordering; no debt for a live server ──
+
+
+def _owed_writer_source(text: str, name: str) -> str:
+    """The Python a script runs to write the restart record (the heredoc that
+    follows ``name`` in it)."""
+    at = text.index(name)
+    start = text.index("<<'PY'\n", at) + len("<<'PY'\n")
+    return text[start : text.index("\nPY\n", start) + 1]
+
+
+def _run_writer(monkeypatch, tmp_path: Path, source: str, argv: list[str]) -> list[str]:
+    """Run a record writer in-process, as shipped, logging every fsync (file or
+    directory) and rename, in order."""
+    import stat as stat_mod
+
+    events: list[str] = []
+    real_fsync, real_replace, real_rename = os.fsync, os.replace, os.rename
+
+    def fsync(fd):
+        events.append("fsync-dir" if stat_mod.S_ISDIR(os.fstat(fd).st_mode) else "fsync-file")
+        return real_fsync(fd)
+
+    def replace(a, b, *args, **kwargs):
+        events.append("rename")
+        return real_replace(a, b, *args, **kwargs)
+
+    def rename(a, b, *args, **kwargs):
+        events.append("rename")
+        return real_rename(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "rename", rename)
+    monkeypatch.setattr(sys, "argv", ["-", *argv])
+    exec(compile(source, "<restart-record-writer>", "exec"), {"__name__": "__main__"})  # noqa: S102 - the shipped writer, extracted
+    return events
+
+
+def test_update_sh_makes_the_restart_record_durable_before_it_counts(monkeypatch, tmp_path):
+    """Codex P1 (4316956958): a rename alone is atomic, not durable. The record is
+    fsynced before the rename and its directory after it, so a power loss after
+    the stop cannot lose it."""
+    source = _owed_writer_source(UPDATE.read_text(), "_owe_server_restart() {")
+    (tmp_path / "g").mkdir()
+    path = tmp_path / "g" / "server_restart_owed.json"
+    events = _run_writer(monkeypatch, tmp_path, source, [str(path), "123", "s", "stopped"])
+    assert events == ["fsync-file", "rename", "fsync-dir"], events
+    assert json.loads(path.read_text())["stage"] == "stopped"
+
+
+def test_a_record_that_cannot_be_synced_refuses_the_stop(monkeypatch, tmp_path):
+    source = _owed_writer_source(UPDATE.read_text(), "_owe_server_restart() {")
+    (tmp_path / "g").mkdir()
+    path = tmp_path / "g" / "server_restart_owed.json"
+
+    def broken(fd):
+        raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(os, "fsync", broken)
+    monkeypatch.setattr(sys, "argv", ["-", str(path), "123", "s", "stopping"])
+    try:
+        exec(compile(source, "<restart-record-writer>", "exec"), {"__name__": "__main__"})  # noqa: S102 - the shipped writer, extracted
+    except (OSError, SystemExit) as exc:
+        assert not isinstance(exc, SystemExit) or exc.code not in (0, None)
+    else:
+        raise AssertionError("a record that could not be synced was reported written")
+
+
+def test_bootstrap_makes_its_restart_record_durable_and_dated_to_the_crash(monkeypatch, tmp_path):
+    from tests.test_scripts.test_bootstrap_guards import BOOTSTRAP
+
+    source = _owed_writer_source(BOOTSTRAP.read_text(), 'OWED_FILE="$HOME/.genesis/')
+    (tmp_path / "g").mkdir()
+    state = tmp_path / "g" / "update_state.json"
+    state.write_text("{}")
+    crashed_ns = time.time_ns() - 3_600_123_456_789
+    os.utime(state, ns=(crashed_ns, crashed_ns))
+    path = tmp_path / "g" / "server_restart_owed.json"
+    events = _run_writer(monkeypatch, tmp_path, source, [str(path), str(state), "123", "stopped"])
+    assert events == ["fsync-file", "rename", "fsync-dir"], events
+    assert path.stat().st_mtime_ns == crashed_ns  # to the nanosecond
+    assert json.loads(path.read_text())["stage"] == "stopped"
+
+
+def _set_mtime_ns(path: Path, ns: int) -> None:
+    os.utime(path, ns=(ns, ns))
+
+
+def _us_utc(ns: int) -> str:
+    """An ActiveEnterTimestamp as `systemctl show --timestamp=us+utc` prints it."""
+    secs, rem = divmod(ns, 1_000_000_000)
+    return time.strftime("%a %Y-%m-%d %H:%M:%S", time.gmtime(secs)) + f".{rem // 1000:06d} UTC"
+
+
+def test_an_activation_later_in_the_same_second_pays_the_debt(tmp_path):
+    """Codex P2 (4316956950): ordering within one second is kept. Rule: an
+    activation STRICTLY after the confirmed stop pays; the same instant, or any
+    earlier one, or an unreadable one, leaves the restart owed."""
+    home = tmp_path / "home"
+    second = (time.time_ns() // 1_000_000_000 - 600) * 1_000_000_000
+    stop = second + 300_000_000
+    _with_owed(home)
+    _set_mtime_ns(_owed(home), stop)
+    assert _detect(
+        tmp_path, home, tmp_path / "no-root", active_enter=_us_utc(stop + 400_000_000)
+    ) == (
+        [],
+        "true",
+    )
+    for activation in (stop, stop - 200_000_000):
+        _with_owed(home)
+        _set_mtime_ns(_owed(home), stop)
+        assert _detect(tmp_path, home, tmp_path / "no-root", active_enter=_us_utc(activation)) == (
+            ["genesis-server"],
+            "false",
+        ), activation
+
+
+def test_a_failure_record_from_earlier_in_the_same_second_is_stale(tmp_path):
+    home = tmp_path / "home"
+    failure = _failure_file(tmp_path)
+    failure.parent.mkdir(parents=True)
+    failure.write_text("{}")
+    second = (time.time_ns() // 1_000_000_000 - 600) * 1_000_000_000
+    _set_mtime_ns(failure, second + 100_000_000)
+    assert _detect(
+        tmp_path, home, tmp_path / "no-root", active_enter=_us_utc(second + 900_000_000)
+    ) == ([], "true")
+
+
+def test_no_debt_is_left_for_a_server_the_stop_could_not_bring_down(tmp_path):
+    """CodeRabbit (4317170486): the stop failed and the server is still running.
+    The run leaves it running and exits; a "stopping" record left behind would
+    restart it after a later deliberate stop. A server that did go down keeps it."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    proc = _run_update_until_stop(
+        tmp_path,
+        home,
+        active="genesis-server",
+        rollback=rollback,
+        pre="_stop_genesis_server() { :; }\n_ensure_server_down() { return 1; }\n",
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert not _owed(home).exists()
+
+    home2 = tmp_path / "home2"
+    proc = _run_update_until_stop(
+        tmp_path,
+        home2,
+        active="genesis-server",
+        rollback=rollback,
+        pre=(
+            '_stop_genesis_server() { : > "$FAKE_ACTIVE_FILE"; }\n'
+            "_ensure_server_down() { return 1; }\n"
+        ),
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _owed(home2).exists()
