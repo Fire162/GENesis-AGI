@@ -50,6 +50,7 @@ from tests.test_scripts.test_bootstrap_guards import (
     _recovery_commit_file,
     _recovery_repo,
     _run_crash_recovery,
+    _write_recovery_state,
 )
 from tests.test_scripts.test_update_rollback_recovery import _extract_recovery_block
 from tests.test_scripts.test_update_success_records import _block, _no_delta_block
@@ -309,7 +310,14 @@ def _owed_block(text: str) -> str:
 
 
 def _run_update_until_stop(
-    tmp_path: Path, home: Path, *, active: str, rollback: str, on_live: str = "0"
+    tmp_path: Path,
+    home: Path,
+    *,
+    active: str,
+    rollback: str,
+    on_live: str = "0",
+    pre: str = "",
+    post_merge: str = "false",
 ) -> subprocess.CompletedProcess:
     """update.sh from its "fetching" state through the service stop, as shipped.
 
@@ -324,16 +332,22 @@ def _run_update_until_stop(
         'STARTED_AT="2026-10-18T00:00:00+00:00"\n'
         "ROLLBACK_TAG=rollback\nORIGINAL_BRANCH=main\nUPDATE_OWN_HEAD=''\n"
         f"DEPLOY_HEAD={rollback}\nOLD_TAG=v1.0.0\nOLD_COMMIT={rollback[:7]}\n"
-        f"POST_MERGE=false\nON_LIVE={on_live}\n_LIVE_WERE_RUNNING=()\n"
+        f"POST_MERGE={post_merge}\nON_LIVE={on_live}\n_LIVE_WERE_RUNNING=()\n"
         '_SELF_COPY="$HOME/self-copy"\n'
+        # Not a repository; the fake git refuses anything run against it anyway.
+        f'GENESIS_ROOT="{tmp_path / "cwd"}"\n'
         + _owed_block(text)
         + _func(text, "_write_state")
         + "_guardian_pause() { :; }\n_guardian_resume() { :; }\n"
         "_drop_own_prestop_state() { :; }\n_flush_deploy_summary() { :; }\n"
         "_live_prestop_exit() { :; }\n_ensure_server_down() { return 0; }\n"
         "_stop_genesis_server() { kill -KILL $$; }\n"
+        '_clear_deploy_state() { rm -f "$STATE_FILE"; echo CLEARED; }\n'
+        '_live_abandon() { echo "LIVE-ABANDON $1"; exit "$1"; }\n'
+        "_live_stop_failed_note() { :; }\n"
+        + pre
         # update.sh's own "fetching" write, made before the services are inspected.
-        'WERE_RUNNING=()\nif [ "$ON_LIVE" != 1 ]; then _write_state "fetching"; fi\n'
+        + 'WERE_RUNNING=()\nif [ "$ON_LIVE" != 1 ]; then _write_state "fetching"; fi\n'
         + text[
             text.index("\nWERE_RUNNING=()\n") + 1 : text.index(
                 '[[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped:'
@@ -501,7 +515,13 @@ def test_a_bridge_that_yielded_to_the_restored_server_is_not_a_failure(tmp_path)
     assert "FAILED=genesis-server genesis-bridge\n" in r.stdout, r.stdout
 
 
-def _no_delta_route(tmp_path: Path, home: Path, *were_running: str) -> tuple[str, list[str]]:
+def _no_delta_route(
+    tmp_path: Path,
+    home: Path,
+    *were_running: str,
+    root: Path | None = None,
+    active_enter: str = "",
+) -> tuple[str, list[str]]:
     """update.sh's nothing-new dispatch with nothing new, then (if it falls
     through to the full activation) its recovery detection."""
     text = UPDATE.read_text()
@@ -513,7 +533,7 @@ def _no_delta_route(tmp_path: Path, home: Path, *were_running: str) -> tuple[str
     script = (
         "set -Eeuo pipefail\n"
         f"WERE_RUNNING=({' '.join(were_running)})\n"
-        f'GENESIS_ROOT="{tmp_path / "no-root"}"\nVENV_DIR="{tmp_path / "missing-venv"}"\n'
+        f'GENESIS_ROOT="{root or tmp_path / "no-root"}"\nVENV_DIR="{tmp_path / "missing-venv"}"\n'
         'GENESIS_TAKE_TEMPLATES=""\n'
         "_nothing_new() { return 0; }\n_tier2_pending_since_baseline() { return 1; }\n"
         + defs
@@ -522,7 +542,7 @@ def _no_delta_route(tmp_path: Path, home: Path, *were_running: str) -> tuple[str
         + seg
         + '\necho "WERE=${WERE_RUNNING[*]:-}"\n'
     )
-    r = _sh(tmp_path, home, script)
+    r = _sh(tmp_path, home, script, active_enter=active_enter)
     assert r.returncode == 0, r.stdout + r.stderr
     route = re.search(r"^ROUTE=(.*)$", r.stdout, re.MULTILINE).group(1)
     m = re.search(r"^WERE=(.*)$", r.stdout, re.MULTILINE)
@@ -631,3 +651,206 @@ def test_a_unit_last_up_before_the_obligation_still_owes_the_restart(tmp_path):
     for value in (earlier, "n/a", ""):
         assert _detect(tmp_path, home, root, active_enter=value) == (["genesis-server"], "false")
     assert _owed(home).exists()
+
+
+# ── round 2: no stop without the record; a later activation outranks older evidence ──
+
+
+def _systemd_time(epoch: float) -> str:
+    """An ActiveEnterTimestamp as `systemctl show` prints it."""
+    return time.strftime("%a %Y-%m-%d %H:%M:%S %Z", time.localtime(epoch))
+
+
+def _archive_failure(db: Path, home: Path, monkeypatch) -> None:
+    """The version collector, as the bridge's runtime runs it, consumes the record."""
+    import aiosqlite
+
+    from genesis.learning.signals import genesis_version
+
+    failure = home / ".genesis" / "last_update_failure.json"
+    monkeypatch.setattr(genesis_version, "_FAILURE_FILE", failure)
+    monkeypatch.setattr(genesis_version, "_FAILURE_ARCHIVE_DIR", home / ".genesis" / "uf")
+
+    async def _consume() -> None:
+        async with aiosqlite.connect(str(db)) as conn:
+            collector = genesis_version.GenesisVersionCollector(conn)
+            with patch.object(genesis_version, "update_in_progress", return_value=False):
+                await collector._check_failure_file()
+
+    asyncio.run(_consume())
+    assert not failure.exists()
+
+
+def test_the_server_is_never_stopped_without_its_restart_record(tmp_path):
+    """Codex P1 (4309637542): the restart record cannot be written, so nothing is
+    stopped: the run clears its state and exits, the server still running."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    # The record's temporary file cannot be created.
+    (home / ".genesis" / "server_restart_owed.json.tmp").mkdir(parents=True)
+    proc = _run_update_until_stop(
+        tmp_path, home, active="genesis-server genesis-bridge", rollback=rollback
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out  # -9 would mean the stop ran
+    assert "NOT stopped" in out and "CLEARED" in out, out
+    assert not _owed(home).exists()
+    log = tmp_path / "fake.log"
+    assert "stop" not in (log.read_text() if log.exists() else ""), "nothing may be stopped"
+
+
+def test_a_post_merge_refusal_keeps_the_earlier_runs_rollback_tag(tmp_path):
+    """--post-merge reuses the crashed run's rollback tag, which its state still
+    names: refusing to stop must not delete it (a plain run's tag is its own)."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    (home / ".genesis" / "server_restart_owed.json.tmp").mkdir(parents=True)
+    # A function in the same shell, so it is what update.sh's `git` resolves to;
+    # the fake executable first on PATH still refuses anything else.
+    log_git = 'git() { printf "GIT %s\\n" "$*" >> "$FAKE_LOG"; return 0; }\n'
+    for post_merge, deleted in (("true", False), ("false", True)):
+        log = tmp_path / "fake.log"
+        log.unlink(missing_ok=True)
+        proc = _run_update_until_stop(
+            tmp_path,
+            home,
+            active="genesis-server",
+            rollback=rollback,
+            pre=log_git,
+            post_merge=post_merge,
+        )
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        calls = log.read_text() if log.exists() else ""
+        assert ("tag -d rollback" in calls) is deleted, (post_merge, calls)
+
+
+def test_on_live_the_server_is_never_stopped_without_its_restart_record(tmp_path):
+    root, _, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    (home / ".genesis" / "server_restart_owed.json.tmp").mkdir(parents=True)
+    proc = _run_update_until_stop(
+        tmp_path, home, active="genesis-server", rollback=rollback, on_live="1"
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "LIVE-ABANDON 1" in out, out
+
+
+def test_a_pre_marker_updaters_crash_is_restored_after_its_record_was_archived(
+    tmp_path, monkeypatch
+):
+    """Codex P1 (4309637548): the crashed update predates the restart record, so
+    only bootstrap's recovery knows the server was stopped. It writes the record
+    itself; the collector archiving the failure record does not lose it, and a
+    run with nothing to merge restores the server. (crashed_recovered stays out
+    of the recovery statuses: a crash before the stop must not start a server the
+    operator stopped.)"""
+    root, db, _, _ = _crashed_merge(tmp_path, services_stopped=["genesis-server"])
+    home = tmp_path / "home"
+    assert _owed(home).is_file()
+    _archive_failure(db, home, monkeypatch)
+    assert _no_delta_route(tmp_path, home, root=root) == ("full", ["genesis-server"])
+
+
+def test_bootstrap_writes_no_restart_record_for_a_crash_before_the_stop(tmp_path):
+    _crashed_merge(tmp_path, services_stopped=[])
+    assert not _owed(tmp_path / "home").exists()
+
+
+def test_bootstrap_dates_its_records_to_the_crash_not_to_itself(tmp_path):
+    """The records bootstrap writes carry the crashed state's time, so a server
+    revived after the crash (the watchdog) and stopped by the operator before
+    bootstrap ran is not started again."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    _migrated_genesis_root(tmp_path, root)
+    home = tmp_path / "home"
+    state = _write_recovery_state(
+        home,
+        own_head=deploy,
+        deploy_head=deploy,
+        old_tag="v1.0.0",
+        old_commit=rollback[:7],
+        started_at="2026-10-18T00:00:00+00:00",
+        services_stopped=["genesis-server"],
+    )
+    crashed = time.time() - 3600
+    os.utime(state, (crashed, crashed))
+    rec = _run_crash_recovery(root, home)
+    assert rec.returncode == 0 and "Crash recovery complete" in rec.stdout, rec.stdout + rec.stderr
+    for record in (_owed(home), _failure_file(tmp_path)):
+        assert abs(record.stat().st_mtime - crashed) < 2, record
+    revived = _systemd_time(crashed + 600)
+    assert _detect(tmp_path, home, root, active_enter=revived) == ([], "true")
+
+
+def test_a_later_activation_outranks_an_older_failure_record(tmp_path):
+    """Codex P2 (4309637546): the restart was paid by a later activation; the
+    failure record from the same crash must not restart a server the operator
+    has stopped since. The alert record itself is left for its readers."""
+    home = tmp_path / "home"
+    _with_owed(home)
+    failure = _failure_file(tmp_path)
+    failure.write_text("{}")
+    crash = time.time() - 7200
+    for record in (_owed(home), failure):
+        os.utime(record, (crash, crash))
+    revived = _systemd_time(crash + 3600)
+    assert _detect(tmp_path, home, tmp_path / "no-root", active_enter=revived) == ([], "true")
+    assert not _owed(home).exists()
+    assert failure.exists()
+
+
+def test_failure_evidence_newer_than_the_last_activation_still_restores(tmp_path):
+    home = tmp_path / "home"
+    failure = _failure_file(tmp_path)
+    failure.parent.mkdir(parents=True)
+    failure.write_text("{}")
+    revived = _systemd_time(time.time() - 3600)
+    for value in (revived, "", "n/a"):
+        assert _detect(tmp_path, home, tmp_path / "no-root", active_enter=value) == (
+            ["genesis-server"],
+            "false",
+        )
+
+
+def _history_root(tmp_path: Path, status: str | None, completed_at: str) -> Path:
+    import sqlite3
+
+    root = tmp_path / f"root-{status}-{abs(hash(completed_at))}"
+    (root / "data").mkdir(parents=True)
+    con = sqlite3.connect(root / "data" / "genesis.db")
+    con.execute("CREATE TABLE update_history (status TEXT, started_at TEXT, completed_at TEXT)")
+    if status is not None:
+        con.execute(
+            "INSERT INTO update_history VALUES (?, ?, ?)",
+            (status, "2026-10-18T00:00:00+00:00", completed_at),
+        )
+    con.commit()
+    con.close()
+    return root
+
+
+def test_a_later_activation_outranks_an_older_failed_status(tmp_path):
+    from datetime import UTC, datetime
+
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    now = time.time()
+    revived = _systemd_time(now - 3600)
+    older = datetime.fromtimestamp(now - 7200, UTC).isoformat()
+    newer = datetime.fromtimestamp(now - 600, UTC).isoformat()
+    for status in ("rolled_back", "failed"):
+        stale = _history_root(tmp_path, status, older)
+        assert _detect(tmp_path, home, stale, active_enter=revived) == ([], "true"), status
+        fresh = _history_root(tmp_path, status, newer)
+        assert _detect(tmp_path, home, fresh, active_enter=revived) == (
+            ["genesis-server"],
+            "false",
+        ), status
+        # No readable activation, or no readable completion time: still a recovery.
+        assert _detect(tmp_path, home, stale, active_enter="") == (["genesis-server"], "false")
+        bad = _history_root(tmp_path, status, "not a time")
+        assert _detect(tmp_path, home, bad, active_enter=revived) == (
+            ["genesis-server"],
+            "false",
+        )

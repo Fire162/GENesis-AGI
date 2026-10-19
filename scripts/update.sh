@@ -252,63 +252,85 @@ PY
 }
 
 # BEGIN restart-owed (extracted by tests/test_scripts/test_bootstrap_crash_restart.py)
-# The restart an update owes genesis-server (#3451). Written immediately before
-# this run stops the server; removed only by update.sh, once the server is back
-# (health-checked on the success and no-delta paths, active after the pre-stop
-# interrupt handler restarted it), or when the unit has come up since it was
-# written (_server_recovery_pending). Present while genesis-server is not running, it
-# tells the next run "an update stopped this and nothing brought it back". A kill
+# The restart an update owes genesis-server (#3451). update.sh writes it
+# immediately before it stops the server, and refuses to stop the server when it
+# cannot; bootstrap's crash recovery writes it too (dated to the crashed state)
+# when a crash left the server stopped without one, as an update from before this
+# file existed does. Retired by update.sh once the server is back (health-checked
+# on the success and no-delta paths, active after the pre-stop interrupt handler
+# restarted it), or as paid when the unit has come up since it was written
+# (_server_recovery_pending). Present while genesis-server is not running, it tells
+# the next run "an update stopped this and nothing brought it back". A kill
 # anywhere after the stop leaves it, a power loss included (which runs no handler),
 # whatever state file that kill left and whether or not bootstrap's crash recovery
 # ever reads one: the next update overwrites a "fetching" state it is allowed past,
 # so that recovery often never runs. A server no update stopped has no such file,
-# so an operator's stop stays a stop. Nothing else reads it, and nothing consumes
-# it: the alert record (last_update_failure.json) is separate, because the version
-# collector archives that one.
+# so an operator's stop stays a stop. Nothing consumes it: the alert record
+# (last_update_failure.json) is separate, because the version collector archives
+# that one.
 SERVER_RESTART_OWED="$HOME/.genesis/server_restart_owed.json"
 _owe_server_restart() {
     mkdir -p "$HOME/.genesis" 2>/dev/null || true
     if ! { printf '{"pid": %s, "started_at": "%s", "timestamp": "%s"}\n' \
             "$$" "${STARTED_AT:-}" "$(date -Iseconds)" > "$SERVER_RESTART_OWED.tmp" \
         && mv -f "$SERVER_RESTART_OWED.tmp" "$SERVER_RESTART_OWED"; } 2>/dev/null; then
-        echo "  WARNING: could not write $SERVER_RESTART_OWED: if this run dies after the stop, the next update reads the stopped genesis-server as operator-stopped." >&2
+        rm -f "$SERVER_RESTART_OWED.tmp" 2>/dev/null || true
+        echo "  ERROR: could not write $SERVER_RESTART_OWED." >&2
+        return 1
     fi
+}
+# Is evidence dated $1 (epoch seconds) still current against the unit's last
+# activation $2? Evidence older than a later activation is stale: something
+# brought the server back after it, so a server down now was stopped after that,
+# by someone else. Either time unreadable (0) keeps the evidence current, which
+# is the recovery side.
+_evidence_current() {
+    [ "${1:-0}" -eq 0 ] 2>/dev/null || [ "${2:-0}" -eq 0 ] 2>/dev/null \
+        || [ "$1" -ge "$2" ] 2>/dev/null
 }
 # Is genesis-server, which is NOT running, owed a restart? Prints why and returns
 # 0; returns 1 when nothing says an update left it down, so it stays as the
 # operator left it. The one predicate for recovery detection and the no-delta
-# dispatch, so the two cannot disagree. (_latest_update_status is defined below.)
+# dispatch, so the two cannot disagree. Every piece of evidence answers to the
+# same rule: a later activation of the unit outranks it (_evidence_current), so a
+# restart by anything (the watchdog, a deploy_code_only.sh restart, a start by
+# hand, this script's conflict exit or rollback) followed by an operator stop is
+# never undone by evidence from before that restart. (_latest_update_status and
+# _latest_update_completed_epoch are defined below.) When an operator "hold"
+# marker exists (#2718: keep a stopped server stopped), this predicate must
+# check it first.
 _server_recovery_pending() {
+    # The unit's last activation, read once. Anything unreadable (no bus, "n/a",
+    # a unit never started since boot) is 0, which leaves all evidence current.
+    # An empty value must not reach `date -d`, which reads "" as midnight today.
+    local _up _up_at=0 _at
+    _up="$(systemctl --user show genesis-server.service -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+    if [ -n "$_up" ]; then
+        _up_at="$(date -d "$_up" +%s 2>/dev/null || echo 0)"
+    fi
+    case "$_up_at" in '' | *[!0-9]*) _up_at=0 ;; esac
     if [ -e "$SERVER_RESTART_OWED" ]; then
-        # Paid already if the unit came up AFTER the file was written: something
-        # else restarted the server since (the watchdog, a deploy_code_only.sh
-        # restart, a start by hand, this script's conflict exit or rollback), and
-        # a server down now was stopped after that, by someone else. Derived from
-        # the unit's own record, so every restarter is covered without each one
-        # having to retire the file. Anything unreadable (no bus, "n/a", a unit
-        # never started) reads as "not since", which keeps the restart owed. An
-        # empty value must not reach `date -d`, which reads "" as midnight today.
-        local _owed_at _up _up_at=0
-        _owed_at="$(stat -c %Y "$SERVER_RESTART_OWED" 2>/dev/null || echo 0)"
-        _up="$(systemctl --user show genesis-server.service -p ActiveEnterTimestamp --value 2>/dev/null || true)"
-        if [ -n "$_up" ]; then
-            _up_at="$(date -d "$_up" +%s 2>/dev/null || echo 0)"
-        fi
-        if [ "$_up_at" -gt "$_owed_at" ] 2>/dev/null; then
-            rm -f "$SERVER_RESTART_OWED"
-        else
+        _at="$(stat -c %Y "$SERVER_RESTART_OWED" 2>/dev/null || echo 0)"
+        if _evidence_current "$_at" "$_up_at"; then
             echo "an earlier update stopped genesis-server and never verified it back"
             return 0
         fi
+        # Paid by the later activation.
+        rm -f "$SERVER_RESTART_OWED"
     fi
     if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
-        echo "a prior update's failure record is present"
-        return 0
+        _at="$(stat -c %Y "$HOME/.genesis/last_update_failure.json" 2>/dev/null || echo 0)"
+        if _evidence_current "$_at" "$_up_at"; then
+            echo "a prior update's failure record is present"
+            return 0
+        fi
     fi
     case "$(_latest_update_status)" in
         rolled_back | failed)
-            echo "the last update did not complete cleanly"
-            return 0
+            if _evidence_current "$(_latest_update_completed_epoch)" "$_up_at"; then
+                echo "the last update did not complete cleanly"
+                return 0
+            fi
             ;;
         unreadable)
             # Unknown is not "nothing failed". Recovering costs a restart and a
@@ -1978,6 +2000,24 @@ if [ "${ON_LIVE:-0}" != 1 ]; then
     _write_state "fetching"
 fi
 if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+    # Never stop the server without that record on disk: a run that died after
+    # such a stop would leave it down with nothing to tell the next run that an
+    # update, not the operator, stopped it. Nothing is stopped yet, so refuse
+    # here and change nothing, like the pre-stop backup refusal above.
+    if ! _owe_server_restart; then
+        echo "  Could not record the restart this update would owe genesis-server — server NOT stopped, nothing changed."
+        echo "  Make $HOME/.genesis writable (and free space on its disk), then re-run."
+        if [ "${ON_LIVE:-0}" = 1 ]; then
+            _live_abandon 1 "the restart record could not be written"
+        fi
+        # --post-merge never deletes the tag: it is the earlier run's, and the
+        # state still names it as the rollback point for the merged code.
+        if [[ "$POST_MERGE" == "false" ]]; then
+            git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+        fi
+        _clear_deploy_state
+        exit 1
+    fi
     # Pause the host Guardian BEFORE the stop so it never sees the restart as an
     # outage. Best-effort. The resume rides the EXIT trap, COMPOSED with the
     # temp-copy self-delete (a resume-only re-arm would leak the mktemp copy every
@@ -1990,7 +2030,6 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
         trap '_live_prestop_exit; _guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
     fi
     _guardian_pause
-    _owe_server_restart
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
     # back during the merge/migration window. The ERR-trap rollback is not armed
@@ -2229,6 +2268,36 @@ try:
     print((row[0] or "") if row else "")
 except Exception:
     sys.exit(1)
+PYEOF
+}
+
+# When the row _latest_update_status reads was completed, as epoch seconds; ""
+# when it cannot be read or parsed. Read by _server_recovery_pending (restart-owed),
+# which treats "" as current evidence: the recovery side.
+_latest_update_completed_epoch() {
+    local db_path="$GENESIS_ROOT/data/genesis.db" py=""
+    [ -f "$db_path" ] || return 0
+    py="$(_metadata_python 12 || true)"
+    [ -n "$py" ] || return 0
+    GH_DB_PATH="$db_path" "$py" - <<'PYEOF' 2>/dev/null || true
+import os
+import sqlite3
+from datetime import datetime
+
+try:
+    con = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True, timeout=5)
+    try:
+        # The same row as _latest_update_status.
+        row = con.execute(
+            "SELECT completed_at FROM update_history ORDER BY datetime(started_at) DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        con.close()
+    when = datetime.fromisoformat(row[0]) if row and row[0] else None
+    if when is not None and when.tzinfo is not None:
+        print(int(when.timestamp()))
+except Exception:
+    pass
 PYEOF
 }
 

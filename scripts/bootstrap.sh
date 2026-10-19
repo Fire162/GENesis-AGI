@@ -288,7 +288,8 @@ PY
 
         # bootstrap never starts genesis-server. What restores a server the crashed
         # update stopped is the restart that update recorded it owed, before the
-        # stop (update.sh, restart-owed), which only update.sh retires (#3451).
+        # stop (update.sh, restart-owed; written below when the crashed update left
+        # none), which only update.sh retires (#3451).
         # This reports the crash: update.sh's own failure record,
         # last_update_failure.json in its writer's format, which the dashboard
         # shows and the version collector alerts on (and then archives; the
@@ -350,9 +351,35 @@ with open(failure_path, "x", encoding="utf-8") as f:
     json.dump(data, f, indent=4)
 PY
             then
+                # Dated to the crash, not to this run (see below).
+                touch -r "$UPDATE_STATE" "$FAILURE_FILE" 2>/dev/null || true
                 echo "  genesis-server was stopped by the crashed update; the next update.sh run restarts and health-checks it."
             else
                 echo "  WARNING: could not write $FAILURE_FILE; this crash is not reported as an update failure. genesis-server may still be down; start it with: systemctl --user start genesis-server.service" >&2
+            fi
+        fi
+
+        # The restart the crashed update owes the server, when it left none: an
+        # update.sh from before restart-owed writes none, and this recovery is then
+        # the only thing that knows the server was stopped (the failure record above
+        # is archived by the version collector; crashed_recovered is deliberately not
+        # a recovery status, because a crash before the stop must not start a server
+        # the operator stopped). Same file and format as update.sh's
+        # _owe_server_restart, which retires it. Dated to the crashed state's last
+        # write, which came before any restart since the crash: update.sh treats
+        # evidence older than the unit's last activation as paid, so a server the
+        # watchdog revived and the operator then stopped, before this ran, stays
+        # stopped.
+        OWED_FILE="$HOME/.genesis/server_restart_owed.json"
+        if [ "$STATE_SERVER_STOPPED" = "1" ] && [ ! -e "$OWED_FILE" ]; then
+            if printf '{"pid": %s, "started_at": "", "timestamp": "%s"}\n' \
+                    "$STATE_PID" "$(date -Iseconds)" > "$OWED_FILE.tmp" 2>/dev/null \
+                && touch -r "$UPDATE_STATE" "$OWED_FILE.tmp" 2>/dev/null \
+                && mv -f "$OWED_FILE.tmp" "$OWED_FILE" 2>/dev/null; then
+                echo "  Recorded the restart the crashed update owes genesis-server."
+            else
+                rm -f "$OWED_FILE.tmp" 2>/dev/null || true
+                echo "  WARNING: could not write $OWED_FILE; if genesis-server is still down, the next update.sh may read it as operator-stopped. Start it with: systemctl --user start genesis-server.service" >&2
             fi
         fi
 
