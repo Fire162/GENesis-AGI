@@ -37,7 +37,8 @@ from fastmcp import Context
 
 from genesis.browser import chromium, engine, packages, profile_backup
 from genesis.browser.types import CAMOUFOX_PROFILE_DIR, BrowserLayer
-from genesis.mcp.health import mcp
+from genesis.mcp.health import mcp, payment_context
+from genesis.payments import card_fill
 from genesis.security.card_redaction import CARD_FILTER, contains_card_text, redact_text
 from genesis.security.card_redaction import redacted as _redacted
 from genesis.security.card_shapes import contains_card_number
@@ -127,6 +128,9 @@ _REDACTED_LOGGERS = (
     "genesis.browser.profile",
     "genesis.browser.profile_backup",
     "genesis.browser.provision",
+    "genesis.mcp.health.payment_context",
+    "genesis.payments.card_fill",
+    "genesis.payments.release_client",
     "fastmcp.tools.tool_manager",
     "fastmcp.tools.tool",
     "fastmcp.server.server",
@@ -413,6 +417,8 @@ def _on_local_context_closed(layer: BrowserLayer, ctx) -> None:
     logger.warning("%s window closed — stopping its driver", layer.value)
 
     async def _reap():
+        if layer is BrowserLayer.CAMOUFOX:  # its payment context closed with it
+            await payment_context.abort("browser_closed")  # outside the lock: it can wait
         async with _browser_lock:
             now = _stealth_browser if layer is BrowserLayer.CAMOUFOX else _context
             if now is ctx:
@@ -443,6 +449,8 @@ async def async_cleanup():
     global _active_page, _idle_task
 
     _active_page = None
+    # First: a release not yet claimed is cancelled, the payment context closed.
+    await payment_context.abort("mcp_exit")
 
     # Cancel the idle watcher first, so it cannot reclaim a layer concurrently.
     if _idle_task is not None:
@@ -487,6 +495,8 @@ async def _ensure_browser():
     async with _browser_lock:
         if _stealth_page is not None and _is_page_alive(_stealth_page):
             return _stealth_page
+        if payment_context.past_claim():  # a restart would close a claimed card's window
+            raise payment_context.PaymentInFlight(card_fill.TEXTS["payment_in_flight"])
         if _layer_open(BrowserLayer.CAMOUFOX):
             logger.warning("Camoufox page is stale — restarting Camoufox")
             await _cleanup_camoufox()
@@ -512,6 +522,17 @@ async def _ensure_browser():
         # Always headed — Xvfb :99 is always running.
         os.environ["DISPLAY"] = _VNC_DISPLAY
 
+        prefs = {
+            # Camoufox disables session history (max_entries=0) for
+            # anti-detection.  Re-enable it so back/forward navigation
+            # works in collaborate mode.
+            "browser.sessionhistory.max_entries": 10,
+            "browser.sessionhistory.max_total_viewers": -1,
+        }
+        # Read once per launch: prefs cannot change under a running browser.
+        pinned = card_fill.card_fill_enabled()
+        if pinned:
+            prefs.update(card_fill.CARD_FILL_PREFS)
         cm = AsyncCamoufox(
             executable_path=str(status.path),
             headless=False,
@@ -519,13 +540,7 @@ async def _ensure_browser():
             user_data_dir=str(_PROFILE_DIR),
             humanize=2.5,  # Native Camoufox cursor humanization (Bézier curves, max 2.5s)
             window=(1920, 1080),  # Fill VNC display (Xvfb :99 is 1920x1080x24)
-            firefox_user_prefs={
-                # Camoufox disables session history (max_entries=0) for
-                # anti-detection.  Re-enable it so back/forward navigation
-                # works in collaborate mode.
-                "browser.sessionhistory.max_entries": 10,
-                "browser.sessionhistory.max_total_viewers": -1,
-            },
+            firefox_user_prefs=prefs,
         )
         # Nothing is assigned until __aenter__ succeeds, so a failed launch
         # leaves no half-open layer behind. __aenter__ starts the Playwright
@@ -538,6 +553,7 @@ async def _ensure_browser():
             raise
         # With persistent_context, browser IS the context
         _stealth_cm, _stealth_browser = cm, ctx
+        payment_context.set_prefs_pinned(pinned)
         _layer_launched[BrowserLayer.CAMOUFOX] = time.monotonic()
         ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CAMOUFOX, c))
         ctx.on("dialog", _on_dialog)
@@ -1201,8 +1217,12 @@ async def _reclaim_idle_layers(now: float) -> None:
         last = _layer_last_used.setdefault(layer, now)
         if now - last < _IDLE_TIMEOUT_S:
             continue
+        if layer is BrowserLayer.CAMOUFOX and payment_context.in_flight():
+            continue  # a payment holds it (the flow also keeps its clock fresh)
         async with _browser_lock:
             last = _layer_last_used.get(layer, now)
+            if layer is BrowserLayer.CAMOUFOX and payment_context.in_flight():
+                continue
             if _layer_open(layer) and now - last >= _IDLE_TIMEOUT_S:
                 logger.info(
                     "Browser layer %s idle for %ds — reclaiming it", layer.value, _IDLE_TIMEOUT_S,
@@ -1525,6 +1545,8 @@ async def _get_page(
         # created before its page load timed out) still bills, and only the
         # watcher reclaims it.
         _start_idle_watcher()
+    if payment_context.is_payment_page(page):  # never: no tool may act on that context
+        raise RuntimeError("refused: the payment context is not a tool page")
     _active_page = page
     # Leaving TinyFish does NOT end its session: ending a paid session because
     # of what it costs is automatic cost control, which the design principles
@@ -2784,6 +2806,14 @@ async def _read_pointer_position(
 
 
 async def _vnc_click_turnstile(page) -> bool:
+    """:func:`_vnc_click_now`, unless a card payment runs (it would aim at the
+    active X window, which can be the payment window); a payment cannot start
+    while it clicks."""
+    with payment_context.try_x_input() as ok:
+        return ok and await _vnc_click_now(page)
+
+
+async def _vnc_click_now(page) -> bool:
     """Click the Turnstile checkbox via VNC trusted input (fallback).
 
     Uses vncdotool to send a mouse click through the VNC protocol, producing
@@ -3179,6 +3209,10 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                 _ts_log.info("RESOLVED: playwright_captcha (challenge gone)")
                 return {"status": "resolved", "method": "playwright_captcha"}
 
+        # Phases 2-3 click on the shared display, where a payment window may be.
+        if payment_context.in_flight():
+            return {"status": "blocked", "reason": "payment_in_flight"}
+
         # Phase 2: VNC click — last resort fallback
         _ts_log.info("PHASE 2: VNC click fallback")
         logger.warning(
@@ -3217,6 +3251,8 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                     attempt,
                 )
             else:
+                if payment_context.in_flight():  # stood down, not a VNC fault
+                    return {"status": "blocked", "reason": "payment_in_flight"}
                 vnc_failed_count += 1
                 logger.warning(
                     "VNC click attempt %d failed — repairing VNC infra",
@@ -3319,6 +3355,8 @@ async def _impl_browser_navigate(
         return {"error": f"Chromium is not ready: {e}"}
     except packages.BrowserPackagesChanged as e:
         return {"error": str(e)}
+    except payment_context.PaymentInFlight:
+        return {"error": card_fill.TEXTS["payment_in_flight"], "code": "payment_in_flight"}
     except PatchrightBroken as e:
         # Restarting comes first when a package changed under this session, as for
         # any import error; otherwise the message is patchright's own repair.
@@ -3590,7 +3628,7 @@ async def _follow_new_page(old, new) -> str | None:
     global _active_page
 
     layer = _layer_of(old)
-    if layer is None:
+    if layer is None or payment_context.is_payment_page(new):
         return _NOT_FOLLOWED_LAYER_MOVED
     # The endpoint whose Genesis tab id the follow and a later close rewrite
     # (_remote_target_ids is keyed by CDP URL). While remote CDP drives ``old``
@@ -4710,6 +4748,64 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# browser_fill_card: the flow is payment_context's; this is the entry point
+# ---------------------------------------------------------------------------
+
+
+async def _close_browser_for_payment(ctx) -> None:
+    """The payment context would not close: close Camoufox, and it with it, if
+    it is still the launch the payment ran on (not one started since)."""
+    async with _browser_lock:
+        if _stealth_browser is ctx:
+            await _cleanup_camoufox()
+
+
+@_redacted
+async def _impl_browser_fill_card(
+    card_ref: str = "",
+    amount: str = "",
+    fields: dict | None = None,
+    pay: str | dict | None = None,
+    expiry_format: str = "MM/YY",
+    extra_fields: dict | None = None,
+    report=None,
+) -> dict:
+    """Pay with a vault card in an isolated browser context. See browser_fill_card."""
+    try:
+        if not card_fill.card_fill_enabled():
+            return card_fill.result("card_fill_disabled")
+        if card_fill.playwright_debug_on():
+            return card_fill.result("playwright_debug_on")
+        args = card_fill.validate(card_ref, amount, fields, pay, expiry_format, extra_fields)
+        # Short hold: every browser tool waits on this lock, and the flow waits minutes.
+        async with _browser_lock:
+            page, ctx = _active_page, _stealth_browser
+            if page is None or not _is_page_alive(page):
+                return card_fill.result("no_page")
+            if _layer_of(page) is not BrowserLayer.CAMOUFOX or ctx is None:
+                return card_fill.result("not_camoufox")
+            if card_fill.origin_of(page.url) is None:
+                return card_fill.result("not_http")
+            if not payment_context.prefs_pinned():
+                return card_fill.result("prefs_not_pinned")
+            if packages.stale_loaded_modules(_layer_dists(BrowserLayer.CAMOUFOX)):
+                return card_fill.result("browser_packages_changed")
+        _touch(BrowserLayer.CAMOUFOX)
+        hooks = payment_context.Hooks(
+            alive=lambda: _stealth_browser is ctx,
+            touch=lambda: _touch(BrowserLayer.CAMOUFOX),
+            interstitial=_detect_interstitial,
+            close_browser=lambda: _close_browser_for_payment(ctx),
+        )
+        return await payment_context.fill_card(args, ctx, page, hooks, report)
+    except card_fill.Refused as r:
+        return card_fill.result(r.code)
+    except Exception as e:  # noqa: BLE001 - never an exception's text: it may quote the page
+        logger.error("browser_fill_card failed (%s)", type(e).__name__)
+        return card_fill.result("internal_error")
+
+
+# ---------------------------------------------------------------------------
 # MCP tool registrations
 # ---------------------------------------------------------------------------
 
@@ -4982,6 +5078,62 @@ async def browser_press_key(key: str, count: int = 1) -> dict:
         _impl_browser_press_key(key, count),
         30.0,
         f"browser_press_key('{key}')",
+    )
+
+
+@mcp.tool()
+async def browser_fill_card(
+    card_ref: str = "",
+    amount: str = "",
+    fields: dict | None = None,
+    pay: str | dict | None = None,
+    expiry_format: str = "MM/YY",
+    extra_fields: dict | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Pay with a vault card on the Camoufox checkout page now open, after the
+    owner approves this payment with a Telegram tap. Card values never reach you.
+
+    The checkout is reopened in a separate, short-lived browser context that no
+    other browser tool can reach and the display shows blank; this tool fills
+    the card there, clicks Pay itself, and closes it before returning.
+
+    card_ref: the vault card (card_ + 12 hex). amount: the total exactly as the
+    page states it (it must appear on the page; the owner sees it). fields: kind
+    -> CSS selector, or {"selector": ..., "frames": [iframe selector, ...]} for
+    a field inside (nested) iframes. Kinds: number (required), expiry, or
+    exp_month and exp_year, cvc, name, postal_code; each must match one element
+    whose autocomplete names its kind (cc-number, cc-exp, cc-csc, cc-name,
+    postal-code), or a labelled tel input or select. pay: the Pay button, same
+    shape (a button or input type=submit; its label is shown to the owner).
+    expiry_format: MM/YY, MM / YY, MM-YY, MMYY, MM/YYYY or MMYYYY.
+    extra_fields: other checkout fields to fill first, name -> {"selector",
+    "value"}, names from email, name, phone, address_line1, address_line2, city,
+    region, postal_code, country, company (top document only; the owner sees
+    the names, never the values).
+
+    Waits for the tap (up to about 12 minutes). Returns {code, status, host}
+    and, where they apply, filled (field kinds typed), field, reason. After Pay
+    the code is submitted_unverified, challenge or outcome_unknown; for the
+    last two, do NOT retry: tell the owner. The main browser does not get the
+    payment context's cookies back, so it may not show the order.
+
+    Refused while card fill is off (config/payments.yaml) or another payment runs.
+    """
+    last_sent = 0.0
+
+    async def report(message: str) -> None:
+        nonlocal last_sent
+        if ctx is None or time.monotonic() - last_sent < _FILL_PROGRESS_EVERY_S:
+            return
+        last_sent = time.monotonic()
+        with contextlib.suppress(Exception):  # best effort: a lost report changes nothing
+            await asyncio.wait_for(
+                ctx.report_progress(0, message=message), timeout=_FILL_PROGRESS_SEND_S
+            )
+
+    return await _impl_browser_fill_card(
+        card_ref, amount, fields, pay, expiry_format, extra_fields, report=report
     )
 
 

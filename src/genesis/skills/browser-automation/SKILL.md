@@ -387,7 +387,23 @@ error, followed by a checklist. Read the underlying error to find the cause.
 **Money.** Before any purchase or payment: summarise what is bought, show the
 total, get explicit approval for this transaction (approval never carries over),
 and never click "Place order", "Pay now" or similar without it. Never type a
-card number. The user types it on the VNC display or in their own Chrome.
+card number with the general tools. The user types it on the VNC display or in
+their own Chrome, or, when card fill is on, use `browser_fill_card`:
+
+- Open the checkout with `browser_navigate` (Camoufox) and read the card
+  fields, the Pay button and the total off a snapshot. Pass selectors, never
+  values: `fields` (number, expiry or exp_month+exp_year, cvc, name,
+  postal_code; `{"selector", "frames"}` for fields inside iframes), `pay`, the
+  total as `amount` exactly as the page shows it, and other checkout fields as
+  `extra_fields` (`{"email": {"selector": "#email", "value": "..."}}`).
+- The tool reopens the checkout in a window no other tool reaches, waits for
+  the owner's Telegram tap, fills, clicks Pay itself and closes the window.
+  You get a fixed `code` and `status` only.
+- `submitted_unverified`: check the order page or the merchant account.
+  `challenge` or `outcome_unknown`: do NOT retry; tell the owner the outcome is
+  unknown. Any code before Pay (`failed_before_pay`, `claimed_not_filled`, a
+  refusal): nothing was paid; a single-use card may be spent, so ask the owner
+  before trying again.
 
 **Credentials.**
 - Do not type a password, code or card number the user pasted into chat. Ask
