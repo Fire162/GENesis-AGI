@@ -1705,8 +1705,12 @@ the shared banner is not an assertion about all concurrent sessions.
   accepts (a dotted DNS name: no IP, single-label or loopback host), every
   document is masked transparent from creation and kept so by an observer, the owner's tap shows the Pay button label and the
   extra field names, the tool clicks Pay itself and returns fixed codes only.
-  Before Pay it re-checks the tapped title, origins, Pay control, amount and
-  extra fields, and reads every card field back.
+  Before the tap it waits up to 10 s for a hosted widget's frames, fields, Pay
+  and total to mount (after it, a missing element means the page changed).
+  After the grant, after the claim and before Pay it re-checks the tapped
+  title, origins, Pay control, amount, extra fields and for a bot check, and
+  before Pay reads every card field back; it keeps reporting progress until
+  the end, so a client's idle timeout does not cancel it past the claim.
   While it runs, the idle reclaim skips Camoufox, Turnstile's X clicks in the
   same MCP process stand down (other processes on the display: not yet), and after the claim a stale-page restart is refused. Cookies are not
   handed back to the main context yet, and a 3DS challenge closes the context

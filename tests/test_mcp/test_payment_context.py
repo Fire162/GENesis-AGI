@@ -120,6 +120,19 @@ class Loc:
     def __init__(self, frame, sel):
         self.frame, self.sel = frame, sel
 
+    @property
+    def first(self):
+        return self
+
+    async def wait_for(self, state=None, timeout=None):
+        # A widget that mounts late: its elements appear when something waits.
+        self.frame.waits.append(self.sel)
+        late = self.frame.late.pop(self.sel, None)
+        if late is not None:
+            self.frame.elements[self.sel] = late
+        if not self.frame.elements.get(self.sel):
+            raise TimeoutError("not attached")
+
     async def count(self):
         return len(self.frame.elements.get(self.sel, []))
 
@@ -130,6 +143,8 @@ class Loc:
 class Frame:
     def __init__(self, url, elements=None, text=""):
         self.url, self.elements, self.text = url, elements or {}, text
+        self.late: dict = {}  # selector -> elements that mount only once waited for
+        self.waits: list[str] = []
         self.masked = True
         self.session: dict = {}
 
@@ -398,6 +413,7 @@ def _clean(monkeypatch):
         ("SETTLE_S", 0.3),
         ("NAV_GRACE_S", 0.05),
         ("TICK_S", 0.01),
+        ("ATTACH_S", 0.05),
     ):
         monkeypatch.setattr(pc, name, value)
     # The flow reads Camoufox's media defaults for the payment context. CI's test
@@ -514,7 +530,10 @@ async def test_pays_in_an_isolated_context_and_returns_fixed_text(vault, logs):
     assert [o["origin"] for o in kw["storage_state"]["origins"]] == ["https://shop.example.com"]
     assert ns.pctx.closed and not pc.in_flight()
     assert vault.ops("release_cancel") == [] and vault.half_closed == []
-    assert progress and all("approval" in m for m in progress)
+    # Progress waits for the tap, then keeps the client's idle clock fed to the end.
+    assert progress[0].startswith("waiting for the owner's approval")
+    after = progress[progress.index("finishing the approved payment") :]
+    assert set(after) == {"finishing the approved payment"}
     _sweep(out, logs, progress)
 
 
@@ -938,6 +957,60 @@ async def test_card_fields_are_read_back_after_the_last_pay_check(vault):
         Handle.fill, Handle.evaluate = real_fill, real_eval
     assert len(reads) == 2
     assert out["code"] == "failed_before_pay" and out["field"] == "cvc" and clicked == []
+
+
+async def test_a_widget_that_mounts_after_load_is_waited_for_before_the_tap(vault):
+    """Hosted card frames and Pay often mount after DOMContentLoaded."""
+    ns = checkout()
+    for page in (ns.main_page, ns.ppage):
+        page.main_frame.late["iframe#card"] = page.main_frame.elements.pop("iframe#card")
+    ns.ppage.main_frame.late["#pay"] = ns.ppage.main_frame.elements.pop("#pay")
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+    assert "iframe#card" in ns.main_page.main_frame.waits  # the handover walk waited too
+    assert {"iframe#card", "#pay"} <= set(ns.ppage.main_frame.waits)
+
+
+async def test_after_the_tap_an_absent_element_is_not_waited_for(vault):
+    """Past the tap, absence means the page changed: no wait, release cancelled."""
+    ns = checkout()
+
+    def unmount():
+        ns.ppage.main_frame.late["#pay"] = ns.ppage.main_frame.elements.pop("#pay")
+
+    vault.on_status = unmount
+    out, _ = await _run(ns)
+    assert out["code"] == "pay_not_found"
+    assert vault.ops("release_claim") == [] and vault.ops("release_cancel")
+
+
+async def test_two_card_kinds_on_one_element_are_refused_before_the_tap(vault):
+    ns = checkout()
+    ns.els["number"].kinds.add("cvc")  # malformed markup: one input reads as both
+    ns.fields["cvc"] = {"selector": "#num", "frames": ["iframe#card"]}
+    out, _ = await _run(ns)
+    assert out["code"] == "field_ambiguous:cvc" and vault.requests == []
+
+
+@pytest.mark.parametrize(
+    ("hits", "code"),
+    [
+        (1, "page_changed"),  # after the grant: the release is cancelled
+        (2, "claimed_not_filled"),  # after the claim: nothing typed
+        (3, "failed_before_pay"),  # before Pay: not clicked
+    ],
+)
+async def test_a_bot_check_appearing_after_the_tap_stops_the_flow(vault, hits, code):
+    ns = checkout()
+    clicked = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    hooks = Hooks()
+    # The first call is the pre-tap check; the next ones are _same_page's.
+    hooks.interstitial = AsyncMock(side_effect=[False] * hits + [True] * 10)
+    out, _ = await _run(ns, hooks=hooks)
+    assert out["code"] == code and clicked == []
+    if code == "page_changed":
+        assert vault.ops("release_claim") == []
 
 
 async def test_every_frame_on_a_chain_gets_its_storage(vault):
