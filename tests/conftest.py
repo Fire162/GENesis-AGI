@@ -481,6 +481,12 @@ def _configure_lock_and_basetemp(config):
         _reap_stale_pytest_basetemps(pytest_base)
         target = os.path.join(pytest_base, str(os.getpid()))
         Path(target).mkdir(parents=True, exist_ok=True)
+        # A test HOME left by a killed run that had this PID (the reaper spares
+        # live PIDs, and this one is ours): pytest empties basetemp itself, but
+        # the live closure would reuse this, state and all.
+        stale_home = os.path.join(target, "home")
+        if os.path.lexists(stale_home):
+            _force_rmtree(stale_home)
     except Exception as exc:  # noqa: BLE001 — see the note above the try
         # Say so. A silent fall-back lands the temp tree back on whatever
         # pytest's default is — which on an install with a tmpfs /tmp is the
@@ -492,7 +498,11 @@ def _configure_lock_and_basetemp(config):
             "Set GENESIS_BIG_TMP to a writable on-disk directory."
         )
         return
-    config.option.basetemp = target
+    # basetemp is a CHILD of the per-PID leaf, not the leaf itself: pytest empties
+    # basetemp the first time a test asks for tmp_path, and the live closure keeps
+    # the session's test HOME beside it (``<leaf>/home``), so it must not be
+    # inside. The reaper and the cleanup below remove the whole leaf.
+    config.option.basetemp = os.path.join(target, "bt")
     config._genesis_basetemp_cleanup = target
 
 
@@ -511,6 +521,17 @@ def pytest_unconfigure(config):
         from tests import _live_closure, _live_fence
 
         _live_fence.uninstall_files(config)
+        # The test HOME outside the leaf (no basetemp redirect) lives in the
+        # closure's directory; read-only trees (git objects) need the forced
+        # removal before that directory's plain one.
+        home = getattr(config, "_genesis_live_home_cleanup", None)
+        if home:
+            try:
+                _force_rmtree(home)
+            except Exception as exc:  # noqa: BLE001 — best-effort, as below
+                _warn_without_escalating(
+                    f"genesis: cleanup of the test HOME {home} failed ({exc!r})."
+                )
         _live_closure.uninstall_files(config)
         if target:
             # BROAD for the same reason as pytest_configure's fallback: a hook that

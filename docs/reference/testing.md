@@ -236,17 +236,38 @@ a test behaves as it does on CI, where none exist. Child processes inherit it.
   memory hook as a child never posts to the live server.
 - `GENESIS_DB_PATH` is set per test (`_isolate_genesis_db_path` in
   `tests/conftest.py`) to the same temp database the in-process patch returns.
+- `GENESIS_MCP_LOG_DIR` names a directory that does not exist, so importing the
+  health MCP opens no log in the shared `~/tmp`.
+- `HOME` names a private directory for the whole session, so anything resolved
+  through `Path.home()` or `~` (tokens, the Guardian's shared policy file,
+  caches, stamps, logs, `~/tmp` scratch) lands there instead of the real home.
+  It sits beside pytest's basetemp in the per-process leaf under
+  `~/tmp/pytest/<pid>/` (basetemp is `<leaf>/bt`, the home `<leaf>/home`); on CI
+  or with an explicit `--basetemp` it is a temp directory beside that basetemp,
+  or in the default temp dir. It holds only `tmp/` at the start. It is set after
+  the box lock and basetemp are placed, which both read HOME. pytest imports
+  `tests/test*/conftest.py` before that point on a directory run, so state paths
+  `genesis` modules have already bound under the real home (`~/.genesis`,
+  `~/.claude`, `~/tmp`, `~/.cache`, `~/.config`, `~/.local/share`,
+  `~/.local/state`) are moved into the test home, and the summary names each
+  one. `_live_closure.REAL_HOME` names the real home for a test that must use it
+  (the fence's deploy-script tests do).
+  `PLAYWRIGHT_BROWSERS_PATH` keeps pointing at the real browser cache, so the
+  UI tests still find their browser.
 - A test that sets its own value with `monkeypatch` still wins.
-- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves secrets in place, and the
-  summary says so; the git, gh and hook-URL settings still apply.
+- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves secrets and HOME in
+  place, and the summary says so; the git, gh and hook-URL settings still apply.
 - Not covered:
   - a reader that builds its own path to `secrets.env` instead of honouring
     `SECRETS_PATH`;
-  - credentials kept in other files (`~/.claude`, `~/.genesis`, `~/.ssh`,
-    `~/.git-credentials`);
-  - state paths other than the database: `GENESIS_HOME` is not redirected,
-    and a reader of the fixed `~/genesis/data/genesis.db` path ignores
-    `GENESIS_DB_PATH`.
+  - a path built from the password database rather than HOME, and a child
+    process started with an environment that has no `HOME` at all (Python and
+    bash then fall back to the real home);
+  - an explicit `GENESIS_HOME` a test or the environment sets;
+  - a home path bound before the redirect as a string, inside a container, or
+    by a module outside the `genesis` package;
+  - `tempfile` output, which goes to `TMPDIR` (on some installs a directory in
+    the real home).
 
 ## Integration Tests
 
