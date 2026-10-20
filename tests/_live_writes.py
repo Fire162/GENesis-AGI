@@ -21,8 +21,9 @@ A PEP 578 audit hook judges, in this interpreter:
   ``~/.genesis/cc_oauth_token.env``).
 
 A write counts when it lands under the real home and outside the allowed
-places: the temp directory (``tempfile.gettempdir()``), pytest's basetemp, the
-box lock file, ``/dev``, and ``__pycache__`` / ``.pytest_cache`` directories.
+places: the temp directory (``tempfile.gettempdir()``), pytest's basetemp and its
+per-process leaf, the live closure's test HOME, the box lock file this run took,
+``/dev``, and ``__pycache__`` / ``.pytest_cache`` directories.
 Paths given relative to a directory descriptor are resolved through
 ``/proc/self/fd``. Each write is classed by where it lands (the deployed
 checkout, this checkout, ``~/.genesis``, ``~/.claude``, elsewhere in the home)
@@ -271,15 +272,26 @@ def install(config) -> None:
     """Arm the write audit. Idempotent: an audit hook cannot be removed."""
     if _S.installed:
         return
-    from genesis.util.pytest_lock import default_lock_path
+    from tests import _live_closure
 
     home = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
     _S.real_home = home
     roots = {os.path.realpath(tempfile.gettempdir())}
-    if config.option.basetemp:
-        roots.add(os.path.realpath(str(config.option.basetemp)))
+    # basetemp, its per-process leaf, and the closure's test HOME (which may sit
+    # under the real home, in ~/tmp/pytest/<pid>).
+    for root in (
+        config.option.basetemp,
+        getattr(config, "_genesis_basetemp_cleanup", None),
+        _live_closure._S.home,
+    ):
+        if root:
+            roots.add(os.path.realpath(str(root)))
     _S.allowed_roots = tuple(sorted(roots))
-    lock = default_lock_path()
+    # The lock this run took. default_lock_path() would now resolve under the
+    # test home (HOME has moved), where there is no lock. (Its holder record is
+    # written through an fd opened before this hook, so today nothing reports it
+    # either way; the entry names the right file for any later open.)
+    lock = getattr(getattr(config, "_genesis_pytest_lock", None), "_path", None)
     _S.allowed_files = frozenset({os.path.realpath(str(lock))} if lock else ())
     repo = os.path.realpath(str(Path(__file__).resolve().parent.parent))
     deployed = os.path.realpath(os.path.join(home, "genesis"))
