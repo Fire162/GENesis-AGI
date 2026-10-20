@@ -14,12 +14,16 @@ label, field origins and the extra field names), wait for the tap, re-check
 the page, claim the card once, fill the card fields through element handles,
 click Pay, classify what followed, and close the context. Every document of
 the context is masked (fully transparent) from creation, so the display shows
-nothing of the checkout.
+nothing of the checkout. Every request of the context passes a network guard
+(``_UrlGuard``) that, once the card is claimed, aborts any request whose URL
+carries the card number (the first request of a redirect chain; a redirect
+hop carrying it is seen and reported instead; a WebSocket URL is not covered).
 
 The agent gets back only a fixed code and text, the merchant host, the kinds
 of fields typed, and a vault reason from its fixed set: never page text, a
 URL path, an exception's text or a value. Card values live in locals of one
-coroutine and are dropped after the fill.
+coroutine and are dropped after the fill; the network guard keeps only a random
+key, the number's length and its keyed digest, for the context's life.
 """
 
 from __future__ import annotations
@@ -27,13 +31,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import re
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import unquote_plus, urlsplit
 
 from genesis.browser.profile import domain_matches, registrable_domain
 from genesis.payments import card_fill as cf
@@ -157,17 +162,27 @@ CARD_FIELD_JS = r"""(e, kind) => {
   return label.test(text) ? tag : '';
 }"""
 # The Pay control: a button (not type=reset) or an input type=submit; whether
-# its effective form method is GET; whether it can be clicked; its label.
+# its form DECLARES GET (a formmethod or method attribute whose value, or invalid
+# value, means GET); whether it can be clicked; its label. A form that is GET
+# only because it has no method attribute is how script-handled checkouts look
+# (the script cancels the submit and pays by its own request), so it is not
+# refused here: the payment context's network guard (_UrlGuard) blocks any
+# request whose URL carries the card number (see its docstring for the limits).
 PAY_JS = r"""(e) => {
   const tag = e.tagName.toLowerCase();
   const type = (e.getAttribute('type') || '').toLowerCase();
   const button = tag === 'button' ? type !== 'reset' : tag === 'input' && type === 'submit';
   const f = e.form;
-  const m = !f ? '' : (e.hasAttribute('formmethod') ? e.formMethod : f.method);
+  const m = !f ? '' : e.hasAttribute('formmethod') ? e.formMethod
+    : f.hasAttribute('method') ? f.method : '';
+  const dget = !!f && !e.hasAttribute('formmethod') && !f.hasAttribute('method');
   const label = tag === 'input' ? (e.value || '') : (e.innerText || e.textContent || '');
-  return {button, get: String(m).toLowerCase() === 'get',
+  return {button, get: String(m).toLowerCase() === 'get', dget,
           live: e.isConnected && !e.disabled, label: label.slice(0, 200)};
 }"""
+# Whether field ``e`` would be sent by a native submit of Pay ``p``'s form: in
+# that form, named, enabled. Only asked of a field in Pay's own document.
+SENT_WITH_PAY_JS = "(e, p) => !!e.form && !!p.form && e.form === p.form && !!e.name && !e.disabled"
 # An extra (non-card) field: an input, textarea or select whose autocomplete
 # names no card token. Returns the tag, or ''.
 EXTRA_FIELD_JS = r"""(e) => {
@@ -224,6 +239,8 @@ class _Flow:
     paid: bool = False
     popup: bool = False
     navs: int = 0
+    url_blocked: bool = False  # the network guard aborted a request carrying the card number
+    url_leaked: bool = False  # a redirect hop carried the card number (a route cannot stop it)
     abort_reason: str | None = None
     tearing_down: bool = False
     stuck: bool = False  # the fallback browser close was not reached
@@ -231,6 +248,110 @@ class _Flow:
     report: Callable[[str], Awaitable[None]] | None = None
     granted: bool = False  # past the tap: keep the client's idle clock fed
     done: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+# What may sit between the card number's digits in a URL and still read as it:
+# spaces, plus signs, dots, slashes, dashes and underscores (value_landed in
+# card_fill accepts a slash as card formatting too). ``&`` and ``=`` still end a
+# run, so a match needs the whole number inside one parameter or path segment.
+_URL_SEPARATORS = re.compile(r"[\s.+/_-]+")
+# The guard computes one keyed digest per digit window, on the event loop that
+# also runs the flow: about 6 us each (measured, so 1M digits took 6.4 s). A URL
+# needing more windows than this (about 25 ms of work) is not judged; the route
+# aborts it, unrecorded. No real checkout URL comes near: it takes 4,096 digit
+# windows, a single run over 4,000 digits long for a 16-digit card.
+_MAX_WINDOWS = 4096
+
+
+class _Unjudgeable(Exception):
+    """A URL too heavy to check within _MAX_WINDOWS."""
+
+
+class _UrlGuard:
+    """The network half of "card values never leave in a URL".
+
+    Routed on the whole payment context before its first page loads, so the
+    first request of every redirect chain, in every frame and popup, passes
+    through ``handle``: a native GET form, a page's ``form.submit()``, a link,
+    ``location``, ``fetch``, a beacon. Armed after the claim with the card
+    number; from then on a request whose URL holds that number (decoded twice;
+    spaces, plus signs, dots, slashes, dashes and underscores ignored) is
+    aborted and recorded on the flow (``url_blocked``). A request the guard
+    cannot judge is aborted too, without the record (it does not know the card
+    was in it).
+
+    What a route cannot stop: a redirect hop (Playwright calls the handler for
+    the first URL of a chain only) and a WebSocket URL. A redirect hop that
+    carries the number is still SEEN, by ``on_request``, and recorded as
+    ``url_leaked``: it already left, so the flow reports it rather than claiming
+    it was blocked. A WebSocket URL is neither stopped nor seen.
+
+    The number itself is not kept: only a random key, its length and its keyed
+    digest, which outlive the fill for the context's life.
+    """
+
+    def __init__(self, flow: _Flow) -> None:
+        self._flow = flow
+        self._key = b""
+        self._len = 0
+        self._tag: bytes | None = None
+
+    def _mac(self, digits: str) -> bytes:
+        return hmac.new(self._key, digits.encode(), "sha256").digest()
+
+    def arm(self, number: str) -> None:
+        digits = re.sub(r"\D", "", number)
+        self._key = secrets.token_bytes(32)
+        self._len = len(digits)
+        self._tag = self._mac(digits)
+        del digits
+
+    def carries(self, url: str) -> bool:
+        """Whether ``url`` holds the armed number. Raises _Unjudgeable when the
+        check would take more than _MAX_WINDOWS digests."""
+        if self._tag is None or self._len == 0:
+            return False
+        text = _URL_SEPARATORS.sub("", unquote_plus(unquote_plus(url)))
+        n = self._len
+        runs = re.findall(rf"\d{{{n},}}", text)
+        if sum(len(run) - n + 1 for run in runs) > _MAX_WINDOWS:
+            raise _Unjudgeable
+        for run in runs:
+            for i in range(len(run) - n + 1):
+                if hmac.compare_digest(self._mac(run[i : i + n]), self._tag):
+                    return True
+        return False
+
+    async def handle(self, route) -> None:
+        try:
+            hit = self.carries(route.request.url)
+        except Exception as e:  # noqa: BLE001 - never the URL
+            logger.warning("payment url guard could not judge a request (%s)", type(e).__name__)
+            with contextlib.suppress(Exception):
+                await route.abort("failed")
+            return
+        if hit:
+            self._flow.url_blocked = True
+            with contextlib.suppress(Exception):
+                await route.abort("blockedbyclient")
+            return
+        try:
+            await route.continue_()
+        except Exception as e:  # noqa: BLE001 - the request stays paused: it never leaves
+            logger.warning("payment url guard could not pass a request on (%s)", type(e).__name__)
+
+    def on_request(self, request) -> None:
+        """The context's request event: a redirect hop that carries the number."""
+        if getattr(request, "redirected_from", None) is None:
+            return
+        try:
+            leaked = self.carries(request.url)
+        except Exception as e:  # noqa: BLE001 - never the URL
+            # Too heavy to check: counted as a leak, the outcome cannot be vouched for.
+            logger.warning("payment url guard could not judge a redirect (%s)", type(e).__name__)
+            leaked = self._tag is not None
+        if leaked:
+            self._flow.url_leaked = True
 
 
 class _Stop(Exception):
@@ -475,6 +596,17 @@ async def _resolve(page, args: cf.CardArgs, wait=False) -> tuple[dict[str, _Fiel
         raise _Stop("pay_not_button")
     if info.get("get") is not False:
         raise _Stop("pay_get_form")
+    if info.get("dget") is True:
+        # GET only by default: the network guard blocks any URL holding the
+        # number, so this is safe while a native submit would carry the number
+        # too. Card fields it would send WITHOUT the number (the number in a
+        # provider frame, or unnamed) would reach a URL the guard cannot see.
+        sent = set()
+        for kind, f in fields.items():
+            if f.frame is frame and await _step(f.handle.evaluate(SENT_WITH_PAY_JS, handle)):
+                sent.add(kind)
+        if sent and "number" not in sent:
+            raise _Stop("pay_get_form")
     label = info.get("label")
     return fields, _Field(frame, handle, "pay", origin), label if isinstance(label, str) else ""
 
@@ -680,10 +812,16 @@ def _is_challenge(url) -> bool:
 
 async def _outcome(flow: _Flow, ppage, start: str, before: set, site: str, hooks: Hooks) -> str:
     """What followed the Pay click (``start``: the URL before it; ``before``: the
-    frame URLs then), from navigation and new frame URLs only."""
+    frame URLs then), from navigation and new frame URLs only. A request the
+    network guard saw carrying the card number outranks them all: a redirect hop
+    it could only see (leaked) before a request it stopped (blocked)."""
     loop = asyncio.get_running_loop()
     deadline, moved = loop.time() + SETTLE_S, False
     while loop.time() < deadline:
+        if flow.url_leaked:
+            return "card_url_leaked"
+        if flow.url_blocked:
+            return "card_url_blocked"
         if not hooks.alive() or ppage.is_closed():
             return "outcome_unknown"
         # ppage.frames includes the main frame: a top-level move to a challenge
@@ -697,6 +835,10 @@ async def _outcome(flow: _Flow, ppage, start: str, before: set, site: str, hooks
         hooks.touch()
         await _beat()
         await asyncio.sleep(TICK_S)
+    if flow.url_leaked:
+        return "card_url_leaked"
+    if flow.url_blocked:
+        return "card_url_blocked"
     if not moved:
         return "challenge"  # no settle within the bound: a bank check, a decline, or stuck
     host = urlsplit(ppage.url).hostname
@@ -745,12 +887,16 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
                 storage_state=handed,
                 no_viewport=True,  # as the persistent launch; a viewport can hang new_page()
                 accept_downloads=False,
+                service_workers="block",  # a worker's requests would not pass the route
                 **STOCK_MEDIA_DEFAULTS,
             )
         )
         del handed
         pctx.on("dialog", lambda d: _spawn(d.dismiss()))
         await _step(pctx.add_init_script(MASK_INIT_JS))
+        guard = _UrlGuard(flow)
+        await _step(pctx.route("**/*", guard.handle))
+        pctx.on("request", guard.on_request)
         seed = None
         if session:  # into an empty sessionStorage of the same origin, before page scripts
             seed = await _step(
@@ -849,6 +995,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         values = cf.values_for(card, list(fields), args.expiry_format)
     finally:
         del card
+    guard.arm(values["number"])  # before anything is typed
 
     # Typing. Nothing is typed into a page that changed after the tap.
     if _gone(flow, ppage, hooks) or not await _same_page(
@@ -859,6 +1006,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     try:
         flow.typing = True
         for kind, f in fields.items():
+            if flow.url_blocked or flow.url_leaked:
+                raise _Stop("card_url_before_pay", filled=flow.typed)
             if cf.origin_of(f.frame.url) != origins[kind] or not await _mask_ok(ppage):
                 raise _Stop("failed_before_pay", field=kind, filled=flow.typed)
             if f.tag == "select":
@@ -877,6 +1026,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             ppage, args, top, seen, label, title, fields, pay, hooks, clicking=True
         ):
             raise _Stop("failed_before_pay", filled=flow.typed)
+        if flow.url_blocked or flow.url_leaked:
+            raise _Stop("card_url_before_pay", filled=flow.typed)
         if _moved(ppage, top, fields, pay, seen) or not _pay_ok(
             await _step(pay.handle.evaluate(PAY_JS)), label, clicking=True
         ):
@@ -896,4 +1047,9 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     with contextlib.suppress(Exception):
         await _step(pay.handle.click(timeout=CLICK_MS))
     code = await _outcome(flow, ppage, start, before, site, hooks)
+    # A flag set after _outcome's last look still outranks what it saw.
+    if flow.url_leaked:
+        code = "card_url_leaked"
+    elif flow.url_blocked:
+        code = "card_url_blocked"
     return cf.result(code, flow.host, filled=flow.typed)

@@ -1705,6 +1705,16 @@ the shared banner is not an assertion about all concurrent sessions.
   accepts (a dotted DNS name: no IP, single-label or loopback host), every
   document is masked transparent from creation and kept so by an observer, the owner's tap shows the Pay button label and the
   extra field names, the tool clicks Pay itself and returns fixed codes only.
+  Card values never leave in a URL: a Pay control whose form DECLARES GET, or
+  whose default-GET form would send card fields without the number, is
+  refused before the tap, and a context-wide network route aborts the first
+  request of any redirect chain whose URL carries the claimed card number
+  (`card_url_blocked`, do not retry), so a script-handled form that is GET only
+  by default is not refused. A redirect hop carrying it cannot be stopped by a
+  route; it is seen and reported (`card_url_leaked`; before Pay,
+  `card_url_before_pay`). WebSocket URLs are not covered. This guards a trusted
+  merchant's flawed form, not a hostile page script: one that reads a field can
+  still send it another way (a request body, an encoding the guard does not undo).
   Before the tap it waits up to 10 s for a hosted widget's frames, fields, Pay
   and total to mount (after it, a missing element means the page changed).
   After the grant, after the claim and before Pay it re-checks the tapped

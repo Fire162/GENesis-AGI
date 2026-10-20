@@ -5106,6 +5106,8 @@ async def browser_fill_card(
     whose autocomplete names its kind (cc-number, cc-exp, cc-csc, cc-name,
     postal-code), or a labelled tel input or select. pay: the Pay button, same
     shape (a button or input type=submit; its label is shown to the owner).
+    browser_snapshot and browser_run_js see only the top document, not inside
+    a cross-origin checkout frame: there, use the provider's standard ids.
     expiry_format: MM/YY, MM / YY, MM-YY, MMYY, MM/YYYY or MMYYYY.
     extra_fields: other checkout fields to fill first, name -> {"selector",
     "value"}, names from email, name, phone, address_line1, address_line2, city,
@@ -5114,8 +5116,10 @@ async def browser_fill_card(
 
     Waits for the tap (up to about 12 minutes). Returns {code, status, host}
     and, where they apply, filled (field kinds typed), field, reason. After Pay
-    the code is submitted_unverified, challenge or outcome_unknown; for the
-    last two, do NOT retry: tell the owner. The main browser does not get the
+    the code is submitted_unverified, challenge, card_url_blocked (a request
+    carrying the card number in its URL was blocked), card_url_leaked (a
+    redirect carried it) or outcome_unknown; for all but the first, do NOT
+    retry: tell the owner. The main browser does not get the
     payment context's cookies back, so it may not show the order.
 
     Refused while card fill is off (config/payments.yaml) or another payment runs.

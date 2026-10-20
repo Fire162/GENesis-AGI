@@ -91,7 +91,8 @@ TEXTS = {
     "not_https": "The checkout is not served over https at a named host." + _NONE,
     "pay_not_found": "The pay selector did not match exactly one element.",
     "pay_not_button": "The pay control must be a button or an input type=submit.",
-    "pay_get_form": "Refused: the pay control submits with GET (the card would be in a URL).",
+    "pay_get_form": "Refused: the pay control's form declares GET, or would send card fields "
+    "without the number in a URL.",
     "extra_field_not_found": "An extra field selector did not match one input or select of "
     "its own.",
     "extra_field_is_card_field": "An extra_fields target is a card field.",
@@ -117,10 +118,18 @@ TEXTS = {
     "Pay was not clicked." + _SPENT,
     "failed_before_pay": "Filling stopped part-way; Pay was NOT clicked and the payment "
     "window was closed." + _SPENT,
+    "card_url_before_pay": "Pay was NOT clicked: while the card was typed, the checkout sent "
+    "or tried to send the card number in a URL. Treat the card as exposed and tell the "
+    "owner." + _SPENT,
     "submitted_unverified": "Pay was clicked and the checkout moved on. Not verified: "
     "check the order page or the merchant account.",
     "challenge": "Pay was clicked, then a bank check appeared or the checkout did not move "
     "on within 60 s; the payment window was closed." + _NO_RETRY,
+    "card_url_blocked": "Pay was clicked; the payment window blocked a request that would have "
+    "carried the card number in a URL. Whether the checkout went ahead another way is "
+    "unknown." + _NO_RETRY,
+    "card_url_leaked": "Pay was clicked; a redirect carried (or may have carried) the card number "
+    "in a URL, which the payment window could see but not stop." + _NO_RETRY,
     "outcome_unknown": "Pay was clicked, then the payment window, the browser or this call "
     "ended before the checkout settled." + _NO_RETRY,
     "internal_error": "browser_fill_card failed before Pay; detail withheld.",

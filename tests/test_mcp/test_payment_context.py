@@ -74,6 +74,7 @@ class El:
         self.value = ""
         self.mangle = False  # the page shows something other than what was typed
         self.on_click = None
+        self.sent = False  # SENT_WITH_PAY_JS's answer: a native submit of Pay's form sends it
 
 
 class Handle:
@@ -95,6 +96,8 @@ class Handle:
             return self.el.extra or self.el.tag
         if js is pc._SAME_JS:
             return arg.el is self.el
+        if js is pc.SENT_WITH_PAY_JS:
+            return self.el.sent
         if js is pc.EXTRA_VALUE_JS:
             return [self.el.value]
         raise AssertionError("unexpected script")
@@ -214,6 +217,10 @@ class PCtx:
                 log.append(("dispose", js))
 
         return Disposable()
+
+    async def route(self, pattern, handler):
+        self.log.append(("route", pattern))
+        self.route_handler = handler
 
     async def new_page(self):
         self.log.append(("new_page",))
@@ -522,9 +529,11 @@ async def test_pays_in_an_isolated_context_and_returns_fixed_text(vault, logs):
     assert EMAIL not in json.dumps(req)
     # The context: mask script before the first page, viewport as the main launch,
     # merchant and card-frame storage only, closed at the end.
-    assert ns.log[0] == ("init_script", pc.MASK_INIT_JS) and ns.log[1] == ("new_page",)
+    # The network guard is routed before the first page loads.
+    assert ns.log[:3] == [("init_script", pc.MASK_INIT_JS), ("route", "**/*"), ("new_page",)]
     kw = ns.main.new_context_kwargs
     assert kw["no_viewport"] is True and kw["accept_downloads"] is False
+    assert kw["service_workers"] == "block"  # a worker's requests would skip the route
     assert {k: kw[k] for k in MEDIA_DEFAULTS} == MEDIA_DEFAULTS  # as the main launch
     assert sorted(c["name"] for c in kw["storage_state"]["cookies"]) == ["cart", "m"]
     assert [o["origin"] for o in kw["storage_state"]["origins"]] == ["https://shop.example.com"]
@@ -535,6 +544,271 @@ async def test_pays_in_an_isolated_context_and_returns_fixed_text(vault, logs):
     after = progress[progress.index("finishing the approved payment") :]
     assert set(after) == {"finishing the approved payment"}
     _sweep(out, logs, progress)
+
+
+class Route:
+    """Playwright's Route, as the guard uses it."""
+
+    def __init__(self, url, fail=False):
+        self.request = types.SimpleNamespace(url=url)
+        self.fail = fail
+        self.done = None
+
+    async def abort(self, error_code="failed"):
+        self.done = ("abort", error_code)
+
+    async def continue_(self):
+        if self.fail:
+            raise RuntimeError("route gone")
+        self.done = ("continue",)
+
+
+def _guard(number=PAN):
+    flow = pc._Flow(task=None)
+    g = pc._UrlGuard(flow)
+    g.arm(number)
+    return flow, g
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://shop.example.com/charge?card={PAN}",
+        "https://shop.example.com/charge?card=4242+4242+4242+4242",
+        "https://shop.example.com/charge?card=4242%204242%204242%204242",
+        "https://shop.example.com/charge?card=4242-4242-4242-4242",
+        "https://shop.example.com/charge?card=4242.4242.4242.4242",
+        "https://shop.example.com/charge?card=4242%25204242%25204242%25204242",  # twice
+        f"https://shop.example.com/{PAN}/x",
+        "https://shop.example.com/c?card=4242%252B4242%252B4242%252B4242",  # '+' after decoding
+        "https://shop.example.com/c?card=4242/4242/4242/4242",
+        f"https://shop.example.com/c?x=99{PAN}77",  # inside a longer digit run
+    ],
+)
+def test_the_url_guard_finds_the_card_number_in_a_url(url):
+    _flow, g = _guard()
+    assert g.carries(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://shop.example.com/charge?order=4242424242424241",  # one digit off
+        "https://shop.example.com/charge?card=4242x4242x4242x4242",  # split by a letter
+        "https://shop.example.com/charge?last4=4242&amount=1999",
+        "https://shop.example.com/",
+    ],
+)
+def test_the_url_guard_passes_other_urls(url):
+    _flow, g = _guard()
+    assert g.carries(url) is False
+
+
+def test_an_unarmed_url_guard_passes_everything():
+    g = pc._UrlGuard(pc._Flow(task=None))
+    assert g.carries(f"https://shop.example.com/charge?card={PAN}") is False
+
+
+async def test_the_url_guard_aborts_a_carrying_request_and_records_it():
+    flow, g = _guard()
+    r = Route(f"https://shop.example.com/charge?card={PAN}")
+    await g.handle(r)
+    assert r.done == ("abort", "blockedbyclient") and flow.url_blocked is True
+    ok = Route("https://shop.example.com/charge?card=tok_abc")
+    await g.handle(ok)
+    assert ok.done == ("continue",)
+
+
+async def test_the_url_guard_aborts_when_it_cannot_judge(monkeypatch, logs):
+    flow, g = _guard()
+
+    def boom(_url):
+        raise ValueError(PAN)
+
+    monkeypatch.setattr(g, "carries", boom)
+    r = Route("https://shop.example.com/x")
+    await g.handle(r)
+    assert r.done == ("abort", "failed")  # fail closed
+    assert flow.url_blocked is False  # it could not tell: no claim that the card was in it
+    _sweep(logs)
+
+
+async def test_a_url_too_heavy_to_judge_is_aborted_unrecorded():
+    flow, g = _guard()
+    heavy = "https://t.example.org/x?d=" + "1" * (pc._MAX_WINDOWS + 16)
+    with pytest.raises(pc._Unjudgeable):
+        g.carries(heavy)
+    r = Route(heavy)
+    await g.handle(r)
+    assert r.done == ("abort", "failed") and flow.url_blocked is False
+    # Right at the bound it is still judged.
+    assert g.carries("https://t.example.org/x?d=" + "1" * (pc._MAX_WINDOWS + 15)) is False
+
+
+async def test_a_failed_pass_on_is_logged_not_raised(logs):
+    _flow, g = _guard()
+    r = Route("https://shop.example.com/a.js", fail=True)
+    await g.handle(r)
+    assert r.done is None
+    assert any("could not pass a request on" in line for line in logs)
+
+
+def _request(url, redirected=True):
+    return types.SimpleNamespace(url=url, redirected_from=object() if redirected else None)
+
+
+def test_a_redirect_hop_carrying_the_number_is_recorded_as_leaked():
+    flow, g = _guard()
+    g.on_request(_request(f"https://shop.example.com/land?pan={PAN}"))
+    assert flow.url_leaked is True and flow.url_blocked is False
+
+
+def test_a_first_request_or_a_clean_hop_is_not_a_leak():
+    flow, g = _guard()
+    g.on_request(_request(f"https://shop.example.com/c?pan={PAN}", redirected=False))  # routed
+    g.on_request(_request("https://shop.example.com/land?order=1"))
+    assert flow.url_leaked is False
+
+
+def test_an_unjudgeable_redirect_hop_counts_as_a_leak_once_armed():
+    flow, g = _guard()
+    g.on_request(_request("https://t.example.org/x?d=" + "1" * (pc._MAX_WINDOWS + 16)))
+    assert flow.url_leaked is True
+    unarmed = pc._UrlGuard(pc._Flow(task=None))
+    unarmed.on_request(_request("https://t.example.org/x?d=" + "1" * (pc._MAX_WINDOWS + 16)))
+    assert unarmed._flow.url_leaked is False
+
+
+async def test_a_card_number_redirect_after_pay_is_reported_as_leaked(vault, logs):
+    ns = checkout()
+
+    def pay():
+        for fn in ns.pctx.handlers["request"]:
+            fn(_request(f"https://shop.example.com/land?pan={PAN}"))
+
+    ns.els["pay"].on_click = pay
+    out, _ = await _run(ns)
+    assert out["code"] == "card_url_leaked" and "do NOT retry" in out["status"]
+    _sweep(out, logs)
+
+
+async def test_a_card_number_url_after_pay_is_blocked_and_reported(vault, logs):
+    ns = checkout()
+    hit: list = []
+
+    def pay():  # Pay makes the checkout send the card in a URL (a native GET form)
+        r = Route(f"https://shop.example.com/charge?cardNumber={PAN}&cvc={CVC}")
+        hit.append(r)
+        asyncio.ensure_future(ns.pctx.route_handler(r))
+
+    ns.els["pay"].on_click = pay
+    out, _ = await _run(ns)
+    assert hit[0].done == ("abort", "blockedbyclient")
+    assert out["code"] == "card_url_blocked"
+    assert "do NOT retry" in out["status"]
+    assert ns.pctx.closed
+    _sweep(out, logs)
+
+
+async def test_a_card_number_url_while_typing_stops_before_pay(vault, logs):
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    real_fill = Handle.fill
+
+    async def fill(self, value, timeout=None):
+        await real_fill(self, value, timeout)
+        if self.el is ns.els["number"]:  # an input listener sends the number in a URL
+            await ns.pctx.route_handler(Route(f"https://t.example.org/c?n={PAN}"))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "fill", fill)
+        out, _ = await _run(ns)
+    assert out["code"] == "card_url_before_pay" and clicked == []
+    assert "exposed" in out["status"] and "NOT clicked" in out["status"]
+    _sweep(out, logs)
+
+
+async def test_a_card_number_url_after_the_last_field_stops_before_pay(vault, logs):
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    real_input_value = Handle.input_value
+
+    async def input_value(self, timeout=None):  # a script fires while the last field is read
+        if self.el is ns.els["name"] and self.el.value:
+            for fn in ns.pctx.handlers["request"]:
+                fn(_request(f"https://shop.example.com/land?pan={PAN}"))
+        return await real_input_value(self, timeout)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "input_value", input_value)
+        out, _ = await _run(ns)
+    assert out["code"] == "card_url_before_pay" and clicked == []
+    _sweep(out, logs)
+
+
+@pytest.mark.parametrize(
+    ("blocked", "leaked", "code"),
+    [(True, False, "card_url_blocked"), (False, True, "card_url_leaked"), (True, True, "card_url_leaked")],
+)
+async def test_the_outcome_ends_at_once_on_a_guard_flag(monkeypatch, blocked, leaked, code):
+    # The settle wait is long; a flag ends it on the first tick, leaked before blocked.
+    monkeypatch.setattr(pc, "SETTLE_S", 30.0)
+    flow = pc._Flow(task=None, url_blocked=blocked, url_leaked=leaked)
+    page = Page(SHOP)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    got = await pc._outcome(flow, page, SHOP, {SHOP}, "example.com", Hooks().make())
+    assert got == code and loop.time() - t0 < 5.0
+
+
+async def test_a_flag_set_after_the_outcome_settles_still_wins(vault, monkeypatch):
+    ns = checkout()
+    real = pc._outcome
+
+    async def late(flow, *a):
+        code = await real(flow, *a)
+        flow.url_blocked = True  # the route's abort lands after the last tick
+        return code
+
+    monkeypatch.setattr(pc, "_outcome", late)
+    out, _ = await _run(ns)
+    assert out["code"] == "card_url_blocked"
+
+
+@pytest.mark.parametrize(
+    ("sent", "number_top", "code"),
+    [
+        ({"name"}, False, "pay_get_form"),  # the name would go in a URL, the number not
+        ({"cvc"}, False, "submitted_unverified"),  # another document: Pay's form cannot send it
+        ({"name", "number"}, True, "submitted_unverified"),  # the number too: the guard sees it
+        (set(), False, "submitted_unverified"),  # a script-handled form sends none of them
+    ],
+)
+async def test_a_default_get_pay_form_is_refused_only_when_it_would_send_card_fields_alone(
+    vault, sent, number_top, code
+):
+    ns = checkout()
+    if number_top:  # the number in Pay's own document
+        ns.ppage.main_frame.elements["#num2"] = ns.ppage.extra[0].elements["#num"]
+        ns.main_page.main_frame.elements["#num2"] = ns.main_page.extra[0].elements["#num"]
+        ns.fields["number"] = "#num2"
+    ns.els["pay"].pay.update(dget=True)
+    for kind in sent:
+        ns.els[kind].sent = True
+    out, _ = await _run(ns)
+    assert out["code"] == code
+    if code == "pay_get_form":
+        assert vault.ops("release_request") == []  # refused before the tap
+
+
+async def test_a_declared_get_ignores_field_membership(vault):
+    ns = checkout()
+    ns.els["pay"].pay.update(get=True, dget=False)
+    ns.els["number"].sent = True
+    out, _ = await _run(ns)
+    assert out["code"] == "pay_get_form"
 
 
 def _main_values(ns):

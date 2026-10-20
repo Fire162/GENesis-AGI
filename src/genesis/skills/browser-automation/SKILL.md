@@ -391,7 +391,10 @@ card number with the general tools. The user types it on the VNC display or in
 their own Chrome, or, when card fill is on, use `browser_fill_card`:
 
 - Open the checkout with `browser_navigate` (Camoufox) and read the card
-  fields, the Pay button and the total off a snapshot. Pass selectors, never
+  fields, the Pay button and the total off a snapshot. A snapshot and
+  `browser_run_js` see only the top document: inside a cross-origin checkout
+  frame (Stripe's, for one) nothing is observable yet, so use the provider's
+  standard ids there. Pass selectors, never
   values: `fields` (number, expiry or exp_month+exp_year, cvc, name,
   postal_code; `{"selector", "frames"}` for fields inside iframes), `pay`, the
   total as `amount` exactly as the page shows it, and other checkout fields as
@@ -400,8 +403,10 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   the owner's Telegram tap, fills, clicks Pay itself and closes the window.
   You get a fixed `code` and `status` only.
 - `submitted_unverified`: check the order page or the merchant account.
-  `challenge` or `outcome_unknown`: do NOT retry; tell the owner the outcome is
-  unknown. Any code before Pay (`failed_before_pay`, `claimed_not_filled`, a
+  `challenge`, `card_url_blocked`, `card_url_leaked` or `outcome_unknown`: do NOT retry; tell the owner the outcome is
+  unknown. `card_url_before_pay`: Pay was not clicked, but the card number was
+  sent or nearly sent in a URL; tell the owner the card may be exposed. Any
+  other code before Pay (`failed_before_pay`, `claimed_not_filled`, a
   refusal): nothing was paid; a single-use card may be spent, so ask the owner
   before trying again.
 
