@@ -342,11 +342,9 @@ only memory servers:
 
 A census-level `head_history_telemetry` checks every commit HEAD held in the
 last 2h30m, so the CODE HISTORY of a process that lived and died between two
-censuses is still covered; its source and switch are not. A database is
-foreign only when the process holds no open descriptor on the live one and no
-symlink on its path changed since it started. The cutover clock can only start
-at a census with no producer
-that could be running older code; a row of an older schema reads dirty
+censuses is still covered; its source and switch are not. Every producer row
+uses the memory servers' database rule above. The cutover clock can only start
+at a census with no producer that could be running older code; a row of an older schema reads dirty
 ("predates the current census contract"). Pruned with the telemetry rows.
 **The verdict** is `scripts/graph_cutover_report.py` over the pure
 `memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
