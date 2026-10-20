@@ -108,6 +108,10 @@ def test_children_resolve_the_per_test_database(tmp_path):
 
 
 _SUBRUN_CONFTEST = """
+# Imported before the closure installs, as the box lock in tests/conftest.py
+# does: its directory constant is bound to the real home and must be moved.
+from genesis.util import process_lock  # noqa: F401
+
 pytest_plugins = ["tests._live_closure"]
 
 
@@ -125,10 +129,18 @@ def pytest_unconfigure(config):
 
 _SUBRUN_TESTS = """
 import os
+from pathlib import Path
+
+from genesis.util import process_lock
+
+# Bound at import, during collection: after the closure is installed.
+IMPORT_HOME = Path.home()
 
 
 def test_key_state():
     print("KEY=" + os.environ.get("FENCE_PROBE_API_KEY", "<absent>"))
+    print("IMPORT_HOME=" + str(IMPORT_HOME))
+    print("PID_DIR=" + str(process_lock._DEFAULT_PID_DIR))
 """
 
 
@@ -136,7 +148,14 @@ def _subrun(tmp_path: Path, live_e2e: bool) -> str:
     (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
     (tmp_path / "test_sub.py").write_text(_SUBRUN_TESTS)
     repo = Path(__file__).resolve().parent.parent
-    env = {**os.environ, "PYTHONPATH": str(repo), "FENCE_PROBE_API_KEY": "probe-value"}
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([str(repo), str(repo / "src")]),
+        "FENCE_PROBE_API_KEY": "probe-value",
+        # The parent's HOME is this session's private one; hand the child the
+        # real home so the opt-in run's "unchanged" is measured against it.
+        "HOME": closure.REAL_HOME,
+    }
     env.pop("PYTEST_CURRENT_TEST", None)
     if live_e2e:
         env["GENESIS_LIVE_E2E"] = "1"
@@ -193,6 +212,10 @@ def test_a_module_imported_at_collection_binds_the_closures_database(tmp_path):
     assert bound == [str(Path(base) / "import-time-genesis.db")] * 3, out.stdout
 
 
+def _value(text: str, key: str) -> str:
+    return next(line.split("=", 1)[1] for line in text.splitlines() if line.startswith(key + "="))
+
+
 def test_a_run_removes_keys_and_names_them(tmp_path):
     text = _subrun(tmp_path, live_e2e=False)
     assert "KEY=<absent>" in text
@@ -200,7 +223,103 @@ def test_a_run_removes_keys_and_names_them(tmp_path):
     assert "probe-value" not in text  # names only, never values
 
 
+def test_a_run_gets_a_private_home_bound_before_collection(tmp_path):
+    """A module that resolves ``Path.home()`` when collected binds the session's
+    private home, and a value bound earlier (the process lock's directory) moved
+    with it. The run's summary says so."""
+    text = _subrun(tmp_path, live_e2e=False)
+    home = _value(text, "IMPORT_HOME")
+    assert home != closure.REAL_HOME and "genesis-test-home-" in home, text
+    assert _value(text, "PID_DIR") == str(Path(home) / ".genesis"), text
+    assert "HOME redirected" in text
+
+
 def test_an_opt_in_live_run_keeps_its_keys(tmp_path):
     text = _subrun(tmp_path, live_e2e=True)
     assert "KEY=probe-value" in text
     assert "GENESIS_LIVE_E2E=1, secrets left in place" in text
+    assert _value(text, "IMPORT_HOME") == closure.REAL_HOME  # HOME untouched too
+
+
+@pytest.mark.skipif(
+    not closure._S.home, reason="HOME not redirected (GENESIS_LIVE_E2E=1 or setup failed)"
+)
+def test_this_session_runs_with_a_private_home_outside_basetemp(request):
+    """pytest empties basetemp on first use, so the home must sit beside it."""
+    home = Path(closure._S.home)
+    assert Path.home() == home and str(home) != closure.REAL_HOME
+    assert (home / "tmp").is_dir()
+    basetemp = Path(request.config._tmp_path_factory.getbasetemp())
+    assert home not in basetemp.parents and basetemp not in home.parents
+
+
+def test_the_box_lock_was_taken_before_the_redirect(request):
+    """Placed after the lock: resolved under the private home (no ``.genesis``),
+    the lock path would be None and the run would silently take no lock."""
+    from genesis.util import pytest_lock
+
+    lock = request.config._genesis_pytest_lock
+    if lock.acquired:
+        path = Path(lock._path)
+        assert not closure._S.home or Path(closure._S.home) not in path.parents
+        if not os.environ.get(pytest_lock.PATH_ENV):
+            assert Path(closure.REAL_HOME, ".genesis") in path.parents, path
+        return
+    excused = [
+        name
+        for name in (pytest_lock.HELD_ENV, pytest_lock.DISABLE_ENV, pytest_lock.PATH_ENV)
+        if os.environ.get(name)
+    ]
+    if excused or not Path(closure.REAL_HOME, ".genesis").is_dir():
+        pytest.skip(f"no lock expected here ({excused or 'no install'})")
+    pytest.fail("an install exists and nothing excused the box lock, yet none was taken")
+
+
+_SUBRUN_EARLY_CONFTEST = """
+# A test* subdirectory conftest of a directory argument: pytest imports it
+# BEFORE pytest_configure, so this module binds the real home first.
+import genesis.cc.types  # noqa: F401
+"""
+
+_SUBRUN_EARLY_TEST = """
+from pathlib import Path
+
+import genesis.cc.types as types
+
+
+def test_bound_dir():
+    print("HOME=" + str(Path.home()))
+    print("BOUND=" + str(types._BACKGROUND_SESSION_DIR))
+"""
+
+
+def test_a_path_bound_before_configure_is_moved_into_the_home(tmp_path):
+    """CI's bare ``pytest`` (a directory) imports ``tests/test*/conftest.py`` before
+    configure; a state path a module bound then is moved into the test home and
+    named in the summary."""
+    (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
+    sub = tmp_path / "test_early"
+    sub.mkdir()
+    (sub / "conftest.py").write_text(_SUBRUN_EARLY_CONFTEST)
+    (sub / "test_x.py").write_text(_SUBRUN_EARLY_TEST)
+    repo = Path(__file__).resolve().parent.parent
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([str(repo), str(repo / "src")]),
+        "HOME": closure.REAL_HOME,
+    }
+    for name in ("PYTEST_CURRENT_TEST", "GENESIS_LIVE_E2E"):
+        env.pop(name, None)
+    out = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", str(tmp_path)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    home = _value(out.stdout, "HOME")
+    assert home != closure.REAL_HOME, out.stdout
+    assert _value(out.stdout, "BOUND") == str(Path(home, ".genesis", "background-sessions"))
+    assert "genesis.cc.types._BACKGROUND_SESSION_DIR" in out.stdout
