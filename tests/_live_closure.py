@@ -45,10 +45,12 @@ live tests need real credentials, so the secrets half is skipped and the summary
 says so; the git, gh and hook-URL closures stay on.
 The HOME redirect is skipped too: those tests act on the live install's state.
 
-``GENESIS_DB_PATH`` names a file under the closure's own directory from
-``pytest_configure`` on, so a module that resolves the database path when it is
-IMPORTED (during collection, before any fixture runs) binds that file rather than
-the checkout's ``data/genesis.db``, the live database in the main checkout.
+``GENESIS_DB_PATH`` names a file under the closure's own directory from the
+moment this plugin is imported (with the root conftest, before pytest imports
+any ``tests/test*/conftest.py``), so a module that resolves the database path
+when it is IMPORTED, at module level or as a default argument, binds that file
+rather than the checkout's ``data/genesis.db``, the live database in the main
+checkout. ``SECRETS_PATH`` is set at the same moment (unless ``GENESIS_LIVE_E2E=1``).
 ``tests/conftest.py`` (``_isolate_genesis_db_path``) then points it at a per-test
 file for the code a test runs and the children it starts. The import-time file is
 one per session: a default-argument connect in one test can leave rows another
@@ -76,6 +78,7 @@ The OS-level sandbox is the boundary for those.
 
 from __future__ import annotations
 
+import atexit
 import os
 import pwd
 import re
@@ -115,6 +118,26 @@ class _State:
 
 _S = _State()
 
+# The database path is set when this plugin is IMPORTED, not in install().
+# tests/conftest.py names it in ``pytest_plugins``, so pytest imports it while
+# registering the root conftest, before it imports any ``tests/test*/conftest.py``
+# (which a directory run, CI's bare ``pytest`` included, loads BEFORE
+# pytest_configure). A module imported there binds the path at import
+# (``DEFAULT_DB_PATH = genesis_db_path()``) and as default arguments
+# (``def get_db(path=DEFAULT_DB_PATH)``), which nothing can rebase afterwards.
+# MEASURED: set in install(), a full directory run connected to the checkout's
+# data/genesis.db from 10 voice tests; in the deployed checkout that is the live
+# database.
+# SECRETS_PATH likewise: a module that loads secrets.env at import would read
+# the real file before install() ran.
+_S.base = tempfile.mkdtemp(prefix="genesis-live-closure-")
+# Removed at exit when install() never ran (a run the box lock refuses exits in
+# pytest_configure first); otherwise the session cleanup owns it.
+atexit.register(lambda: _S.installed or shutil.rmtree(_S.base, ignore_errors=True))
+os.environ["GENESIS_DB_PATH"] = str(Path(_S.base) / "import-time-genesis.db")
+if os.environ.get("GENESIS_LIVE_E2E") != "1":
+    os.environ["SECRETS_PATH"] = str(Path(_S.base) / "no-secrets.env")
+
 
 def credential_names(environ) -> list[str]:
     """The credential-shaped names in ``environ`` that the closure removes."""
@@ -127,8 +150,7 @@ def install(config) -> None:
     """Apply the closure to this process's environment. Idempotent."""
     if _S.installed:
         return
-    _S.base = tempfile.mkdtemp(prefix="genesis-live-closure-")
-    no_gh = Path(_S.base) / "no-gh"
+    no_gh = Path(_S.base) / "no-gh"  # _S.base: made at import, see above
     no_gh.mkdir()
     _S.live_e2e = os.environ.get("GENESIS_LIVE_E2E") == "1"
     if not _S.live_e2e:
@@ -142,9 +164,15 @@ def install(config) -> None:
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
     os.environ["GIT_SSH_COMMAND"] = "false"
     os.environ["GENESIS_PROACTIVE_HOOK_URL"] = _CLOSED_PORT_URL
-    # Before collection: modules that resolve the database path at import
-    # (``_DB_PATH = genesis_db_path()``) bind this, not the checkout's live file.
-    os.environ["GENESIS_DB_PATH"] = str(Path(_S.base) / "import-time-genesis.db")
+    # Set at import (see above). If something changed it since, paths bound in
+    # between follow the other value: say so rather than hide it.
+    db = str(Path(_S.base) / "import-time-genesis.db")
+    if os.environ.get("GENESIS_DB_PATH") != db:
+        sys.stderr.write(
+            f"genesis: GENESIS_DB_PATH changed after the live closure set it "
+            f"({os.environ.get('GENESIS_DB_PATH')!r}); restoring {db}\n"
+        )
+    os.environ["GENESIS_DB_PATH"] = db
     # A directory that does not exist: importing the health MCP's browser module
     # then attaches no log file, instead of appending every genesis.* line of this
     # run to the MCP servers' shared ~/tmp/mcp_health.log.
@@ -179,7 +207,10 @@ def _redirect_home(config) -> None:
     if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ and cache.is_dir():
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(cache)
     os.environ["HOME"] = str(home)
-    _S.rebased = tuple(_rebase_bound_paths(home))
+    # Not tempfile.gettempdir(): it is often ~/tmp itself (TMPDIR), which would
+    # exempt every state path bound under ~/tmp.
+    private = (_S.base, getattr(config, "_genesis_basetemp_cleanup", None))
+    _S.rebased = tuple(_rebase_bound_paths(home, private))
     _S.home = str(home)
 
 
@@ -201,7 +232,7 @@ def _unredirected_home(config) -> Path:
         return home
 
 
-def _rebase_bound_paths(home: Path) -> list[str]:
+def _rebase_bound_paths(home: Path, private=()) -> list[str]:
     """Move state paths ``genesis`` modules bound to the real home before this ran.
 
     pytest imports every ``tests/test*/conftest.py`` of a directory argument (CI's
@@ -212,14 +243,24 @@ def _rebase_bound_paths(home: Path) -> list[str]:
     directory, the circuit-breaker state file); the rest are the checkout, which
     must not move. So only paths under a state root of the real home are rebased,
     each named in the run summary. A path held as a string or inside a container,
-    or bound by a module outside ``genesis``, is not reached."""
+    or bound by a module outside ``genesis``, is not reached.
+
+    ``private`` names directories that are already this run's own (the closure's
+    directory and the per-process leaf; the test home is added here), which may sit under a state
+    root (``~/tmp``): a path under one is left alone. MEASURED: without that, the
+    import-time database path (under the closure's directory in ``~/tmp``) was
+    moved, and stopped matching the default arguments bound to it."""
     roots = [Path(REAL_HOME, r) for r in _STATE_ROOTS]
+    keep = [Path(os.path.realpath(p)) for p in (*private, home) if p]
     moved = []
     for name, module in list(sys.modules.items()):
         if module is None or not (name == "genesis" or name.startswith("genesis.")):
             continue
         for attr, value in list(vars(module).items()):
             if not isinstance(value, PurePath):
+                continue
+            real = Path(os.path.realpath(value))
+            if any(real == k or k in real.parents for k in keep):
                 continue
             if any(value == root or root in value.parents for root in roots):
                 setattr(module, attr, type(value)(home, value.relative_to(REAL_HOME)))
