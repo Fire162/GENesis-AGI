@@ -185,10 +185,10 @@ def test_filter_state_keeps_the_merchant_site_and_card_frames_only():
 
 def test_filter_state_by_ip_host_is_exact():
     state = {
-        "cookies": [{"name": "a", "domain": "10.0.0.5"}, {"name": "b", "domain": "0.5"}],
+        "cookies": [{"name": "a", "domain": "192.0.2.5"}, {"name": "b", "domain": "2.5"}],
         "origins": [],
     }
-    assert [c["name"] for c in cf.filter_state(state, "10.0.0.5", set())["cookies"]] == ["a"]
+    assert [c["name"] for c in cf.filter_state(state, "192.0.2.5", set())["cookies"]] == ["a"]
 
 
 def test_registrable_domain_uses_the_bundled_suffix_list():
