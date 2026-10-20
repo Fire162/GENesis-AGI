@@ -297,11 +297,28 @@ commit the main checkout has held since it started (read by
 `scripts/lib/serving_commit.py`, the reader the deploy scripts use, which refuses
 on a reflog gap, a move in the start second, a clock step back or git's expiry
 cutoff), whether ALL of them contain the telemetry module (a module imported
-after start loads whatever is on disk then), its exec-time kill switch and DB
-path, plus whether HEAD has the module and whether `src/genesis/memory/` is
-dirty. Git runs with `--no-optional-locks`, so the hourly read never takes the
-index lock a deploy needs. The cutover clock can only start at a census with no
-server that could be running older code. Pruned with the telemetry rows.
+after start loads whatever is on disk then), plus whether HEAD has the module
+and whether `src/genesis/memory/` is dirty. Git runs with `--no-optional-locks`,
+so the hourly read never takes the index lock a deploy needs. Since schema 2
+("conservative unknowns", rules in `memory/graph_census_proof.py`) a server's row
+is clean only when three more things are PROVEN, each derived the way that
+server derives it, never from the census process's own state: its code source
+(its `argv[0]` is in main's `.venv/bin`, it runs main's own server script, and
+nothing that venv's site-packages, `PYTHONPATH`, the script's directory or the
+system `sitecustomize` can load shadows main's `genesis`), its kill switch (what
+it runs with: the memory lifespan's router reloads its secrets file with
+`override=True`, so a key the file carries beats the exec-time value; the file
+counts only if it and any symlink on its path are unchanged by ctime since the
+server started, and a missing or changed file is unknown), and its database
+scope (the primary database is fixed at import from the exec env or the root
+default, and a path in the file becomes a second one; `foreign` only when every
+one of them differs from the live database by `(st_dev, st_ino)`, and only for a
+server whose code is proven). Anything unproven
+lands in `unknown_reasons` or `telemetry_off: null`, and the verdict reads the
+row as not clean, so the clock waits for that server to restart. The cutover
+clock can only start at a census with no server that could be running older
+code; a row of an older schema reads dirty ("predates the current census
+contract"). Pruned with the telemetry rows.
 **The verdict** is `scripts/graph_cutover_report.py` over the pure
 `memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
 falkordb-served traversals and falkordb traffic on at least 10 UTC days in the
