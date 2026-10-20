@@ -175,10 +175,13 @@ def _stub_scripts(tmp_path: Path) -> Path:
     return script
 
 
-def test_a_deploy_script_with_the_real_home_is_refused(tmp_path):
+def test_a_deploy_script_with_the_real_home_is_refused(tmp_path, monkeypatch):
     script = _stub_scripts(tmp_path)
     with fence.expect_violation():
         subprocess.run(["bash", str(script)], env={**os.environ, "HOME": fence._S.real_home})
+    # The closure gives the session a private HOME; put the real one back so the
+    # inherited-environment branch is the one under test.
+    monkeypatch.setenv("HOME", fence._S.real_home)
     with fence.expect_violation():
         subprocess.run([str(script)])  # inherits the real HOME
 
@@ -203,7 +206,8 @@ def test_a_deploy_script_with_a_private_home_runs(tmp_path):
         ("bash", ["bash", "-e", "/x/scripts/update.sh"], True),
     ],
 )
-def test_judge(program, argv, refused):
+def test_judge(program, argv, refused, monkeypatch):
+    monkeypatch.setenv("HOME", fence._S.real_home)  # env=None reads the process HOME
     assert (fence.judge(program, argv, None) is not None) is refused
 
 
@@ -251,6 +255,9 @@ def update_routes(tmp_path, monkeypatch):
     root = tmp_path / "root"
     root.mkdir()
     monkeypatch.setattr(updates, "_GENESIS_ROOT", root)
+    # The incident ran with the real HOME; the closure's private session HOME
+    # would make the deploy-script branches look harmless, so restore it.
+    monkeypatch.setenv("HOME", fence._S.real_home)
     app = Flask(__name__)
     with app.app_context():
         yield updates

@@ -109,11 +109,12 @@ def test_every_spelling_of_a_real_home_deploy_run_is_refused(argv):
     assert fence.judge(argv[0], argv, env) is not None
 
 
-def test_parse_only_relative_paths_and_os_system_are_judged_right():
+def test_parse_only_relative_paths_and_os_system_are_judged_right(monkeypatch):
     env = {"HOME": fence._S.real_home, "PATH": os.defpath}
     assert fence.judge("bash", ["bash", "-n", S], env) is None
     assert fence.judge("bash", ["bash", "update.sh"], env, "/x/scripts") is not None
-    # os.system is judged as `sh -c <line>`
+    # os.system is judged as `sh -c <line>`, with the process HOME (the real one here)
+    monkeypatch.setenv("HOME", fence._S.real_home)
     assert fence.judge("sh", ["sh", "-c", f"cd /x && bash {S}"], None) is not None
 
 
