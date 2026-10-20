@@ -19,9 +19,13 @@ startup imports (``genesis``, a customize module, anything a ``.pth`` line or
 the system ``sitecustomize`` imports) found in a ``PYTHONPATH`` entry or beside
 the script would shadow the real one, so it makes the source unknown.
 
-Stated residuals: the venv's own ``.pth`` files are trusted as they read NOW,
+Stated residuals: the venv's site-packages (its ``.pth`` files, and any
+``genesis`` or customize module installed there) is trusted as it reads NOW,
 with no change-time rule, because every update reruns ``pip install -e`` and
-rewrites them (owner ruling, 2026-10-20: accepted). The window this leaves: a
+rewrites it: such a rule would mark every running server unknown after every
+update (MEASURED 2026-10-20: 16 of 16 live servers started before the last
+rewrite). Owner ruling, 2026-10-20: accepted. A package installed there when a
+server started and removed later is therefore not seen. The window this leaves: a
 ``pip install -e`` from a worktree into main's venv, a server started then, and
 an update that rewrites the install back to main before the census reads it
 would read as main. A standing procedure already forbids that install; a ``PYTHONPATH`` entry is proven only by its change time
