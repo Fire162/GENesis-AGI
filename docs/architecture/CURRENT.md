@@ -1703,7 +1703,10 @@ the shared banner is not an assertion about all concurrent sessions.
   the merchant's cookies and storage (sessionStorage included) are handed over,
   it refuses a checkout or card frame not on https at a host the vault's release
   accepts (a dotted DNS name: no IP, single-label or loopback host), every
-  document is masked transparent from creation and kept so by an observer, the owner's tap shows the Pay button label and the
+  document is masked transparent from creation and kept so by an observer, top-layer content
+  (modal dialogs, popovers, fullscreen, backdrops, view transitions) and the page background included; a nested frame Camoufox's init script
+  missed (no mask at all) is masked by evaluate and re-checked, while a defeated mask or an unmasked
+  top document fails the check, the owner's tap shows the Pay button label and the
   extra field names, the tool clicks Pay itself and returns fixed codes only.
   Card values never leave in a URL: a Pay control whose form DECLARES GET, or
   whose default-GET form would send card fields without the number, is

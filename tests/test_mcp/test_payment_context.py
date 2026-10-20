@@ -149,6 +149,10 @@ class Frame:
         self.late: dict = {}  # selector -> elements that mount only once waited for
         self.waits: list[str] = []
         self.masked = True
+        self.repairable = True  # MASK_INIT_JS evaluated into it takes
+        self.mask_absent = False  # no mask at all (the init script never ran here)
+        self.injected = 0
+        self.parent_frame = None
         self.session: dict = {}
 
     def locator(self, sel):
@@ -157,6 +161,13 @@ class Frame:
     async def evaluate(self, js):
         if js == pc._MASK_CHECK_JS:
             return self.masked
+        if js == pc._MASK_ABSENT_JS:
+            return self.mask_absent
+        if js == pc.MASK_INIT_JS:
+            self.injected += 1
+            if self.repairable:
+                self.masked, self.mask_absent = True, False
+            return None
         if js == pc._TEXT_JS:
             return self.text
         if js == pc._SESSION_JS:
@@ -169,6 +180,8 @@ class Page:
         self.url = url
         self.main_frame = Frame(url)
         self.extra = list(frames)
+        for f in self.extra:
+            f.parent_frame = self.main_frame
         self._closed = False
         self._title = title
         self.handlers: dict = {}
@@ -1090,7 +1103,15 @@ async def test_abort_ends_the_flow_with_a_result_and_cancels(vault):
         ("on_status", lambda ns: ns.els["pay"].pay.update(label="Pay $99.99"), "page_changed"),
         ("on_status", lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "page_changed"),
         ("on_claim", lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "claimed_not_filled"),
-        ("on_claim", lambda ns: setattr(ns.ppage.extra[0], "masked", False), "claimed_not_filled"),
+        # A child frame whose mask cannot be put back.
+        (
+            "on_claim",
+            lambda ns: (
+                setattr(ns.ppage.extra[0], "masked", False),
+                setattr(ns.ppage.extra[0], "repairable", False),
+            ),
+            "claimed_not_filled",
+        ),
         # Same origin, amount, Pay and fields, but another order under the tapped title.
         ("on_status", lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"), "page_changed"),
         (
@@ -1107,6 +1128,49 @@ async def test_each_check_after_the_tap_holds(vault, hook, change, code):
     setattr(vault, hook, lambda: change(ns))
     out, _ = await _run(ns)
     assert out["code"] == code and clicked == []
+
+
+async def test_a_child_frame_the_init_script_missed_is_masked_and_rechecked(vault):
+    # Camoufox's init script misses some nested helper frames: the check masks
+    # such a frame itself, then re-checks it, and the payment goes on.
+    ns = checkout()
+    helper = Frame("https://js.cards.example.net/helper")
+    helper.masked, helper.mask_absent = False, True
+    helper.parent_frame = ns.ppage.extra[0]
+    ns.ppage.extra.append(helper)
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+    assert helper.injected >= 1 and helper.masked is True
+
+
+async def test_the_top_document_is_never_repaired(vault):
+    ns = checkout()
+    # No mask at all and repairable, but the top document must pass on its own.
+    ns.ppage.main_frame.masked, ns.ppage.main_frame.mask_absent = False, True
+    out, _ = await _run(ns)
+    assert out["code"] == "checkout_load_failed"
+    assert ns.ppage.main_frame.injected == 0
+    assert vault.ops("release_request") == []
+
+
+async def test_a_child_frame_whose_mask_was_defeated_is_not_repaired(vault):
+    # The mask is there but no longer holds (a page script beat the observer):
+    # a tamper signal, never papered over.
+    ns = checkout()
+    ns.ppage.extra[0].masked = False  # present (mask_absent stays False), not holding
+    out, _ = await _run(ns)
+    assert out["code"] == "checkout_load_failed"
+    assert ns.ppage.extra[0].injected == 0
+    assert vault.ops("release_request") == []
+
+
+async def test_a_child_frame_that_stays_unmasked_fails_closed(vault):
+    ns = checkout()
+    ns.ppage.extra[0].masked, ns.ppage.extra[0].mask_absent = False, True
+    ns.ppage.extra[0].repairable = False
+    out, _ = await _run(ns)
+    assert out["code"] == "checkout_load_failed"
+    assert vault.ops("release_request") == []
 
 
 async def test_the_mask_is_checked_before_each_field(vault):

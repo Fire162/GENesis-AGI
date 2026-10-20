@@ -88,7 +88,22 @@ MASK_CSS = (
     " color: transparent !important; -webkit-text-fill-color: transparent !important;"
     " caret-color: transparent !important; text-shadow: none !important }"
     " ::selection { color: transparent !important; background: transparent !important }"
+    # The top layer (a modal dialog, an open popover, a fullscreen element and
+    # their backdrops) paints outside the root's opacity group, so the root rule
+    # does not hide it. One rule per selector: an engine that does not know a
+    # selector drops the whole rule it appears in, and the others must survive.
+    " :modal { opacity: 0 !important }"
+    " :popover-open { opacity: 0 !important }"
+    " :fullscreen { opacity: 0 !important }"
+    " ::backdrop { opacity: 0 !important }"
+    # A view transition paints its pseudo-tree in an overlay too.
+    " ::view-transition { opacity: 0 !important }"
+    # The canvas takes the root's or body's background whatever the root's opacity.
+    " html, body { background: transparent !important }"
 )
+# The top-layer states, as selectors; one at a time, since an engine that does
+# not know one throws on it.
+_TOP_LAYER = "[':modal', ':popover-open', ':fullscreen']"
 _MASK_JS = (
     "() => { const id = '__genesis_payment_mask__';"
     " const root = document.documentElement;"
@@ -99,6 +114,10 @@ _MASK_JS = (
     " (document.head || root).appendChild(s); }"
     " s.removeAttribute('media'); s.disabled = false;"
     " if (s.textContent !== '" + MASK_CSS + "') s.textContent = '" + MASK_CSS + "';"
+    # A page rule or inline style marked important beats the stylesheet; an
+    # inline important set after it wins, so each open top-layer element gets one.
+    " for (const q of " + _TOP_LAYER + ") { try { for (const e of document.querySelectorAll(q))"
+    " e.style.setProperty('opacity', '0', 'important'); } catch (_) {} }"
     " return true; }"
 )
 # A context-level init script: runs before the page's own scripts in every
@@ -113,22 +132,50 @@ MASK_INIT_JS = (
     " const s = document.getElementById('__genesis_payment_mask__');"
     " return !!r && r.style.getPropertyValue('opacity') === '0'"
     " && r.style.getPropertyPriority('opacity') === 'important'"
-    " && !!s && !s.disabled && !s.hasAttribute('media') && s.textContent === '" + MASK_CSS + "'; };"
+    " && !!s && !s.disabled && !s.hasAttribute('media') && s.textContent === '" + MASK_CSS + "'"
+    " && " + _TOP_LAYER + ".every((q) => { try { return Array.from(document.querySelectorAll(q))"
+    ".every((e) => e.style.getPropertyValue('opacity') === '0'"
+    " && e.style.getPropertyPriority('opacity') === 'important'); } catch (_) { return true; } }); };"
     " new MutationObserver(() => { if (!ok()) m(); }).observe(document,"
     " {childList: true, subtree: true, attributes: true, characterData: true});"
+    # Opening a popover or going fullscreen changes no attribute: catch the
+    # events instead (beforetoggle runs before the popover first paints).
+    " const hide = (ev) => { const t = ev.target;"
+    " if (t && t.style) t.style.setProperty('opacity', '0', 'important'); m(); };"
+    " for (const ev of ['beforetoggle', 'toggle', 'fullscreenchange'])"
+    " document.addEventListener(ev, hide, true);"
     " m(); document.addEventListener('DOMContentLoaded', m); })();"
 )
 _MASK_CHECK_JS = """() => {
   const clear = (v) => v === 'transparent' || /^rgba\\([^)]*,\\s*0\\)$/.test(v);
   const root = document.documentElement;
   if (!root || getComputedStyle(root).opacity !== '0') return false;
+  for (const e of [root, document.body]) {
+    if (!e) continue;
+    const s = getComputedStyle(e);
+    if (!clear(s.backgroundColor) || s.backgroundImage !== 'none') return false;
+  }
+  try {  // an engine without view transitions has nothing there to paint
+    if (getComputedStyle(root, '::view-transition').opacity !== '0') return false;
+  } catch (_) {}
   for (const e of document.querySelectorAll('input, textarea, select')) {
     const s = getComputedStyle(e);
     if (!clear(s.color) || !clear(s.webkitTextFillColor) || !clear(s.caretColor)) return false;
     if (s.textShadow && s.textShadow !== 'none') return false;
   }
+  for (const sel of [':modal', ':popover-open', ':fullscreen']) {
+    let top;
+    try { top = document.querySelectorAll(sel); } catch (_) { continue; }  // unknown to this engine
+    for (const e of top) {
+      if (getComputedStyle(e).opacity !== '0') return false;
+      if (getComputedStyle(e, '::backdrop').opacity !== '0') return false;
+    }
+  }
   return true;
 }"""
+# Whether this document lacks the mask altogether (the init script never ran in
+# it), as opposed to a mask that is present but defeated.
+_MASK_ABSENT_JS = "() => !document.getElementById('__genesis_payment_mask__')"
 # Whether ``e`` is a field of ``kind``: an enabled input or select whose
 # autocomplete names that kind, or a type=tel input (a select for an expiry
 # month or year) whose label, aria-label, placeholder, name or id says so.
@@ -612,9 +659,25 @@ async def _resolve(page, args: cf.CardArgs, wait=False) -> tuple[dict[str, _Fiel
 
 
 async def _mask_ok(page) -> bool:
+    """Every frame is masked. A frame below the top document with NO mask at
+    all gets it and is re-checked: Camoufox's init script misses some nested
+    frames (measured: four 1-px hidden helper frames of a hosted card widget).
+    An in-flow frame draws nothing while the top document is masked, since
+    opacity applies to a whole subtree, iframes included; a frame in the top
+    layer does not, which is why the mask covers the top layer itself. A mask
+    that is present but defeated is never repaired, and neither is the top
+    document: either fails the check."""
     try:
         frames = list(page.frames)
         for frame in frames:
+            if await _step(frame.evaluate(_MASK_CHECK_JS)) is True:
+                continue
+            if (
+                frame.parent_frame is None
+                or await _step(frame.evaluate(_MASK_ABSENT_JS)) is not True
+            ):
+                return False
+            await _step(frame.evaluate(MASK_INIT_JS))
             if await _step(frame.evaluate(_MASK_CHECK_JS)) is not True:
                 return False
         return bool(frames)

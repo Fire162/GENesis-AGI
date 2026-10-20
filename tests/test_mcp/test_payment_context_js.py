@@ -7,6 +7,8 @@ display). Skipped where Playwright's Chromium is not installed (as in CI).
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import pytest
 
 from genesis.mcp.health import payment_context as pc
@@ -129,3 +131,101 @@ def test_the_mask_survives_a_media_attribute_on_its_style(page):
     page.set_content("<input id=x>")
     page.evaluate("() => document.getElementById('__genesis_payment_mask__').media = 'print'")
     assert page.evaluate(pc._MASK_CHECK_JS) is True
+
+
+# The top layer (a modal dialog, a popover, a fullscreen element and their
+# backdrops) paints outside the root's opacity group, so the root mask alone
+# does not hide it: the mask covers it explicitly, and the check verifies it.
+_TOP_LAYER_OPACITY = (
+    "(sel) => { const e = document.querySelector(sel);"
+    " return [getComputedStyle(e).opacity, getComputedStyle(e, '::backdrop').opacity]; }"
+)
+
+
+def test_a_modal_dialog_is_masked(page):
+    page.set_content(
+        "<dialog id=d><p>order</p></dialog>"
+        "<script>document.getElementById('d').showModal()</script>"
+    )
+    assert page.evaluate(_TOP_LAYER_OPACITY, "#d") == ["0", "0"]
+    assert page.evaluate(pc._MASK_CHECK_JS) is True
+
+
+def test_an_open_popover_is_masked(page):
+    page.set_content(
+        "<div id=p popover>order</div><script>document.getElementById('p').showPopover()</script>"
+    )
+    assert page.evaluate(_TOP_LAYER_OPACITY, "#p")[0] == "0"
+    assert page.evaluate(pc._MASK_CHECK_JS) is True
+
+
+def test_the_mask_wins_over_a_page_forcing_a_dialog_visible(page):
+    # Inline important from the page, and a page rule marked important: the
+    # mask re-asserts an inline important when the dialog opens, which wins.
+    page.set_content(
+        "<style>#d:modal { opacity: 1 !important }</style>"
+        "<dialog id=d style='opacity: 1 !important'><p>order</p></dialog>"
+        "<script>document.getElementById('d').showModal()</script>"
+    )
+    assert page.evaluate(_TOP_LAYER_OPACITY, "#d")[0] == "0"
+    assert page.evaluate(pc._MASK_CHECK_JS) is True
+
+
+def test_the_mask_wins_over_a_page_forcing_a_popover_visible(page):
+    # Opening a popover changes no attribute; the toggle events catch it. A real
+    # navigation, not set_content: document.open() drops a document's listeners.
+    html = "<style>#p:popover-open { opacity: 1 !important }</style><div id=p popover>order</div>"
+    page.goto("data:text/html," + quote(html))
+    page.evaluate("() => document.getElementById('p').showPopover()")
+    page.wait_for_timeout(50)
+    assert page.evaluate(_TOP_LAYER_OPACITY, "#p")[0] == "0"
+    assert page.evaluate(pc._MASK_CHECK_JS) is True
+
+
+def test_a_backdrop_the_page_forces_visible_fails_the_check(page):
+    # A pseudo-element takes no inline style: a page rule that out-ranks the
+    # mask's is caught by the check, which then fails closed.
+    page.set_content(
+        "<style>html body dialog#d::backdrop { opacity: 1 !important }</style>"
+        "<dialog id=d><p>order</p></dialog>"
+        "<script>document.getElementById('d').showModal()</script>"
+    )
+    assert page.evaluate(pc._MASK_CHECK_JS) is False
+
+
+def test_the_view_transition_overlay_is_masked(page):
+    page.set_content("<p>x</p>")
+    assert (
+        page.evaluate(
+            "() => getComputedStyle(document.documentElement, '::view-transition').opacity"
+        )
+        == "0"
+    )
+    assert page.evaluate(pc._MASK_CHECK_JS) is True
+
+
+def test_a_view_transition_the_page_forces_visible_fails_the_check(page):
+    page.set_content("<style>html:root::view-transition { opacity: 1 !important }</style><p>x</p>")
+    assert page.evaluate(pc._MASK_CHECK_JS) is False
+
+
+def test_the_page_background_is_cleared(page):
+    page.set_content("<body style='background: red'><p>x</p></body>")
+    assert page.evaluate("() => getComputedStyle(document.body).backgroundColor") in (
+        "transparent",
+        "rgba(0, 0, 0, 0)",
+    )
+    assert page.evaluate(pc._MASK_CHECK_JS) is True
+
+
+def test_a_background_the_page_forces_fails_the_check(page):
+    page.set_content("<style>html body#b { background: red !important }</style><body id=b>x</body>")
+    assert page.evaluate(pc._MASK_CHECK_JS) is False
+
+
+def test_the_mask_absent_probe(page):
+    page.set_content("<p>x</p>")
+    assert page.evaluate(pc._MASK_ABSENT_JS) is False
+    page.evaluate("() => document.getElementById('__genesis_payment_mask__').remove()")
+    # The observer puts it back before any later task can look.
+    assert page.evaluate(pc._MASK_ABSENT_JS) is False
