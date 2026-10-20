@@ -842,10 +842,10 @@ def test_an_empty_reflog_window_means_head_held_only_head(repo):
 
     reader = gc._load_serving_commit()
     r, old, new = repo
-    assert gc._window_held(reader, "", 0.0, new) == [new]
+    assert gc._window_held(reader, "", 0.0, new, 0) == [new]
     reflog = (r / ".git" / "logs" / "HEAD").read_text()
-    assert gc._window_held(reader, reflog, 9e12, new) == [new]  # window after every move
-    held = gc._window_held(reader, reflog, 0.0, new)  # window before every move
+    assert gc._window_held(reader, reflog, 9e12, new, 0) == [new]  # window after every move
+    held = gc._window_held(reader, reflog, 0.0, new, 0)  # window before every move
     assert held[-1] == new and old in held
 
 
@@ -916,13 +916,13 @@ def test_a_reflog_gap_or_a_foreign_end_inside_the_window_is_unknown(repo):
     a, b, c, d = ("a" * 40, "b" * 40, "c" * 40, "d" * 40)
     gap = _reflog_line(a, b, 100) + _reflog_line(c, d, 200)
     with pytest.raises(reader._Unknown):
-        gc._window_held(reader, gap, 50.0, d)
-    assert gc._window_held(reader, gap, 150.0, d) == [c, d]  # the gap lies before the window
+        gc._window_held(reader, gap, 50.0, d, 0)
+    assert gc._window_held(reader, gap, 150.0, d, 0) == [c, d]  # the gap lies before the window
     with pytest.raises(reader._Unknown):
-        gc._window_held(reader, _reflog_line(a, b, 100), 50.0, c)  # HEAD is not b
+        gc._window_held(reader, _reflog_line(a, b, 100), 50.0, c, 0)  # HEAD is not b
     backwards = _reflog_line(a, b, 200) + _reflog_line(b, c, 100)
     with pytest.raises(reader._Unknown):
-        gc._window_held(reader, backwards, 150.0, c)
+        gc._window_held(reader, backwards, 150.0, c, 0)
 
 
 def test_an_unreadable_history_window_is_never_clean(proc_root, repo, tmp_path, main_venv):
@@ -963,3 +963,64 @@ def test_another_users_python_is_never_read(proc_root, repo, tmp_path, main_venv
     monkeypatch.setattr(census.os, "getuid", lambda: real + 1)
     m = census.build_census(repo[0], proc_root=proc_root, live_db=tmp_path / "live.db")
     assert m["procs"] == []
+
+
+def test_a_window_reaching_past_reflog_expiry_is_unknown(repo):
+    """Git can expire a detour's two entries together, leaving no gap: a window
+    that starts before the expiry cutoff cannot be proven complete."""
+    from genesis.memory import graph_census as gc
+
+    reader = gc._load_serving_commit()
+    _, _, new = repo
+    assert gc._window_held(reader, "", 100.0, new, 50) == [new]
+    with pytest.raises(reader._Unknown):
+        gc._window_held(reader, "", 100.0, new, 150)
+
+
+def test_a_python_naming_the_worker_as_an_argument_is_not_a_worker(
+    proc_root, repo, tmp_path, main_venv
+):
+    worker = _worker_argv(repo, main_venv)[1]
+    m = _roles_census(proc_root, repo, tmp_path, [(107, [main_venv[0], "-m", "pytest", worker], {}, None)])
+    assert [p["role"] for p in m["procs"]] == ["venv-generic"]
+
+
+def test_a_relative_interpreter_path_is_counted_as_unknown(proc_root, repo, tmp_path, main_venv):
+    """`.venv/bin/python job.py` was resolved against the cwd at exec, which the
+    process may have left: it may be main's venv, so it is counted, unproven."""
+    m = _roles_census(proc_root, repo, tmp_path, [(108, [".venv/bin/python", "job.py"], {}, None)])
+    [p] = m["procs"]
+    assert (p["role"], p["telemetry"], p["unknown"], p["foreign"]) == (
+        "venv-generic", None, "interpreter_unresolved", False,
+    )
+
+
+def test_a_generic_process_in_another_mount_namespace_is_never_foreign(
+    proc_root, repo, tmp_path, main_venv
+):
+    import time as _time
+
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    r, _, _ = repo
+    (tmp_path / "live.db").touch()
+    _proc(proc_root, 109, [main_venv[0], "-"], started=_time.time() + 60,
+          env={"GENESIS_DB_PATH": str(bench)}, exe=str(tmp_path / "sys" / "bin" / "python3.12"),
+          ns="mnt:[2]")
+    m = census.build_census(r, proc_root=proc_root, live_db=tmp_path / "live.db")
+    [p] = m["procs"]
+    assert p["foreign"] is False
+
+
+@pytest.mark.parametrize(
+    "rel", ["src/genesis/routing/standalone.py", "scripts/genesis_mcp_server.py"]
+)
+def test_an_edited_loader_outside_the_memory_package_marks_head_dirty(proc_root, repo, rel):
+    """The proofs model the entry scripts and loaders: an uncommitted edit there
+    means a process may run code no commit records."""
+    r, _, _ = repo
+    f = r / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("edited = True\n")
+    assert census.build_census(r, proc_root=proc_root)["head_dirty"] is True
+

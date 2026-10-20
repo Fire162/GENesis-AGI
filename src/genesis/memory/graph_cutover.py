@@ -144,7 +144,7 @@ def census_dirt(m: dict | None) -> str | None:
     if m.get("head_telemetry") is not True:
         return "the checkout's HEAD does not contain the telemetry module"
     if m.get("head_dirty") is not False:
-        return "src/genesis/memory/ is dirty in the checkout"
+        return "the checkout's runtime code (src/ or an entry script) is dirty"
     if m.get("head_history_telemetry") is not True:
         return "HEAD held code without telemetry in the last 2h30m (or its history is unreadable)"
     procs = m.get("procs")

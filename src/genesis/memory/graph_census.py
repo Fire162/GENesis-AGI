@@ -75,6 +75,13 @@ HISTORY_LOOKBACK_S = 2.5 * 3600
 #: src (role -> script under the main checkout).
 _SELF_SRC_SCRIPTS = {"ambient": "ambient_awareness_worker.py"}
 _REPLAY_SCRIPT = "ambient_replay.py"
+#: What a traversal producer loads code from in the checkout: an edit here
+#: means a process may run code no commit records.
+_RUNTIME_PATHS = (
+    "src/",
+    "scripts/genesis_mcp_server.py",
+    "scripts/ambient_awareness_worker.py",
+)
 
 
 def _iso(epoch: float) -> str:
@@ -129,18 +136,16 @@ def _readlink_or_none(path: Path) -> str | None:
         return None
 
 
-def _interpreter_dir(argv0: str, env: dict[str, str], cwd: Path) -> str | None:
+def _interpreter_dir(argv0: str, env: dict[str, str]) -> str | None:
     """The real directory of the interpreter ``argv0`` named, resolved the way
-    exec did: as given when absolute, against the cwd when it has a slash (the
-    cwd NOW: a best effort, used only to INCLUDE a process), else through that
-    process's own PATH (an activated venv puts its bin first)."""
+    exec did: as given when absolute, else through that process's own PATH (an
+    activated venv puts its bin first). ``""`` for a relative path with a slash:
+    exec resolved it against the cwd AT EXEC, which the process may have left,
+    so it cannot be resolved now."""
     if os.path.isabs(argv0):
         return os.path.realpath(os.path.dirname(argv0))
     if "/" in argv0:
-        try:
-            return os.path.realpath(os.path.dirname(os.path.join(os.readlink(cwd), argv0)))
-        except OSError:
-            return None
+        return ""
     for d in env.get("PATH", "").split(os.pathsep):
         candidate = os.path.join(d, argv0)
         if d and os.path.isabs(d) and os.access(candidate, os.X_OK):
@@ -152,7 +157,6 @@ def _other_role(
     argv: list[str],
     venv_bin: str | None,
     env: dict[str, str] | None = None,
-    cwd: Path | None = None,
 ) -> str | None:
     """The role of a python process that is not an MCP server, or None when it
     is none the census counts: ambient worker, replay, another bridge or server,
@@ -164,12 +168,20 @@ def _other_role(
     if script is not None and os.path.basename(script) == _REPLAY_SCRIPT:
         return "replay"
     role = telemetry.process_role(argv)
+    # process_role matches the worker's name anywhere in argv (it labels rows);
+    # here the entry script decides, so `pytest .../ambient_awareness_worker.py`
+    # is not a worker.
+    if role == "ambient" and (
+        script is None or os.path.basename(script) != _SELF_SRC_SCRIPTS["ambient"]
+    ):
+        role = None
     if role in ("ambient", "server", "bridge"):
         return role
     if venv_bin is None:
         return None
-    resolved = _interpreter_dir(argv[0], env or {}, cwd or Path("/nonexistent"))
-    return "venv-generic" if resolved == venv_bin else None
+    resolved = _interpreter_dir(argv[0], env or {})
+    # An unresolvable interpreter might be main's: counted, as unknown.
+    return "venv-generic" if resolved in (venv_bin, "") else None
 
 
 def scan_mcp_servers(
@@ -233,7 +245,7 @@ def scan_mcp_servers(
         env = dict(pair.split("=", 1) for pair in env_pairs if "=" in pair)
         role = None
         if server is None:
-            role = _other_role(argv, venv_bin, env, base / "cwd")
+            role = _other_role(argv, venv_bin, env)
             if role is None:
                 continue
         found.append(
@@ -378,7 +390,10 @@ def build_census(
     rc, head = _git(repo, "rev-parse", "HEAD")
     head = head.strip() if rc == 0 else ""
     head_telemetry = has_telemetry(repo, head, cache) if head else None
-    rc, dirty = _git(repo, "status", "--porcelain", "--", "src/genesis/memory/")
+    # The history rule reasons about COMMITS, and the proofs model the loaders
+    # (the entry scripts, routing, env): an edit anywhere a producer loads code
+    # from voids both, not only one inside the memory package.
+    rc, dirty = _git(repo, "status", "--porcelain", "--", *_RUNTIME_PATHS)
     head_dirty = bool(dirty.strip()) if rc == 0 else None
     if head_telemetry is None or head_dirty is None:
         complete = False
@@ -478,7 +493,9 @@ def build_census(
     head_history: bool | None = None
     if history_ok:
         try:
-            window = _window_held(reader, reflog, time.time() - HISTORY_LOOKBACK_S, head)
+            window = _window_held(
+                reader, reflog, time.time() - HISTORY_LOOKBACK_S, head, cutoff
+            )
         except reader._Unknown:
             reasons.append("history_unreadable")
         else:
@@ -497,12 +514,16 @@ def build_census(
     }
 
 
-def _window_held(reader, reflog: str, since: float, head: str) -> list[str]:
+def _window_held(reader, reflog: str, since: float, head: str, cutoff: int) -> list[str]:
     """Every commit HEAD held after ``since``. Read from the moves themselves,
     not via a "boot" lookup, so a reflog that is empty or starts inside the
     window (no move to anchor on) still answers: no move since ``since`` means
     HEAD held only HEAD. Raises ``reader._Unknown`` on a gap, a clock that went
-    backwards, or a reflog that does not end at HEAD."""
+    backwards, or a reflog that does not end at HEAD, and when the window
+    starts before ``cutoff`` (git may have expired a detour there in a pair,
+    leaving no gap)."""
+    if since < cutoff:
+        raise reader._Unknown("the window starts before git's reflog expiry cutoff")
     moves = reader._moves(reflog)
     if moves and moves[-1][1] != head:
         raise reader._Unknown("the reflog does not end at HEAD")
@@ -542,6 +563,12 @@ def _producer_row(
         start=proc["start"],
         open_files=proof.open_file_identities(proc_root, proc["pid"]),
     )
+    if own_ns is None or proc["mnt_ns"] != own_ns:
+        foreign = False  # its paths may name other files in its namespace
+    argv0 = proc["argv"][0] if proc["argv"] else ""
+    if not os.path.isabs(argv0) and "/" in argv0:
+        # exec resolved it against a cwd that may be gone: maybe main's venv.
+        telemetry_ok, unknown, foreign = None, "interpreter_unresolved", False
     row = {
         **base,
         "commit": held[0] if held else None,
