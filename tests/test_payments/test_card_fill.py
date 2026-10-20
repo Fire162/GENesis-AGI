@@ -149,6 +149,15 @@ def test_values_for_names_only_the_tapped_kinds():
         ("exp_year", "31", "2032", False),
         ("name", "Ab Cd", " ab cd ", True),
         ("cvc", "123", None, False),
+        ("cvc", "123", "abc123", False),
+        ("number", PAN, "4242-4242-4242-4242", True),
+        ("expiry", "03/31", "03 / 31", True),
+        ("expiry", "03/31", "0x3/31", False),
+        ("exp_month", "01", "101", False),
+        ("exp_month", "01", "01", True),
+        ("exp_year", "2034", "2134", False),
+        ("exp_year", "2034", "34", True),
+        ("exp_year", "34", "2034", True),
     ],
 )
 def test_value_landed(kind, sent, got, ok):
@@ -234,6 +243,11 @@ def test_card_fill_is_off_unless_exactly_true(repo, text):
         ({"DEBUG": "pw:*"}, True),
         ({"DEBUG": "*"}, True),
         ({"DEBUG": "-pw:*,app"}, False),
+        ({"DEBUG": "pw:channel"}, True),
+        ({"DEBUG": "pw:server"}, True),
+        ({"DEBUG": "pw:channel:command"}, True),
+        ({"DEBUG": "p*"}, True),
+        ({"DEBUG": "app,other"}, False),
         ({"PWDEBUG": "0"}, True),
     ],
 )
@@ -329,3 +343,40 @@ async def test_a_bad_or_missing_reply_is_a_fixed_code(tmp_path, monkeypatch):
     with pytest.raises(rc.ReleaseClientError) as e:
         await rc.release_status("n")
     assert e.value.code == "vault_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("origin", "ok"),
+    [
+        ("https://shop.example.com", True),
+        ("http://shop.example.com", False),
+        ("http://127.0.0.1:8000", True),
+        ("http://localhost", True),
+        ("http://app.localhost:3000", True),
+        ("http://localhost.example.com", False),
+        (None, False),
+    ],
+)
+def test_secure_origin(origin, ok):
+    assert cf.secure_origin(origin) is ok
+
+
+async def test_a_claim_waits_past_the_ordinary_op_timeout(tmp_path, monkeypatch):
+    async def handle(reader, writer):
+        await reader.readline()
+        await asyncio.sleep(0.3)  # a claim's audit row behind a busy database
+        writer.write(b'{"ok": true}\n')
+        await writer.drain()
+        writer.close()
+
+    path = tmp_path / "s.sock"
+    server = await asyncio.start_unix_server(handle, path=str(path))
+    monkeypatch.setattr(rc, "vault_socket_path", lambda: path)
+    monkeypatch.setattr(rc, "_OP_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(rc, "_CLAIM_TIMEOUT_S", 5.0)
+    try:
+        assert (await rc.claim("n", "s"))["ok"] is True
+        with pytest.raises(rc.ReleaseClientError):
+            await rc.release_status("n")
+    finally:
+        server.close()

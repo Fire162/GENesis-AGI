@@ -5120,16 +5120,16 @@ async def browser_fill_card(
 
     Refused while card fill is off (config/payments.yaml) or another payment runs.
     """
-    last_sent = 0.0
+    last_sent, sent = 0.0, 0
 
     async def report(message: str) -> None:
-        nonlocal last_sent
+        nonlocal last_sent, sent
         if ctx is None or time.monotonic() - last_sent < _FILL_PROGRESS_EVERY_S:
             return
-        last_sent = time.monotonic()
+        last_sent, sent = time.monotonic(), sent + 1  # MCP progress must increase
         with contextlib.suppress(Exception):  # best effort: a lost report changes nothing
             await asyncio.wait_for(
-                ctx.report_progress(0, message=message), timeout=_FILL_PROGRESS_SEND_S
+                ctx.report_progress(sent, message=message), timeout=_FILL_PROGRESS_SEND_S
             )
 
     return await _impl_browser_fill_card(

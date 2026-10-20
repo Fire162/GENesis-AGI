@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -56,8 +57,11 @@ SETTLE_S = 60.0  # after the Pay click, for a navigation or a challenge
 NAV_GRACE_S = 13.0
 TICK_S = 0.25
 CLOSE_S = 10.0
-TEARDOWN_S = 60.0
-ABORT_S = 70.0
+# The fallback close waits for the browser lock: a tool call holds it at most
+# 300 s (_with_tool_timeout), then Camoufox's close steps take up to 10 s each.
+CLOSE_BROWSER_S = 330.0
+TEARDOWN_S = CANCEL_S + CLOSE_S + CLOSE_BROWSER_S + 5
+ABORT_S = 70.0  # what an MCP exit or a reap waits; the teardown itself runs on
 _TITLE_CHARS = 120  # the vault cuts to 80; this keeps the request line small
 _NONCE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # 3DS challenge pages, by host or path. Inferred, not measured: an unknown
@@ -84,15 +88,26 @@ _MASK_JS = (
     " let s = document.getElementById(id);"
     " if (!s) { s = document.createElement('style'); s.id = id;"
     " (document.head || root).appendChild(s); }"
-    " s.textContent = '" + MASK_CSS + "'; return true; }"
+    " s.removeAttribute('media'); s.disabled = false;"
+    " if (s.textContent !== '" + MASK_CSS + "') s.textContent = '" + MASK_CSS + "';"
+    " return true; }"
 )
 # A context-level init script: runs before the page's own scripts in every
-# document and frame of the payment context, popups included.
+# document and frame of the payment context, popups included. Its observer stays
+# for the document's life: a page script that removes the style or the inline
+# opacity (say in an input event during a fill) is undone in the same microtask
+# checkpoint, before the next paint. It re-applies only what is missing, so its
+# own writes do not re-trigger it.
 MASK_INIT_JS = (
     "(() => { const m = " + _MASK_JS + ";"
-    " if (!m()) { const o = new MutationObserver(() => { if (m()) o.disconnect(); });"
-    " o.observe(document, {childList: true, subtree: true}); }"
-    " document.addEventListener('DOMContentLoaded', m); })();"
+    " const ok = () => { const r = document.documentElement;"
+    " const s = document.getElementById('__genesis_payment_mask__');"
+    " return !!r && r.style.getPropertyValue('opacity') === '0'"
+    " && r.style.getPropertyPriority('opacity') === 'important'"
+    " && !!s && !s.disabled && !s.hasAttribute('media') && s.textContent === '" + MASK_CSS + "'; };"
+    " new MutationObserver(() => { if (!ok()) m(); }).observe(document,"
+    " {childList: true, subtree: true, attributes: true, characterData: true});"
+    " m(); document.addEventListener('DOMContentLoaded', m); })();"
 )
 _MASK_CHECK_JS = """() => {
   const clear = (v) => v === 'transparent' || /^rgba\\([^)]*,\\s*0\\)$/.test(v);
@@ -114,8 +129,9 @@ CARD_FIELD_JS = r"""(e, kind) => {
   if (!['input', 'select'].includes(tag) || e.disabled || e.readOnly) return '';
   const type = (e.getAttribute('type') || 'text').toLowerCase();
   const bad = ['hidden', 'file', 'checkbox', 'radio', 'submit', 'button', 'image',
-               'reset', 'range', 'color', 'password'];
+               'reset', 'range', 'color'];
   if (tag === 'input' && bad.includes(type)) return '';
+  if (type === 'password' && kind !== 'cvc') return '';  // some checkouts mask the CVC
   const tokens = {number: ['cc-number'], expiry: ['cc-exp'], exp_month: ['cc-exp-month'],
                   exp_year: ['cc-exp-year'], cvc: ['cc-csc'], name: ['cc-name'],
                   postal_code: ['postal-code']}[kind];
@@ -156,6 +172,16 @@ EXTRA_FIELD_JS = r"""(e) => {
   const ac = (e.getAttribute('autocomplete') || '').toLowerCase();
   return /(^|\s)cc-/.test(ac) ? 'card' : tag;
 }"""
+# What an extra field now holds: its value, and for a select the chosen labels.
+EXTRA_VALUE_JS = (
+    "(e) => e.tagName.toLowerCase() === 'select'"
+    " ? [e.value, ...Array.from(e.selectedOptions).map((o) => o.label)] : [e.value]"
+)
+# The page's sessionStorage, which storage_state() does not carry.
+_SESSION_JS = (
+    "() => { const o = {}; for (let i = 0; i < sessionStorage.length; i++) {"
+    " const k = sessionStorage.key(i); o[k] = sessionStorage.getItem(k); } return o; }"
+)
 _SAME_JS = "(a, b) => a === b"
 _TEXT_JS = "() => (document.body ? document.body.innerText : '')"
 
@@ -196,6 +222,8 @@ class _Flow:
     navs: int = 0
     abort_reason: str | None = None
     tearing_down: bool = False
+    stuck: bool = False  # the fallback browser close was not reached
+    hooks: Hooks | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -221,14 +249,24 @@ def prefs_pinned() -> bool:
     return _prefs_pinned
 
 
+def _held() -> _Flow | None:
+    """The running flow; a stuck one (its fallback close not reached) only while
+    the browser it ran on is still the live one, so the guard retires with it."""
+    flow = _flow
+    if flow is not None and flow.stuck and not (flow.hooks and flow.hooks.alive()):
+        return None
+    return flow
+
+
 def in_flight() -> bool:
     """A fill holds the payment context or is still tearing it down."""
-    return _flow is not None
+    return _held() is not None
 
 
 def past_claim() -> bool:
     """A card was claimed and the flow has not finished tearing down."""
-    return _flow is not None and _flow.claimed
+    flow = _held()
+    return flow is not None and flow.claimed
 
 
 def is_payment_page(page) -> bool:
@@ -244,7 +282,7 @@ def try_x_input():
     """Turnstile's side of the one lock: yields False while a payment runs,
     else True, and a fill started meanwhile refuses ``turnstile_in_progress``."""
     global _x_input
-    if _flow is not None:
+    if in_flight():
         yield False
         return
     _x_input += 1
@@ -282,11 +320,11 @@ async def fill_card(args: cf.CardArgs, main_ctx, main_page, hooks: Hooks, report
     """The whole flow; returns a fixed result. ``main_ctx`` and ``main_page``
     are the Camoufox context and active page, read once by the caller."""
     global _flow
-    if _flow is not None:
+    if in_flight():
         return cf.result("payment_in_flight")
     if _x_input:
         return cf.result("turnstile_in_progress")
-    flow = _flow = _Flow(task=asyncio.current_task())
+    flow = _flow = _Flow(task=asyncio.current_task(), hooks=hooks)
     try:
         try:
             return await _run(flow, args, main_ctx, main_page, hooks, report)
@@ -321,6 +359,7 @@ async def _step(aw):
 
 async def _teardown(flow: _Flow, hooks: Hooks) -> None:
     global _flow
+    escalating = False
     try:
         if flow.nonce is not None and not flow.claimed:
             try:
@@ -333,9 +372,18 @@ async def _teardown(flow: _Flow, hooks: Hooks) -> None:
             except Exception as e:  # noqa: BLE001
                 logger.error("payment context did not close (%s)", type(e).__name__)
                 if hooks.alive():  # it may hold typed values: close the whole browser
-                    _spawn(hooks.close_browser())
+                    escalating = True
+                    await asyncio.wait_for(hooks.close_browser(), CLOSE_BROWSER_S)
+    except Exception as e:  # noqa: BLE001
+        logger.error("payment teardown step failed (%s)", type(e).__name__)
     finally:
-        if _flow is flow:
+        # A close that did not detach the browser (refused, timed out, cancelled):
+        # the guard stays while that browser lives, and the close is tried again.
+        if escalating and hooks.alive():
+            logger.error("payment browser close not reached; payments stay refused")
+            flow.stuck = True
+            _spawn(hooks.close_browser())
+        if _flow is flow and not flow.stuck:
             _flow = None
         flow.done.set()
 
@@ -371,8 +419,8 @@ async def _resolve_one(page, spec: cf.Spec, kind: str) -> tuple[object, object, 
             else f"field_{'not_found' if count == 0 else 'ambiguous'}:{kind}"
         )
     origin = cf.origin_of(frame.url)
-    if origin is None:  # about:blank, srcdoc and data: frames are never filled
-        raise _Stop("pay_not_found" if kind == "pay" else f"field_origin:{kind}")
+    if not cf.secure_origin(origin):  # about:blank, srcdoc, data: or plain http: never
+        raise _Stop(f"field_origin:{kind}")
     return frame, await _step(loc.element_handle(timeout=5000)), origin
 
 
@@ -443,8 +491,12 @@ def _moved(ppage, top: str, fields: dict[str, _Field], pay: _Field, seen: dict) 
         return True
 
 
-async def _fill_extras(ppage, args: cf.CardArgs, fields: dict[str, _Field]) -> None:
-    for name, (sel, value) in args.extra.items():
+async def _extras(ppage, args: cf.CardArgs, fields: dict[str, _Field], fill: bool) -> None:
+    """Each extra field: exactly one input, textarea or select in the top
+    document, no card field, no two names on one element; filled when ``fill``,
+    and then holding its value (checked again after the tap and before Pay)."""
+    seen: list = []
+    for sel, value in args.extra.values():
         loc = ppage.main_frame.locator(sel)
         if await _step(loc.count()) != 1:
             raise _Stop("extra_field_not_found")
@@ -457,14 +509,53 @@ async def _fill_extras(ppage, args: cf.CardArgs, fields: dict[str, _Field]) -> N
         for f in fields.values():
             if f.frame is ppage.main_frame and await _step(handle.evaluate(_SAME_JS, f.handle)):
                 raise _Stop("extra_field_is_card_field")
-        try:
-            if tag == "select":
-                await _select(handle, value)
-            else:
-                await _step(handle.fill(value, timeout=10000))
-        except Exception:  # noqa: BLE001
-            raise _Stop("extra_field_failed") from None
-        logger.debug("payment extra field filled (%s)", name)
+        for other in seen:
+            if await _step(handle.evaluate(_SAME_JS, other)):
+                raise _Stop("extra_field_not_found")
+        seen.append(handle)
+        if fill:
+            try:
+                if tag == "select":
+                    await _select(handle, value)
+                else:
+                    await _step(handle.fill(value, timeout=10000))
+            except Exception:  # noqa: BLE001
+                raise _Stop("extra_field_failed") from None
+    for handle, (_sel, value) in zip(seen, args.extra.values(), strict=True):
+        got = await _step(handle.evaluate(EXTRA_VALUE_JS))
+        if not isinstance(got, list) or value.strip().casefold() not in {
+            g.strip().casefold() for g in got if isinstance(g, str)
+        }:
+            raise _Stop("extra_field_failed")
+
+
+async def _same_page(ppage, args, top, seen, label, fields, pay, clicking=False) -> bool:
+    """Everything the tap showed still holds: the top and frame origins, Pay
+    (the same label, a button, no GET submit), the mask, the amount, and every
+    extra field's value. Run after the tap, after the claim, and before Pay."""
+    if _moved(ppage, top, fields, pay, seen):
+        return False
+    if not _pay_ok(await _step(pay.handle.evaluate(PAY_JS)), label, clicking):
+        return False
+    if not await _mask_ok(ppage) or not await _amount_ok(ppage, args.amount):
+        return False
+    try:
+        await _extras(ppage, args, fields, fill=False)
+    except _Stop:
+        return False
+    return True
+
+
+def _pay_ok(info, label: str, clicking: bool) -> bool:
+    """Pay is still the approved control: a button, not a GET submit, the label
+    the tap showed; and, to click it, connected and enabled."""
+    return (
+        isinstance(info, dict)
+        and info.get("button") is True
+        and info.get("get") is False
+        and info.get("label") == label
+        and (not clicking or info.get("live") is True)
+    )
 
 
 async def _select(handle, value: str, kind: str = "") -> None:
@@ -543,6 +634,8 @@ async def _outcome(flow: _Flow, ppage, start: str, before: set, site: str, hooks
     while loop.time() < deadline:
         if not hooks.alive() or ppage.is_closed():
             return "outcome_unknown"
+        # ppage.frames includes the main frame: a top-level move to a challenge
+        # page (a merchant-hosted /3ds included) is a new URL here too.
         if flow.popup or any(
             _is_challenge(f.url) for f in list(ppage.frames) if f.url not in before
         ):
@@ -567,6 +660,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
 
     # Handover. Frame chains resolve read-only in the main page first (their
     # origins choose the storage handed over); nothing there is filled or clicked.
+    if getattr(main_ctx, "browser", None) is None:  # nothing to open a second context with
+        raise _Stop("checkout_load_failed")
     frame_origins = set()
     for kind, (frames, _sel) in [*args.fields.items(), ("pay", args.pay)]:
         if frames:
@@ -579,6 +674,14 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     state = await asyncio.wait_for(main_ctx.storage_state(indexed_db=True), EXPORT_S)
     handed = cf.filter_state(state, site, frame_origins)
     del state
+    session: dict = {}
+    try:  # the main page's own origin only
+        got = await _step(main_page.main_frame.evaluate(_SESSION_JS))
+        session = (
+            {k: v for k, v in got.items() if isinstance(v, str)} if isinstance(got, dict) else {}
+        )
+    except Exception as e:  # noqa: BLE001 - the checkout may still load without it
+        logger.warning("payment sessionStorage read failed (%s)", type(e).__name__)
     try:
         from camoufox.utils import STOCK_MEDIA_DEFAULTS
 
@@ -593,12 +696,25 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         del handed
         pctx.on("dialog", lambda d: _spawn(d.dismiss()))
         await _step(pctx.add_init_script(MASK_INIT_JS))
+        seed = None
+        if session:  # into an empty sessionStorage of the same origin, before page scripts
+            seed = await _step(
+                pctx.add_init_script(
+                    f"(() => {{ const d = {json.dumps(session)};"
+                    f" if (location.origin === new URL({json.dumps(url)}).origin"
+                    " && sessionStorage.length === 0)"
+                    " for (const [k, v] of Object.entries(d)) sessionStorage.setItem(k, v); })();"
+                )
+            )
+        del session
         ppage = await _step(pctx.new_page())
         # The context's "page" event fires for new_page() too: only another page is a popup.
         pctx.on("page", lambda p: p is not ppage and setattr(flow, "popup", True))
         await asyncio.wait_for(
             ppage.goto(url, wait_until="domcontentloaded", timeout=GOTO_MS), GOTO_MS / 1000 + 5
         )
+        if seed is not None:  # the first document only: a later page is not re-seeded
+            await _step(seed.dispose())
     except Exception as e:  # noqa: BLE001
         logger.warning("payment context load failed (%s)", type(e).__name__)
         raise _Stop("checkout_load_failed") from None
@@ -607,6 +723,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     host, top = urlsplit(ppage.url).hostname, cf.origin_of(ppage.url)
     if not host or top is None or registrable_domain(host) != site:
         raise _Stop("checkout_redirected")
+    if not cf.secure_origin(top):
+        raise _Stop("not_https")
     flow.host = host
     if await hooks.interstitial(ppage):
         raise _Stop("bot_check")
@@ -614,7 +732,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     fields, pay, label = await _resolve(ppage, args)
     origins = {k: f.origin for k, f in fields.items()}
     seen = {**origins, "pay": pay.origin}
-    await _fill_extras(ppage, args, fields)  # before the tap: no card value exists yet
+    await _extras(ppage, args, fields, fill=True)  # before the tap: no card value exists yet
     if not await _mask_ok(ppage):
         raise _Stop("mask_unverified")
     if not await _amount_ok(ppage, args.amount):  # after the extras: an address can re-price
@@ -649,13 +767,9 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     await _await_grant(flow, ppage, hooks, report)
 
     # Granted: the page must still show what the tap was for, fields re-resolved.
-    fields, pay, label2 = await _resolve(ppage, args)
-    if _moved(ppage, top, fields, pay, seen) or label2 != label:
+    fields, pay, _label = await _resolve(ppage, args)
+    if not await _same_page(ppage, args, top, seen, label, fields, pay):
         raise _Stop("page_changed")
-    if not await _amount_ok(ppage, args.amount):
-        raise _Stop("page_changed")
-    if not await _mask_ok(ppage):
-        raise _Stop("mask_unverified")
     if why := _gone(flow, ppage, hooks):
         raise _Stop(why)
     flow.claimed = True  # from here the vault may hand the card over: no cancel
@@ -677,10 +791,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         del card
 
     # Typing. Nothing is typed into a page that changed after the tap.
-    if (
-        _gone(flow, ppage, hooks)
-        or _moved(ppage, top, fields, pay, seen)
-        or not await _mask_ok(ppage)
+    if _gone(flow, ppage, hooks) or not await _same_page(
+        ppage, args, top, seen, label, fields, pay
     ):
         values.clear()
         raise _Stop("claimed_not_filled")
@@ -702,14 +814,11 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         values.clear()
 
     # Pay.
-    info = await _step(pay.handle.evaluate(PAY_JS))
-    if (
-        not isinstance(info, dict)
-        or info.get("live") is not True
-        or info.get("get") is not False
-        or _moved(ppage, top, fields, pay, seen)
-        or not await _mask_ok(ppage)
-        or not await _amount_ok(ppage, args.amount)
+    if not await _same_page(ppage, args, top, seen, label, fields, pay, clicking=True):
+        raise _Stop("failed_before_pay", filled=flow.typed)
+    # The fastest-changing checks once more, last, so nothing slow runs between them and the click.
+    if _moved(ppage, top, fields, pay, seen) or not _pay_ok(
+        await _step(pay.handle.evaluate(PAY_JS)), label, clicking=True
     ):
         raise _Stop("failed_before_pay", filled=flow.typed)
     ppage.on(

@@ -88,13 +88,16 @@ TEXTS = {
     "field_not_found": "A card field selector matched nothing.",
     "field_ambiguous": "A card field selector matched more than one element; narrow it.",
     "field_mismatch": "A target is not that kind of card field (autocomplete or label).",
-    "field_origin": "A card field's frame is not on an http(s) origin.",
+    "field_origin": "A card field's or Pay's frame is not on an https origin.",
+    "not_https": "The checkout is not served over https." + _NONE,
     "pay_not_found": "The pay selector did not match exactly one element.",
     "pay_not_button": "The pay control must be a button or an input type=submit.",
     "pay_get_form": "Refused: the pay control submits with GET (the card would be in a URL).",
-    "extra_field_not_found": "An extra field selector did not match one input or select.",
+    "extra_field_not_found": "An extra field selector did not match one input or select of "
+    "its own.",
     "extra_field_is_card_field": "An extra_fields target is a card field.",
-    "extra_field_failed": "An extra field could not be filled." + _NONE,
+    "extra_field_failed": "An extra field did not take or keep its value (pass it as the "
+    "page formats it)." + _NONE,
     "mask_unverified": "The payment window's screen mask did not verify." + _NONE,
     "amount_not_on_page": "The stated amount is not on the checkout page." + _NONE,
     "vault_unavailable": "The vault service did not answer (genesis-server)." + _NONE,
@@ -184,12 +187,16 @@ def card_fill_enabled() -> bool:
 def playwright_debug_on() -> bool:
     """Whether a Playwright debug log would carry what is typed: DEBUGP (the
     Python client prints every protocol message to stdout, the MCP transport),
-    PWDEBUG, DEBUG_FILE, or a DEBUG pattern matching a pw namespace."""
+    PWDEBUG, DEBUG_FILE, or a DEBUG pattern that names or matches any pw
+    namespace (pw:channel logs every command with its arguments). A negation
+    never clears it: refusing is the safe reading."""
     if any(os.environ.get(v) is not None for v in ("DEBUGP", "PWDEBUG", "DEBUG_FILE")):
         return True
-    names = ("pw:api", "pw:protocol", "pw:browser")
+    names = ("pw:api", "pw:protocol", "pw:browser", "pw:channel", "pw:channel:command")
     return any(
-        p and not p.startswith("-") and any(fnmatch.fnmatchcase(ns, p) for ns in names)
+        p
+        and not p.startswith("-")
+        and (p.startswith("pw") or any(fnmatch.fnmatchcase(ns, p) for ns in names))
         for p in re.split(r"[\s,]+", os.environ.get("DEBUG", ""))
     )
 
@@ -290,12 +297,17 @@ def value_landed(kind: str, sent: str, got) -> bool:
     """Whether the field now shows what was typed (a site may reformat digits)."""
     if not isinstance(got, str):
         return False
-    if kind in ("exp_month", "exp_year"):  # a select's option: 01 or 1, 2034 or 34
-        a, b = "".join(c for c in got if c.isdigit()), "".join(c for c in sent if c.isdigit())
-        return bool(a and b) and int(a) % 100 == int(b) % 100
-    if kind in ("number", "cvc", "expiry"):
-        return "".join(c for c in got if c.isdigit()) == "".join(c for c in sent if c.isdigit())
-    return got.strip().casefold() == sent.strip().casefold()
+    got = got.strip()
+    if kind == "exp_month":  # a select's option may drop the leading zero
+        return re.fullmatch(r"\d{1,2}", got) is not None and int(got) == int(sent)
+    if kind == "exp_year":  # or show the year in two or four digits
+        full = lambda y: int(y) + 2000 if len(y) == 2 else int(y)  # noqa: E731
+        return re.fullmatch(r"\d{2}|\d{4}", got) is not None and full(got) == full(sent)
+    if kind in ("number", "cvc", "expiry"):  # a site may add spaces, dashes or a slash
+        return re.fullmatch(r"[\d /-]*", got) is not None and re.sub(r"\D", "", got) == re.sub(
+            r"\D", "", sent
+        )
+    return got.casefold() == sent.strip().casefold()
 
 
 def _norm(text: str) -> str:
@@ -324,6 +336,17 @@ def origin_of(url) -> str | None:
         return None
     host = f"[{host}]" if ":" in host else host
     return f"{parts.scheme}://{host}" + (f":{port}" if port else "")
+
+
+def secure_origin(origin) -> bool:
+    """An https origin, or http on this machine's loopback (nothing in transit)."""
+    if not isinstance(origin, str):
+        return False
+    host = urlsplit(origin).hostname or ""
+    return origin.startswith("https://") or (
+        origin.startswith("http://")
+        and (host in ("localhost", "127.0.0.1", "::1") or host.endswith(".localhost"))
+    )
 
 
 def filter_state(state: dict, site: str, frame_origins: set[str]) -> dict:

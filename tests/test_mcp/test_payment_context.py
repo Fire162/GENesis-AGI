@@ -34,6 +34,7 @@ from genesis.payments import release_client
 
 PAN = "4242424242424242"
 CARD_REF = "card_" + "ab12" * 3
+# frozen-clock-ok: 3-year margin; the test expiry stays valid for any run shorter than that
 YEAR = datetime.now(UTC).year + 3
 CVC = "".join(secrets.choice(string.digits[1:]) for _ in range(3))
 NAME = "Zq" + "".join(secrets.choice(string.ascii_lowercase) for _ in range(8))
@@ -85,6 +86,8 @@ class Handle:
             return self.el.extra or self.el.tag
         if js is pc._SAME_JS:
             return arg.el is self.el
+        if js is pc.EXTRA_VALUE_JS:
+            return [self.el.value]
         raise AssertionError("unexpected script")
 
     async def fill(self, value, timeout=None):
@@ -119,6 +122,7 @@ class Frame:
     def __init__(self, url, elements=None, text=""):
         self.url, self.elements, self.text = url, elements or {}, text
         self.masked = True
+        self.session: dict = {}
 
     def locator(self, sel):
         return Loc(self, sel)
@@ -128,6 +132,8 @@ class Frame:
             return self.masked
         if js == pc._TEXT_JS:
             return self.text
+        if js == pc._SESSION_JS:
+            return dict(self.session)
         raise AssertionError("unexpected script")
 
 
@@ -177,6 +183,13 @@ class PCtx:
 
     async def add_init_script(self, js):
         self.log.append(("init_script", js))
+        log = self.log
+
+        class Disposable:
+            async def dispose(self):
+                log.append(("dispose", js))
+
+        return Disposable()
 
     async def new_page(self):
         self.log.append(("new_page",))
@@ -220,6 +233,7 @@ class MainCtx:
 
     async def storage_state(self, indexed_db=False):
         assert indexed_db is True
+        self.exported = True
         return json.loads(json.dumps(self.state))
 
 
@@ -760,7 +774,7 @@ async def test_abort_ends_the_flow_with_a_result_and_cancels(vault):
     [
         ("on_status", lambda ns: ns.els["pay"].pay.update(label="Pay $99.99"), "page_changed"),
         ("on_status", lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "page_changed"),
-        ("on_claim", lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "failed_before_pay"),
+        ("on_claim", lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "claimed_not_filled"),
         ("on_claim", lambda ns: setattr(ns.ppage.extra[0], "masked", False), "claimed_not_filled"),
     ],
 )
@@ -816,6 +830,122 @@ async def test_a_challenge_like_frame_present_before_pay_is_ignored(vault):
     assert out["code"] == "submitted_unverified"
 
 
+async def _filling(ns, last_kind, change):
+    """Run with ``change`` applied right after ``last_kind`` is typed."""
+    real = Handle.fill
+
+    async def fill(self, value, timeout=None):
+        await real(self, value, timeout)
+        if self.el is ns.els[last_kind]:
+            change()
+
+    Handle.fill = fill
+    try:
+        return (await _run(ns))[0]
+    finally:
+        Handle.fill = real
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda ns: ns.els["pay"].pay.update(label="Pay $999.99"),
+        lambda ns: ns.els["pay"].pay.update(button=False),
+        lambda ns: setattr(ns.els["email"], "value", "other@example.org"),
+        lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"),
+        lambda ns: setattr(ns.ppage.extra[0], "url", "https://evil.example.org/f"),
+    ],
+)
+async def test_pay_and_extras_are_rechecked_right_before_pay(vault, change):
+    ns = checkout()
+    clicked = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    out = await _filling(ns, "name", lambda: change(ns))
+    assert out["code"] == "failed_before_pay" and clicked == []
+
+
+async def test_an_extra_field_changed_while_waiting_cancels(vault):
+    ns = checkout()
+    vault.on_status = lambda: setattr(ns.els["email"], "value", "")
+    out, _ = await _run(ns)
+    assert out["code"] == "page_changed" and vault.ops("release_claim") == []
+
+
+async def test_an_extra_field_that_does_not_keep_its_value_requests_nothing(vault):
+    ns = checkout()
+    ns.els["email"].mangle = True
+    out, _ = await _run(ns)
+    assert out["code"] == "extra_field_failed" and vault.requests == []
+
+
+async def test_two_extra_names_on_one_element_are_refused(vault):
+    ns = checkout()
+    out, _ = await _run(
+        ns,
+        extra_fields={
+            "email": {"selector": "#email", "value": EMAIL},
+            "company": {"selector": "#email", "value": "Acme"},
+        },
+    )
+    assert out["code"] == "extra_field_not_found" and vault.requests == []
+
+
+@pytest.mark.parametrize(
+    ("setup", "code"),
+    [
+        (lambda ns: setattr(ns.ppage, "goto_to", "http://shop.example.com/checkout"), "not_https"),
+        (lambda ns: setattr(ns.ppage.extra[0], "url", "http://js.cards.example.net/f"), "field_origin:number"),
+        (lambda ns: setattr(ns.main, "browser", None), "checkout_load_failed"),
+    ],
+)
+async def test_plain_http_and_no_browser_are_refused(vault, setup, code):
+    ns = checkout()
+    setup(ns)
+    out, _ = await _run(ns)
+    assert out["code"] == code and vault.requests == []
+    assert ns.els["number"].value == ""
+    if code == "checkout_load_failed":  # refused before anything is read or created
+        assert not getattr(ns.main, "exported", False)
+
+
+async def test_a_merchant_hosted_bank_check_is_a_challenge(vault):
+    ns = checkout()
+    ns.els["pay"].on_click = lambda: ns.ppage.navigate("https://shop.example.com/pay/3ds/start")
+    out, _ = await _run(ns)
+    assert out["code"] == "challenge"
+
+
+async def test_session_storage_is_handed_over_for_the_merchant_origin(vault):
+    ns = checkout()
+    ns.main_page.main_frame.session = {"cart": "c-1"}
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+    scripts = [e[1] for e in ns.log if e[0] == "init_script"]
+    assert scripts[0] == pc.MASK_INIT_JS and len(scripts) == 2
+    assert '{"cart": "c-1"}' in scripts[1] and json.dumps(SHOP) in scripts[1]
+    assert ("dispose", scripts[1]) in ns.log  # seeds the first document only
+    assert ("dispose", scripts[0]) not in ns.log
+
+
+async def test_progress_increases(monkeypatch):
+    clock = [0.0]
+
+    async def impl(*_a, report=None, **_k):
+        for _ in range(3):
+            clock[0] += 10
+            await report("waiting")
+        return {"code": "x"}
+
+    sent = []
+    ctx = MagicMock()
+    ctx.report_progress = AsyncMock(side_effect=lambda p, message=None: sent.append(p))
+    monkeypatch.setattr(browser, "_impl_browser_fill_card", impl)
+    monkeypatch.setattr(browser, "time", MagicMock(monotonic=lambda: clock[0]))
+    fn = getattr(browser.browser_fill_card, "fn", browser.browser_fill_card)
+    await fn(CARD_REF, "$1", {"number": "#n"}, "#p", ctx=ctx)
+    assert sent == [1, 2, 3]
+
+
 async def test_abort_after_the_pay_click_is_outcome_unknown(vault):
     ns = checkout()
     ns.els["pay"].on_click = lambda: asyncio.get_running_loop().call_soon(
@@ -825,14 +955,34 @@ async def test_abort_after_the_pay_click_is_outcome_unknown(vault):
     assert out["code"] == "outcome_unknown" and ns.pctx.closed
 
 
-async def test_a_context_that_will_not_close_closes_the_browser(vault):
+async def test_a_context_that_will_not_close_closes_the_browser_first(vault):
     ns = checkout()
     ns.pctx.close_fails = True
-    out, hooks = await _run(ns)
-    for _ in range(5):
-        await asyncio.sleep(0)
+    hooks = Hooks()
+    hooks.close_browser.side_effect = lambda: setattr(hooks, "up", False)
+    out, _ = await _run(ns, hooks=hooks)
     assert out["code"] == "submitted_unverified"
-    hooks.close_browser.assert_awaited_once()
+    hooks.close_browser.assert_awaited_once()  # awaited before the guard is released
+    assert not pc.in_flight()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_a_browser_that_will_not_close_keeps_payments_refused_while_it_lives(vault, fails):
+    ns = checkout()
+    ns.pctx.close_fails = True
+    hooks = Hooks()
+    if fails:
+        hooks.close_browser.side_effect = RuntimeError("lock busy")
+    out, _ = await _run(ns, hooks=hooks)  # the close does not detach the browser
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert hooks.close_browser.await_count == 2  # tried again in the background
+    assert pc.in_flight()
+    with pc.try_x_input() as ok:
+        assert ok is False
+    again, _ = await _run(checkout())
+    assert again["code"] == "payment_in_flight"
+    hooks.up = False  # that browser is gone: the guard retires with it
     assert not pc.in_flight()
 
 

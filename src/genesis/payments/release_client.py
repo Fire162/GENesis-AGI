@@ -21,6 +21,10 @@ from genesis.env import vault_socket_path
 # card and writes an audit row (each about a second at worst behind a busy
 # database). The service gives up on a silent client after 10 s.
 _OP_TIMEOUT_S = 20.0
+# A claim's audit row can wait about 22 s behind a held SQLite write lock
+# (MEASURED, vault_service.py's stop comment). Leaving earlier only turns an
+# approved release into "claim_unanswered", so the claim waits longer.
+_CLAIM_TIMEOUT_S = 90.0
 _MAX_REPLY = 16 * 1024
 
 
@@ -33,10 +37,10 @@ class ReleaseClientError(Exception):
         self.code = code
 
 
-async def _ask(payload: dict) -> dict:
+async def _ask(payload: dict, timeout: float | None = None) -> dict:
     writer = None
     try:
-        async with asyncio.timeout(_OP_TIMEOUT_S):
+        async with asyncio.timeout(timeout or _OP_TIMEOUT_S):
             reader, writer = await asyncio.open_unix_connection(
                 str(vault_socket_path()), limit=_MAX_REPLY
             )
@@ -98,7 +102,7 @@ async def release_status(nonce: str) -> dict:
 async def claim(nonce: str, secret: str) -> dict:
     """``{ok, card: {...}}`` once, or ``{ok: False, error}``. The caller owns
     the card values in the reply and must drop them."""
-    return await _ask({"op": "release_claim", "nonce": nonce, "claim": secret})
+    return await _ask({"op": "release_claim", "nonce": nonce, "claim": secret}, _CLAIM_TIMEOUT_S)
 
 
 async def cancel(nonce: str) -> dict:
