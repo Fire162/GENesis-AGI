@@ -304,16 +304,21 @@ so the hourly read never takes the index lock a deploy needs. Since schema 2
 is clean only when three more things are PROVEN, each derived the way that
 server derives it, never from the census process's own state: its code source
 (its `argv[0]` is in main's `.venv/bin`, it runs main's own server script, and
-nothing that venv's site-packages, `PYTHONPATH`, the script's directory or the
-system `sitecustomize` can load shadows main's `genesis`), its kill switch (what
+nothing that venv's site-packages, the directories its `.pth` files add (main's
+`src` included, searched for customize modules), `PYTHONPATH`, the script's
+directory or the system `sitecustomize` can load shadows main's `genesis`), its kill switch (what
 it runs with: the memory lifespan's router reloads its secrets file with
 `override=True`, so a key the file carries beats the exec-time value; the file
-counts only if it and any symlink on its path are unchanged by ctime since the
-server started, and a missing or changed file is unknown), and its database
+counts only if it and every symlink met resolving it, including links inside a
+link's own target, are unchanged by ctime since the server started, and a
+missing or changed file is unknown), and its database
 scope (the primary database is fixed at import from the exec env or the root
 default, and a path in the file becomes a second one; `foreign` only when every
-one of them differs from the live database by `(st_dev, st_ino)`, and only for a
-server whose code is proven). Anything unproven
+one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
+those paths changed since the server started, and none of its open descriptors
+is the live database, since the open handle is what a long-lived connection
+uses; unreadable descriptors are never foreign; and only for a server whose
+code is proven). Anything unproven
 lands in `unknown_reasons` or `telemetry_off: null`, and the verdict reads the
 row as not clean, so the clock waits for that server to restart. The cutover
 clock can only start at a census with no server that could be running older
