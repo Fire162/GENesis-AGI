@@ -340,9 +340,17 @@ def test_an_edited_memory_package_marks_head_dirty(proc_root, repo):
 @pytest.mark.asyncio
 async def test_record_census_writes_one_row(db, monkeypatch):
     monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED", raising=False)
-    monkeypatch.setattr(census, "build_census", lambda: {"procs": [], "complete": True})
+    seen = {}
+
+    def fake(**kw):
+        seen.update(kw)
+        return {"procs": [], "complete": True}
+
+    monkeypatch.setattr(census, "build_census", fake)
 
     await census.record_census(db)
+    # The live database is the one THIS process's connection holds open.
+    assert seen == {"live_held_by": os.getpid()}
 
     cur = await db.execute(
         "SELECT dimension, metrics_json FROM eval_events WHERE event_type = ?",
@@ -436,7 +444,7 @@ async def test_a_kill_switch_added_to_secrets_env_later_is_seen(db, monkeypatch,
     monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED", raising=False)
     secrets = tmp_path / "secrets.env"
     monkeypatch.setenv("SECRETS_PATH", str(secrets))
-    monkeypatch.setattr(census, "build_census", lambda: {"v": 1, "procs": [], "complete": True})
+    monkeypatch.setattr(census, "build_census", lambda **kw: {"v": 1, "procs": [], "complete": True})
 
     secrets.write_text("OTHER=1\n")
     assert (await census.record_census(db))["complete"] is True
@@ -641,3 +649,24 @@ def test_a_bench_server_holding_the_live_db_open_is_counted(proc_root, repo, tmp
           exe=str(tmp_path / "sys" / "bin" / "python3.12"), fds=[live])
     [p] = census.build_census(r, proc_root=proc_root, live_db=live)["procs"]
     assert p["foreign"] is False
+
+
+def test_the_census_names_the_live_db_its_writer_holds_open(proc_root, repo, tmp_path):
+    """The row is written through the host's open connection: if the path now
+    names another file (a symlink retargeted since it opened), the census
+    cannot say which database "live" is and reads incomplete."""
+    import time as _time
+
+    r, _, _ = repo
+    live = tmp_path / "live.db"
+    live.write_text("")
+    other = tmp_path / "other.db"
+    other.write_text("")
+    _proc(proc_root, 70, ["sleep", "1"], started=_time.time() - 5, fds=[live])
+    _proc(proc_root, 71, ["sleep", "1"], started=_time.time() - 5, fds=[other])
+    held = census.build_census(r, proc_root=proc_root, live_db=live, live_held_by=70)
+    assert "live_db_moved" not in held["reasons"]
+    moved = census.build_census(r, proc_root=proc_root, live_db=live, live_held_by=71)
+    assert (moved["complete"], "live_db_moved" in moved["reasons"]) == (False, True)
+    gone = census.build_census(r, proc_root=proc_root, live_db=live, live_held_by=99999)
+    assert "live_db_moved" in gone["reasons"]

@@ -48,6 +48,22 @@ socket comes from ``GENESIS_HOME``, not the database); its traversals serve no
 live memory, so they are not live traffic, by the same reasoning that excludes
 replay.
 
+**Threat model: accidental drift** (owner ruling, 2026-10-20). The rules catch
+what goes wrong on a working install: a server started before a deploy or a
+secrets edit, one launched from a worktree or another venv, a sandbox
+``PYTHONPATH``, a stray file beside the script, a switch or database set at
+launch. They do not try to defeat someone with shell access deliberately
+building inputs, who could as easily edit main's code. Without a record the
+process writes at its own start (ruled out for now; tracked as a redesign),
+these deliberate constructions stay as residuals:
+- an ordinary (non-symlink) ancestor directory of the secrets file swapped for
+  a pre-built tree. A ctime rule on ancestors would fail every live server
+  (MEASURED: the home and checkout directories change constantly);
+- forged ``.pyc`` files, or a ``PYTHONPYCACHEPREFIX`` / ``-X pycache_prefix``;
+- files added beside the script or in site-packages after the start and
+  removed before the census reads;
+- the stdlib or site-packages upgraded after the start.
+
 No reason code carries an environment value or a path from another process.
 """
 
@@ -69,6 +85,8 @@ PROOF_ENV_KEYS = (
     "PYTHONPATH",
     "PYTHONHOME",
     "PYTHONPLATLIBDIR",
+    "PYTHONEXECUTABLE",
+    "PYTHONWARNINGS",
     "SECRETS_PATH",
     "GENESIS_REPO_ROOT",
     "GENESIS_DB_PATH",
@@ -129,6 +147,31 @@ def _shadows(directory: Path, names: set[str]) -> bool:
         ):
             return True
     return False
+
+
+def _dotted_warning_category(argv: tuple[str, ...], env: dict[str, str]) -> bool:
+    """Whether a ``-W`` option or ``PYTHONWARNINGS`` names a dotted category:
+    CPython imports that module while it processes the warning filters, before
+    ``site`` runs (``warnings._getcategory``)."""
+    filters = env.get("PYTHONWARNINGS", "").split(",")
+    i = 1
+    while i < len(argv) and argv[i].startswith("-") and argv[i] not in ("-m", "-c", "-"):
+        if argv[i] == "-W" and i + 1 < len(argv):
+            filters.append(argv[i + 1])
+        elif argv[i].startswith("-W") and len(argv[i]) > 2:
+            filters.append(argv[i][2:])
+        i += 2 if argv[i] in _PY_OPTS_WITH_VALUE else 1
+    return any("." in (f.split(":") + ["", "", ""])[2] for f in filters)
+
+
+def _has_dist_metadata(directory: Path) -> bool:
+    """Whether ``directory`` holds package metadata. ``importlib.metadata``
+    walks every ``sys.path`` entry, and an entry-point plugin loader (pydantic's,
+    say) imports whatever a ``*.dist-info`` there names."""
+    try:
+        return any(n.endswith((".dist-info", ".egg-info")) for n in os.listdir(directory))
+    except OSError:
+        return True
 
 
 def _finder_mapping(site: Path, module: str) -> dict | None:
@@ -194,8 +237,8 @@ def _script(argv: tuple[str, ...]) -> str | None:
     """The script a ``python [opts] script`` command runs; None for ``-m``/``-c``."""
     i = 1
     while i < len(argv) and argv[i].startswith("-"):
-        if argv[i] in ("-m", "-c"):
-            return None
+        if argv[i] in ("-m", "-c", "-"):
+            return None  # a module, a command, or code read from stdin
         i += 2 if argv[i] in _PY_OPTS_WITH_VALUE else 1
     return argv[i] if i < len(argv) else None
 
@@ -213,9 +256,22 @@ def interpreter_source(
     if not os.path.isabs(argv0):
         return ["argv0_not_absolute"]
     venv = main_root / ".venv"
-    if os.path.realpath(os.path.dirname(argv0)) != os.path.realpath(venv / "bin"):
+    bin_dir = os.path.dirname(argv0)
+    if ".." in Path(argv0).parts or os.path.realpath(bin_dir) != os.path.realpath(venv / "bin"):
         return ["not_main_venv"]
     reasons: list[str] = []
+    # CPython looks for pyvenv.cfg beside the RAW executable path, then one level
+    # up, before resolving any symlink: the file it finds decides the venv.
+    found = next(
+        (c for c in (Path(bin_dir) / "pyvenv.cfg", Path(bin_dir).parent / "pyvenv.cfg") if c.is_file()),
+        None,
+    )
+    try:
+        cfg_is_main = found is not None and os.path.samefile(found, venv / "pyvenv.cfg")
+    except OSError:
+        cfg_is_main = False
+    if not cfg_is_main:
+        reasons.append("venv_cfg_unproven")
     cfg: dict[str, str] = {}
     try:
         for line in (venv / "pyvenv.cfg").read_text().splitlines():
@@ -226,11 +282,16 @@ def interpreter_source(
         pass
     executable = cfg.get("executable")
     if cfg.get("include-system-site-packages") != "false" or not executable or not cfg.get("home"):
-        reasons.append("venv_cfg_unproven")
+        if "venv_cfg_unproven" not in reasons:
+            reasons.append("venv_cfg_unproven")
     elif proc.exe is None or os.path.realpath(proc.exe) != os.path.realpath(executable):
         reasons.append("exe_mismatch")
     if "PYTHONHOME" in proc.env or "PYTHONPLATLIBDIR" in proc.env:
         reasons.append("python_home_set")
+    if "PYTHONEXECUTABLE" in proc.env:
+        reasons.append("python_executable_set")  # makes a venv python run as its base
+    if _dotted_warning_category(proc.argv, proc.env):
+        reasons.append("warnings_import")
 
     sites = sorted((venv / "lib").glob("python*/site-packages"))
     imports: set[str] = {"genesis", *_CUSTOMIZE}
@@ -264,9 +325,12 @@ def interpreter_source(
 
     # The system sitecustomize ``site`` imports (Debian's runs an apport hook):
     # whatever it imports by name could be shadowed through PYTHONPATH.
-    home, version = cfg.get("home"), cfg.get("version", "")
+    home = cfg.get("home")
+    version = cfg.get("version") or cfg.get("version_info") or ""
     major_minor = ".".join(version.split(".")[:2])
-    if home and major_minor:
+    if home and not major_minor:
+        reasons.append("customize_unproven")  # cannot locate the system sitecustomize
+    elif home:
         stdlib_custom = Path(home).parent / "lib" / f"python{major_minor}" / "sitecustomize.py"
         if stdlib_custom.exists():
             try:
@@ -300,6 +364,7 @@ def interpreter_source(
                     and path.is_dir()
                     and _unchanged_since(path, proc.start)
                     and not _shadows(path, reachable)
+                    and not _has_dist_metadata(path)
                 )
             except OSError:
                 ok = False
@@ -313,11 +378,11 @@ def interpreter_source(
     else:
         if script is not None and os.path.realpath(entry) != os.path.realpath(script):
             reasons.append("script_not_main")
-        # sys.path[0] precedes everything else on the path. The script is now
-        # proven to be main's own, so its directory is main's code; only names
-        # that would replace the startup's imports matter here. (site imports
-        # the customize modules before it is added, so those err safe.)
-        if _shadows(Path(os.path.dirname(os.path.realpath(entry))), imports):
+        # sys.path[0] precedes the stdlib and site-packages for every import the
+        # server makes at runtime (dotenv, argparse, ...), so the script's
+        # directory may hold no stdlib or installed name, and no package metadata.
+        script_dir = Path(os.path.dirname(os.path.realpath(entry)))
+        if _shadows(script_dir, reachable) or _has_dist_metadata(script_dir):
             reasons.append("script_dir_shadow")
     return reasons
 

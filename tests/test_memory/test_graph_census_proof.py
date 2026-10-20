@@ -638,3 +638,88 @@ def test_a_customizer_in_main_src_is_unknown(tree):
     sys.path, and the editable install adds main's src."""
     (tree["main"] / "src" / "sitecustomize.py").write_text("")
     assert _source(tree, _proc(tree)) == ["customize_module"]
+
+
+# ── round 2: the startup inputs CPython reads that the census must see ─────
+
+
+def test_a_symlinked_bin_dir_with_no_venv_cfg_above_it_is_unknown(tree):
+    """CPython looks for pyvenv.cfg beside the RAW argv[0], then one level up,
+    before resolving links: through a linked bin dir it finds none and runs as
+    the base interpreter, whatever the link's target holds."""
+    link = tree["tmp"] / "elsewhere" / "bin"
+    link.parent.mkdir()
+    link.symlink_to(tree["venv"] / "bin")
+    proc = _proc(tree, argv=[str(link / "python"), str(tree["main"] / "scripts" / "genesis_mcp_server.py")])
+    assert _source(tree, proc) == ["venv_cfg_unproven"]
+
+
+def test_a_venv_cfg_beside_the_binary_wins_over_the_one_above(tree):
+    (tree["venv"] / "bin" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    assert _source(tree, _proc(tree)) == ["venv_cfg_unproven"]
+
+
+def test_a_dotdot_argv0_is_not_main(tree):
+    odd = tree["venv"] / "bin" / ".." / "bin" / "python"
+    proc = _proc(tree, argv=[str(odd), str(tree["main"] / "scripts" / "genesis_mcp_server.py")])
+    assert _source(tree, proc) == ["not_main_venv"]
+
+
+def test_a_venv_cfg_without_a_version_cannot_locate_the_system_customizer(tree):
+    cfg = tree["venv"] / "pyvenv.cfg"
+    text = cfg.read_text()
+    cfg.write_text(text.replace("version = 3.12.3\n", ""))
+    assert _source(tree, _proc(tree)) == ["customize_unproven"]
+    cfg.write_text(text.replace("version = ", "version_info = "))  # uv's spelling
+    assert _source(tree, _proc(tree)) == []
+
+
+def test_pythonexecutable_makes_a_venv_python_run_as_its_base(tree):
+    proc = _proc(tree, env={"PYTHONEXECUTABLE": "/usr/bin/python3"})
+    assert _source(tree, proc) == ["python_executable_set"]
+
+
+@pytest.mark.parametrize(
+    "argv_opts, env",
+    [
+        ([], {"PYTHONWARNINGS": "default,ignore::evilmod.W"}),
+        (["-W", "ignore::evilmod.W"], {}),
+        (["-Wignore::evilmod.W"], {}),
+    ],
+)
+def test_a_dotted_warning_category_is_an_import_at_startup(tree, argv_opts, env):
+    main = tree["main"]
+    argv = [str(main / ".venv" / "bin" / "python"), *argv_opts, str(main / "scripts" / "genesis_mcp_server.py")]
+    assert _source(tree, _proc(tree, argv=argv, env=env)) == ["warnings_import"]
+
+
+def test_a_plain_warning_filter_imports_nothing(tree):
+    env = {"PYTHONWARNINGS": "ignore::DeprecationWarning"}
+    assert _source(tree, _proc(tree, env=env)) == []
+
+
+@pytest.mark.parametrize("entry", ["inspect.py", "dotenv/", "evil-1.0.dist-info/"])
+def test_the_script_dir_may_not_shadow_a_runtime_import(tree, entry):
+    """sys.path[0] precedes the stdlib and site-packages for every import the
+    server makes at runtime, so a stray stdlib, installed or metadata name there
+    replaces the real one."""
+    (tree["site"] / "dotenv").mkdir()
+    target = tree["main"] / "scripts" / entry.rstrip("/")
+    if entry.endswith("/"):
+        target.mkdir()
+    else:
+        target.write_text("")
+    assert _source(tree, _proc(tree)) == ["script_dir_shadow"]
+
+
+def test_package_metadata_on_pythonpath_is_unknown(tree):
+    route = tree["tmp"] / "route"
+    (route / "plugin-1.0.dist-info").mkdir(parents=True)
+    assert _source(tree, _proc(tree, env={"PYTHONPATH": str(route)})) == ["pythonpath_unproven"]
+
+
+def test_code_read_from_stdin_is_not_the_named_script(tree):
+    """`python - script.py` runs stdin, with the script name only as an argument."""
+    main = tree["main"]
+    argv = [str(main / ".venv" / "bin" / "python"), "-", str(main / "scripts" / "genesis_mcp_server.py")]
+    assert _source(tree, _proc(tree, argv=argv)) == ["script_not_absolute"]

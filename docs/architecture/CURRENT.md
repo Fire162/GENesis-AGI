@@ -303,10 +303,13 @@ so the hourly read never takes the index lock a deploy needs. Since schema 2
 ("conservative unknowns", rules in `memory/graph_census_proof.py`) a server's row
 is clean only when three more things are PROVEN, each derived the way that
 server derives it, never from the census process's own state: its code source
-(its `argv[0]` is in main's `.venv/bin`, it runs main's own server script, and
-nothing that venv's site-packages, the directories its `.pth` files add (main's
-`src` included, searched for customize modules), `PYTHONPATH`, the script's
-directory or the system `sitecustomize` can load shadows main's `genesis`), its kill switch (what
+(its `argv[0]` is in main's `.venv/bin` and the `pyvenv.cfg` CPython finds from
+that raw path is main's, it runs main's own server script, no
+`PYTHONEXECUTABLE` or dotted `-W`/`PYTHONWARNINGS` category is set, and nothing
+that venv's site-packages, the directories its `.pth` files add (main's `src`
+included, searched for customize modules), `PYTHONPATH`, the script's directory
+or the system `sitecustomize` can load replaces main's `genesis` or any module
+the server imports at runtime), its kill switch (what
 it runs with: the memory lifespan's router reloads its secrets file with
 `override=True`, so a key the file carries beats the exec-time value; the file
 counts only if it and every symlink met resolving it, including links inside a
@@ -318,7 +321,10 @@ one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
 those paths changed since the server started, and none of its open descriptors
 is the live database, since the open handle is what a long-lived connection
 uses; unreadable descriptors are never foreign; and only for a server whose
-code is proven). Anything unproven
+code is proven). The census host must also hold the live database it names
+open (`live_db_moved` otherwise). The threat model is accidental drift (owner
+ruling): deliberately constructed inputs, such as a swapped ancestor directory
+or forged bytecode, are documented residuals in the module docstring. Anything unproven
 lands in `unknown_reasons` or `telemetry_off: null`, and the verdict reads the
 row as not clean, so the clock waits for that server to restart. The cutover
 clock can only start at a census with no server that could be running older

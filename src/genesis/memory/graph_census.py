@@ -251,9 +251,12 @@ def build_census(
     *,
     proc_root: Path = _PROC,
     live_db: Path | None = None,
+    live_held_by: int | None = None,
 ) -> dict:
     """One census row's metrics. Blocking (``/proc`` and ``git``): run it in a
-    thread."""
+    thread. ``live_held_by`` is the pid whose connection the row will be written
+    through: the live database is the file IT holds open, so a path retargeted
+    since that connection opened makes the census incomplete."""
     from genesis.env import genesis_db_path, repo_root
 
     repo = repo or repo_root()
@@ -261,6 +264,15 @@ def build_census(
     own_ns = _readlink_or_none(proc_root / "self" / "ns" / "mnt")
     procs, complete = scan_mcp_servers(proc_root)
     reasons: list[str] = [] if complete else ["proc_unreadable"]
+    if live_held_by is not None:
+        held = proof.open_file_identities(proc_root, live_held_by)
+        try:
+            ident = (live.stat().st_dev, live.stat().st_ino)
+        except OSError:
+            ident = None
+        if held is None or ident not in held:
+            complete = False
+            reasons.append("live_db_moved")
 
     if proc_root == _PROC:
         boot = _boot_epoch(proc_root)
@@ -396,7 +408,7 @@ async def record_census(db: aiosqlite.Connection) -> dict:
             "reasons": ["telemetry_disabled"],
         }
     else:
-        metrics = await asyncio.to_thread(build_census)
+        metrics = await asyncio.to_thread(build_census, live_held_by=os.getpid())
     await j9_eval.insert_event(
         db, dimension="system", event_type=CENSUS_EVENT_TYPE, metrics=metrics
     )
