@@ -20,6 +20,8 @@ import json
 import logging
 import secrets
 import string
+import sys
+import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -43,6 +45,13 @@ EMAIL = "zq" + "".join(secrets.choice(string.ascii_lowercase) for _ in range(6))
 SECRETS = (PAN, "4242 4242 4242 4242", CVC, NAME, POSTAL, EMAIL, f"12/{YEAR % 100:02d}")
 SHOP = "https://shop.example.com/checkout?step=pay"
 CARDS = "https://js.cards.example.net/frame"
+# camoufox.utils.STOCK_MEDIA_DEFAULTS as of camoufox 0.5.8, for runs without the package.
+MEDIA_DEFAULTS = {
+    "color_scheme": "no-override",
+    "reduced_motion": "no-override",
+    "forced_colors": "no-override",
+    "contrast": "no-override",
+}
 
 
 def _sweep(*blobs) -> None:
@@ -391,6 +400,18 @@ def _clean(monkeypatch):
         ("TICK_S", 0.01),
     ):
         monkeypatch.setattr(pc, name, value)
+    # The flow reads Camoufox's media defaults for the payment context. CI's test
+    # job installs no [browser] extra, and an absent package ends every flow at
+    # checkout_load_failed, so stand in for it there; a real install is used as is.
+    try:
+        import camoufox.utils  # noqa: F401
+    except ImportError:
+        utils = types.ModuleType("camoufox.utils")
+        utils.STOCK_MEDIA_DEFAULTS = MEDIA_DEFAULTS
+        pkg = types.ModuleType("camoufox")
+        pkg.utils = utils
+        monkeypatch.setitem(sys.modules, "camoufox", pkg)
+        monkeypatch.setitem(sys.modules, "camoufox.utils", utils)
     yield
 
 
@@ -488,6 +509,7 @@ async def test_pays_in_an_isolated_context_and_returns_fixed_text(vault, logs):
     assert ns.log[0] == ("init_script", pc.MASK_INIT_JS) and ns.log[1] == ("new_page",)
     kw = ns.main.new_context_kwargs
     assert kw["no_viewport"] is True and kw["accept_downloads"] is False
+    assert {k: kw[k] for k in MEDIA_DEFAULTS} == MEDIA_DEFAULTS  # as the main launch
     assert sorted(c["name"] for c in kw["storage_state"]["cookies"]) == ["cart", "m"]
     assert [o["origin"] for o in kw["storage_state"]["origins"]] == ["https://shop.example.com"]
     assert ns.pctx.closed and not pc.in_flight()
@@ -776,6 +798,13 @@ async def test_abort_ends_the_flow_with_a_result_and_cancels(vault):
         ("on_status", lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "page_changed"),
         ("on_claim", lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "claimed_not_filled"),
         ("on_claim", lambda ns: setattr(ns.ppage.extra[0], "masked", False), "claimed_not_filled"),
+        # Same origin, amount, Pay and fields, but another order under the tapped title.
+        ("on_status", lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"), "page_changed"),
+        (
+            "on_claim",
+            lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"),
+            "claimed_not_filled",
+        ),
     ],
 )
 async def test_each_check_after_the_tap_holds(vault, hook, change, code):
@@ -854,6 +883,7 @@ async def _filling(ns, last_kind, change):
         lambda ns: setattr(ns.els["email"], "value", "other@example.org"),
         lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"),
         lambda ns: setattr(ns.ppage.extra[0], "url", "https://evil.example.org/f"),
+        lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"),
     ],
 )
 async def test_pay_and_extras_are_rechecked_right_before_pay(vault, change):
@@ -862,6 +892,77 @@ async def test_pay_and_extras_are_rechecked_right_before_pay(vault, change):
     ns.els["pay"].on_click = lambda: clicked.append(1)
     out = await _filling(ns, "name", lambda: change(ns))
     assert out["code"] == "failed_before_pay" and clicked == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "value"),
+    [("number", ""), ("number", "4000056655665556"), ("cvc", ""), ("expiry", "01/30")],
+)
+async def test_a_card_field_rewritten_by_a_later_fill_stops_before_pay(vault, logs, kind, value):
+    """Each field passed its own read-back; filling the last one cleared or
+    rewrote an earlier one. Every card field is read back again before Pay."""
+    ns = checkout()
+    clicked = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    out = await _filling(ns, "name", lambda: setattr(ns.els[kind], "value", value))
+    assert out["code"] == "failed_before_pay" and out["field"] == kind and clicked == []
+    assert out["filled"] == ["number", "expiry", "cvc", "name"]
+    _sweep(out, logs)
+
+
+async def test_card_fields_are_read_back_after_the_last_pay_check(vault):
+    """A script that blanks the CVC while the very last Pay check reads the
+    button: the card fields are read back after it, nothing slow in between."""
+    ns = checkout()
+    clicked = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    typed, reads = [], []
+    real_fill, real_eval = Handle.fill, Handle.evaluate
+
+    async def fill(self, value, timeout=None):
+        await real_fill(self, value, timeout)
+        if self.el is ns.els["name"]:
+            typed.append(1)
+
+    async def evaluate(self, js, arg=None):
+        if js is pc.PAY_JS and typed:
+            reads.append(1)
+            if len(reads) == 2:  # the first is _same_page's, the second the last gate's
+                ns.els["cvc"].value = ""
+        return await real_eval(self, js, arg)
+
+    Handle.fill, Handle.evaluate = fill, evaluate
+    try:
+        out, _ = await _run(ns)
+    finally:
+        Handle.fill, Handle.evaluate = real_fill, real_eval
+    assert len(reads) == 2
+    assert out["code"] == "failed_before_pay" and out["field"] == "cvc" and clicked == []
+
+
+async def test_every_frame_on_a_chain_gets_its_storage(vault):
+    """A provider wrapper frame around the secure-input frame: storage of both
+    origins is handed over, not only the innermost one's."""
+    ns = checkout()
+    for page in (ns.main_page, ns.ppage):
+        card = page.extra[0]
+        wrap = Frame("https://wrap.example.org/w", {"iframe#card": [El(tag="iframe", child=card)]})
+        page.main_frame.elements["iframe#wrap"] = [El(tag="iframe", child=wrap)]
+        page.extra.append(wrap)
+    for kind in ("number", "expiry", "cvc"):
+        ns.fields[kind] = {**ns.fields[kind], "frames": ["iframe#wrap", "iframe#card"]}
+    ns.main.state["cookies"].append({"name": "w", "domain": "wrap.example.org", "value": "c4"})
+    ns.main.state["origins"].append(
+        {"origin": "https://wrap.example.org", "localStorage": [{"name": "k", "value": "v"}]}
+    )
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+    handed = ns.main.new_context_kwargs["storage_state"]
+    assert sorted(c["name"] for c in handed["cookies"]) == ["cart", "m", "w"]
+    assert sorted(o["origin"] for o in handed["origins"]) == [
+        "https://shop.example.com",
+        "https://wrap.example.org",
+    ]
 
 
 async def test_an_extra_field_changed_while_waiting_cancels(vault):

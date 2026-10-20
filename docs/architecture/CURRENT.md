@@ -1701,9 +1701,12 @@ the shared banner is not an assertion about all concurrent sessions.
   vault card in a second, short-lived Camoufox `BrowserContext` that only
   `mcp/health/payment_context.py` creates or holds (an AST contract test pins it):
   the merchant's cookies and storage (sessionStorage included) are handed over,
-  it refuses a checkout or card frame not on https (loopback http aside), every
+  it refuses a checkout or card frame not on https at a host the vault's release
+  accepts (a dotted DNS name: no IP, single-label or loopback host), every
   document is masked transparent from creation and kept so by an observer, the owner's tap shows the Pay button label and the
   extra field names, the tool clicks Pay itself and returns fixed codes only.
+  Before Pay it re-checks the tapped title, origins, Pay control, amount and
+  extra fields, and reads every card field back.
   While it runs, the idle reclaim skips Camoufox, Turnstile's X clicks in the
   same MCP process stand down (other processes on the display: not yet), and after the claim a stale-page restart is refused. Cookies are not
   handed back to the main context yet, and a 3DS challenge closes the context

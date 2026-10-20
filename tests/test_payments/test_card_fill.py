@@ -247,6 +247,10 @@ def test_card_fill_is_off_unless_exactly_true(repo, text):
         ({"DEBUG": "pw:server"}, True),
         ({"DEBUG": "pw:channel:command"}, True),
         ({"DEBUG": "p*"}, True),
+        ({"DEBUG": "*:server*"}, True),  # matches pw:server:channel
+        ({"DEBUG": "*:channel"}, True),
+        ({"DEBUG": "app:*"}, True),  # any wildcard: the namespace list is not closed
+        ({"DEBUG": "?w:api"}, True),
         ({"DEBUG": "app,other"}, False),
         ({"PWDEBUG": "0"}, True),
     ],
@@ -349,16 +353,44 @@ async def test_a_bad_or_missing_reply_is_a_fixed_code(tmp_path, monkeypatch):
     ("origin", "ok"),
     [
         ("https://shop.example.com", True),
+        ("https://shop.example.com:8443", True),
+        ("https://xn--bcher-kva.example", True),
+        ("https://shop.example.com.", True),  # the vault strips a trailing dot too
         ("http://shop.example.com", False),
-        ("http://127.0.0.1:8000", True),
-        ("http://localhost", True),
-        ("http://app.localhost:3000", True),
+        # Hosts the vault's release refuses ("bad host") are refused here first.
+        ("http://127.0.0.1:8000", False),
+        ("http://localhost", False),
+        ("http://app.localhost:3000", False),
+        ("https://localhost", False),
+        ("https://127.0.0.1", False),
+        ("https://[::1]", False),
+        ("https://intranet", False),
         ("http://localhost.example.com", False),
         (None, False),
     ],
 )
 def test_secure_origin(origin, ok):
     assert cf.secure_origin(origin) is ok
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://shop.example.com",
+        "https://shop.example.com.",
+        "https://xn--bcher-kva.example",
+        "https://127.0.0.1",
+    ],
+)
+def test_secure_origin_agrees_with_the_vaults_host_rule(origin):
+    from genesis.payments import vault_store
+
+    host = origin.split("://", 1)[1]
+    try:
+        vault_ok = bool(vault_store.normalise_merchant(host))
+    except vault_store.VaultError:
+        vault_ok = False
+    assert cf.secure_origin(origin) is vault_ok
 
 
 async def test_a_claim_waits_past_the_ordinary_op_timeout(tmp_path, monkeypatch):

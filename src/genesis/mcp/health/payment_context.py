@@ -388,8 +388,9 @@ async def _teardown(flow: _Flow, hooks: Hooks) -> None:
         flow.done.set()
 
 
-async def _walk(frame, frames: tuple[str, ...]):
-    """The frame a chain of iframe selectors leads to, or None."""
+async def _walk(frame, frames: tuple[str, ...], through: list | None = None):
+    """The frame a chain of iframe selectors leads to, or None; ``through``
+    collects every frame entered on the way, the last one included."""
     for fsel in frames:
         loc = frame.locator(fsel)
         if await _step(loc.count()) != 1:
@@ -402,6 +403,8 @@ async def _walk(frame, frames: tuple[str, ...]):
                 await _step(handle.dispose())
         if frame is None:
             return None
+        if through is not None:
+            through.append(frame)
     return frame
 
 
@@ -529,11 +532,20 @@ async def _extras(ppage, args: cf.CardArgs, fields: dict[str, _Field], fill: boo
             raise _Stop("extra_field_failed")
 
 
-async def _same_page(ppage, args, top, seen, label, fields, pay, clicking=False) -> bool:
-    """Everything the tap showed still holds: the top and frame origins, Pay
-    (the same label, a button, no GET submit), the mask, the amount, and every
-    extra field's value. Run after the tap, after the claim, and before Pay."""
+async def _title(ppage) -> str:
+    """The page title as the tap shows it (capped)."""
+    title = await _step(ppage.title())
+    return (title if isinstance(title, str) else "")[:_TITLE_CHARS]
+
+
+async def _same_page(ppage, args, top, seen, label, title, fields, pay, clicking=False) -> bool:
+    """Everything the tap showed still holds: the top and frame origins, the
+    page title, Pay (the same label, a button, no GET submit), the mask, the
+    amount, and every extra field's value. Run after the tap, after the claim,
+    and before Pay."""
     if _moved(ppage, top, fields, pay, seen):
+        return False
+    if await _title(ppage) != title:  # a same-origin SPA can swap the order under one URL
         return False
     if not _pay_ok(await _step(pay.handle.evaluate(PAY_JS)), label, clicking):
         return False
@@ -556,6 +568,11 @@ def _pay_ok(info, label: str, clicking: bool) -> bool:
         and info.get("label") == label
         and (not clicking or info.get("live") is True)
     )
+
+
+async def _holds(f: _Field, kind: str, value: str) -> bool:
+    """The field shows the value typed into it (read back here and dropped)."""
+    return cf.value_landed(kind, value, await _step(f.handle.input_value(timeout=5000)))
 
 
 async def _select(handle, value: str, kind: str = "") -> None:
@@ -658,17 +675,19 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     site = registrable_domain(main_host)
     flow.host = main_host
 
-    # Handover. Frame chains resolve read-only in the main page first (their
-    # origins choose the storage handed over); nothing there is filled or clicked.
+    # Handover. Frame chains resolve read-only in the main page first (the origins
+    # of every frame on each chain choose the storage handed over: a wrapper frame
+    # may need its own to rebuild the inner one); nothing there is filled or clicked.
     if getattr(main_ctx, "browser", None) is None:  # nothing to open a second context with
         raise _Stop("checkout_load_failed")
     frame_origins = set()
     for kind, (frames, _sel) in [*args.fields.items(), ("pay", args.pay)]:
         if frames:
-            frame = await _walk(main_page.main_frame, frames)
-            if frame is None or (origin := cf.origin_of(frame.url)) is None:
+            chain: list = []
+            frame = await _walk(main_page.main_frame, frames, chain)
+            if frame is None or cf.origin_of(frame.url) is None:
                 raise _Stop(f"frame_not_found:{kind}")
-            frame_origins.add(origin)
+            frame_origins.update(o for fr in chain if (o := cf.origin_of(fr.url)))
     # storage_state reads origins without a live page through a temporary main-context
     # page that visits each one (answered locally, no network): it grows with history.
     state = await asyncio.wait_for(main_ctx.storage_state(indexed_db=True), EXPORT_S)
@@ -741,8 +760,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     # The tap.
     title = ""
     with contextlib.suppress(Exception):
-        title = await _step(ppage.title())
-    title = (title if isinstance(title, str) else "")[:_TITLE_CHARS]
+        title = await _title(ppage)
     secret = secrets.token_hex(32)
     try:
         reply = await rc.request_release(
@@ -768,7 +786,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
 
     # Granted: the page must still show what the tap was for, fields re-resolved.
     fields, pay, _label = await _resolve(ppage, args)
-    if not await _same_page(ppage, args, top, seen, label, fields, pay):
+    if not await _same_page(ppage, args, top, seen, label, title, fields, pay):
         raise _Stop("page_changed")
     if why := _gone(flow, ppage, hooks):
         raise _Stop(why)
@@ -792,7 +810,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
 
     # Typing. Nothing is typed into a page that changed after the tap.
     if _gone(flow, ppage, hooks) or not await _same_page(
-        ppage, args, top, seen, label, fields, pay
+        ppage, args, top, seen, label, title, fields, pay
     ):
         values.clear()
         raise _Stop("claimed_not_filled")
@@ -805,22 +823,27 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
                 await _select(f.handle, values[kind], kind)
             else:
                 await _step(f.handle.fill(values[kind], timeout=10000))
-            if not cf.value_landed(
-                kind, values[kind], await _step(f.handle.input_value(timeout=5000))
-            ):
+            if not await _holds(f, kind, values[kind]):
                 raise _Stop("failed_before_pay", field=kind, filled=[*flow.typed, kind])
             flow.typed.append(kind)
+
+        # Pay. The page as tapped, then the fastest-changing checks once more, so
+        # nothing slow runs between them and the click: origins, Pay, and every
+        # card field still holding what was typed (a later field's input, or a
+        # script on the way to Pay, can clear or rewrite an earlier one).
+        if not await _same_page(ppage, args, top, seen, label, title, fields, pay, clicking=True):
+            raise _Stop("failed_before_pay", filled=flow.typed)
+        if _moved(ppage, top, fields, pay, seen) or not _pay_ok(
+            await _step(pay.handle.evaluate(PAY_JS)), label, clicking=True
+        ):
+            raise _Stop("failed_before_pay", filled=flow.typed)
+        for kind, f in fields.items():
+            if cf.origin_of(f.frame.url) != origins[kind] or not await _holds(
+                f, kind, values[kind]
+            ):
+                raise _Stop("failed_before_pay", field=kind, filled=flow.typed)
     finally:
         values.clear()
-
-    # Pay.
-    if not await _same_page(ppage, args, top, seen, label, fields, pay, clicking=True):
-        raise _Stop("failed_before_pay", filled=flow.typed)
-    # The fastest-changing checks once more, last, so nothing slow runs between them and the click.
-    if _moved(ppage, top, fields, pay, seen) or not _pay_ok(
-        await _step(pay.handle.evaluate(PAY_JS)), label, clicking=True
-    ):
-        raise _Stop("failed_before_pay", filled=flow.typed)
     ppage.on(
         "framenavigated", lambda fr: fr is ppage.main_frame and setattr(flow, "navs", flow.navs + 1)
     )

@@ -11,7 +11,6 @@ quotes a card value, a page string or an exception's text.
 
 from __future__ import annotations
 
-import fnmatch
 import logging
 import os
 import re
@@ -24,7 +23,7 @@ import yaml
 from genesis.browser.profile import domain_matches
 from genesis.payments.approval import holds_long_digit_run
 from genesis.payments.release import FILL_NAMES
-from genesis.payments.vault_store import CARD_REF
+from genesis.payments.vault_store import CARD_REF, VaultError, normalise_merchant
 from genesis.security.card_shapes import contains_card_number
 
 logger = logging.getLogger(__name__)
@@ -88,8 +87,8 @@ TEXTS = {
     "field_not_found": "A card field selector matched nothing.",
     "field_ambiguous": "A card field selector matched more than one element; narrow it.",
     "field_mismatch": "A target is not that kind of card field (autocomplete or label).",
-    "field_origin": "A card field's or Pay's frame is not on an https origin.",
-    "not_https": "The checkout is not served over https." + _NONE,
+    "field_origin": "A card field's or Pay's frame is not on https at a named host.",
+    "not_https": "The checkout is not served over https at a named host." + _NONE,
     "pay_not_found": "The pay selector did not match exactly one element.",
     "pay_not_button": "The pay control must be a button or an input type=submit.",
     "pay_get_form": "Refused: the pay control submits with GET (the card would be in a URL).",
@@ -187,16 +186,15 @@ def card_fill_enabled() -> bool:
 def playwright_debug_on() -> bool:
     """Whether a Playwright debug log would carry what is typed: DEBUGP (the
     Python client prints every protocol message to stdout, the MCP transport),
-    PWDEBUG, DEBUG_FILE, or a DEBUG pattern that names or matches any pw
-    namespace (pw:channel logs every command with its arguments). A negation
-    never clears it: refusing is the safe reading."""
+    PWDEBUG, DEBUG_FILE, or a DEBUG pattern that could match any pw namespace
+    (pw:channel logs every command with its arguments; pw:server:channel the
+    commands the driver received). Playwright's namespaces are not a closed
+    list, so any pattern with a wildcard counts, and so does one naming pw. A
+    negation never clears it: refusing is the safe reading."""
     if any(os.environ.get(v) is not None for v in ("DEBUGP", "PWDEBUG", "DEBUG_FILE")):
         return True
-    names = ("pw:api", "pw:protocol", "pw:browser", "pw:channel", "pw:channel:command")
     return any(
-        p
-        and not p.startswith("-")
-        and (p.startswith("pw") or any(fnmatch.fnmatchcase(ns, p) for ns in names))
+        p and not p.startswith("-") and (p.startswith("pw") or any(c in p for c in "*?["))
         for p in re.split(r"[\s,]+", os.environ.get("DEBUG", ""))
     )
 
@@ -339,14 +337,16 @@ def origin_of(url) -> str | None:
 
 
 def secure_origin(origin) -> bool:
-    """An https origin, or http on this machine's loopback (nothing in transit)."""
-    if not isinstance(origin, str):
+    """An https origin on a host the vault's release accepts: a dotted DNS name
+    with a letter TLD. An IP, a single-label or a loopback host would only be
+    refused later by the vault (``bad host``), after the checkout was set up."""
+    if not isinstance(origin, str) or not origin.startswith("https://"):
         return False
-    host = urlsplit(origin).hostname or ""
-    return origin.startswith("https://") or (
-        origin.startswith("http://")
-        and (host in ("localhost", "127.0.0.1", "::1") or host.endswith(".localhost"))
-    )
+    try:
+        host = urlsplit(origin).hostname or ""
+        return bool(host) and bool(normalise_merchant(host))  # the vault's own rule
+    except (ValueError, VaultError):
+        return False
 
 
 def filter_state(state: dict, site: str, frame_origins: set[str]) -> dict:
