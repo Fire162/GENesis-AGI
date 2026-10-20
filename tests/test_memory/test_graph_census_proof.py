@@ -352,7 +352,7 @@ def test_a_hardlink_to_the_live_db_is_not_foreign(tmp_path):
     live.write_text("")
     alias = tmp_path / "alias.db"
     os.link(live, alias)
-    foreign, ident = proof.db_scope([alias], live)
+    foreign, ident = proof.db_scope([alias], live, start=time.time() + 60, open_files=set())
     assert foreign is False
     st = live.stat()
     assert ident == [st.st_dev, st.st_ino]
@@ -365,19 +365,19 @@ def test_foreign_only_when_every_database_it_may_use_is_foreign(tmp_path):
     bench.write_text("")
     other = tmp_path / "other.db"
     other.write_text("")
-    assert proof.db_scope([bench], live)[0] is True
-    assert proof.db_scope([bench, other], live)[0] is True
+    assert proof.db_scope([bench], live, start=time.time() + 60, open_files=set())[0] is True
+    assert proof.db_scope([bench, other], live, start=time.time() + 60, open_files=set())[0] is True
     # The file names the live DB as the second: some writes may land there.
-    assert proof.db_scope([bench, live], live)[0] is False
+    assert proof.db_scope([bench, live], live, start=time.time() + 60, open_files=set())[0] is False
     # The second is unknown: never foreign.
-    assert proof.db_scope([bench, None], live)[0] is False
+    assert proof.db_scope([bench, None], live, start=time.time() + 60, open_files=set())[0] is False
 
 
 @pytest.mark.parametrize("paths", [[None], [Path("/does/not/exist.db")], []])
 def test_an_unknown_or_missing_db_is_never_foreign(tmp_path, paths):
     live = tmp_path / "genesis.db"
     live.write_text("")
-    assert proof.db_scope(paths, live)[0] is False
+    assert proof.db_scope(paths, live, start=time.time() + 60, open_files=set())[0] is False
 
 
 def test_a_backdated_modification_time_does_not_prove_the_file(tmp_path):
@@ -571,3 +571,70 @@ def test_a_pythonpath_entry_shadowing_an_installed_package_is_unknown(tree):
     route = tree["tmp"] / "route"
     (route / "dotenv").mkdir(parents=True)
     assert _source(tree, _proc(tree, env={"PYTHONPATH": str(route)})) == ["pythonpath_unproven"]
+
+
+
+def test_a_secrets_file_behind_a_nested_symlink_swapped_after_start_is_unknown(tmp_path):
+    """Devin (PR review): the file's own link can be old while a link INSIDE its
+    target was retargeted after start, swapping the file with an old ctime."""
+    v1 = tmp_path / "v1"
+    v2 = tmp_path / "v2"
+    for d, body in ((v1, "GENESIS_GRAPH_TELEMETRY_DISABLED=1\n"), (v2, "OTHER=1\n")):
+        d.mkdir()
+        (d / "secrets.env").write_text(body)
+    cur = tmp_path / "cur"
+    cur.symlink_to(v1)
+    entry = tmp_path / "secrets.env"
+    entry.symlink_to(cur / "secrets.env")
+    start = time.time() + 1
+    time.sleep(1.1)
+    cur.unlink()
+    cur.symlink_to(v2)  # the inner link moves; the entry link and v2's file are old
+    assert proof.secrets_values(entry, start) is None
+
+
+def test_a_db_symlink_retargeted_after_start_cannot_prove_foreign(tmp_path):
+    """Codex and Devin (PR review): a link moved after the process opened its DB
+    describes a file it never opened."""
+    live = tmp_path / "genesis.db"
+    live.write_text("")
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    alias = tmp_path / "alias.db"
+    alias.symlink_to(live)
+    start = time.time() + 1
+    time.sleep(1.1)
+    alias.unlink()
+    alias.symlink_to(bench)
+    assert proof.db_scope([alias], live, start=start, open_files=set())[0] is False
+
+
+def test_a_process_holding_the_live_db_open_is_never_foreign(tmp_path):
+    live = tmp_path / "genesis.db"
+    live.write_text("")
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    st = live.stat()
+    held = {(st.st_dev, st.st_ino)}
+    assert proof.db_scope([bench], live, start=time.time() + 60, open_files=held)[0] is False
+    # Unreadable descriptors prove nothing either.
+    assert proof.db_scope([bench], live, start=time.time() + 60, open_files=None)[0] is False
+    assert proof.db_scope([bench], live, start=time.time() + 60, open_files=set())[0] is True
+
+
+def test_open_file_identities_reads_the_descriptors(tmp_path):
+    f = tmp_path / "x.db"
+    f.write_text("")
+    fd_dir = tmp_path / "proc" / "77" / "fd"
+    fd_dir.mkdir(parents=True)
+    (fd_dir / "3").symlink_to(f)
+    st = f.stat()
+    assert proof.open_file_identities(tmp_path / "proc", 77) == {(st.st_dev, st.st_ino)}
+    assert proof.open_file_identities(tmp_path / "proc", 78) is None
+
+
+def test_a_customizer_in_main_src_is_unknown(tree):
+    """Codex (PR review): site imports sitecustomize after the .pth files extend
+    sys.path, and the editable install adds main's src."""
+    (tree["main"] / "src" / "sitecustomize.py").write_text("")
+    assert _source(tree, _proc(tree)) == ["customize_module"]

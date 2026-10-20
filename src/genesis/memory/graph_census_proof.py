@@ -153,9 +153,10 @@ def _finder_mapping(site: Path, module: str) -> dict | None:
     return None
 
 
-def _pth_verdict(site: Path, name: str, main_src: str, imports: set[str]) -> bool:
+def _pth_verdict(site: Path, name: str, main_src: str, imports: set[str], added: list[str]) -> bool:
     """Whether one ``.pth`` file is a known shape that cannot load other genesis
-    code. Adds every module it imports to ``imports``."""
+    code. Adds every module it imports to ``imports`` and every directory it puts
+    on ``sys.path`` to ``added``."""
     try:
         lines = (site / name).read_text().splitlines()
     except (OSError, ValueError):
@@ -185,6 +186,7 @@ def _pth_verdict(site: Path, name: str, main_src: str, imports: set[str]) -> boo
             return False
         if os.path.realpath(os.path.join(site, raw.rstrip())) != main_src:
             return False
+        added.append(main_src)
     return True
 
 
@@ -244,9 +246,15 @@ def interpreter_source(
         except OSError:
             names = None
             reasons.append("site_packages_ambiguous")
+        added: list[str] = []
         for name in names or []:
-            if not _pth_verdict(site, name, main_src, imports):
+            if not _pth_verdict(site, name, main_src, imports, added):
                 reasons.append(f"unknown_pth:{name}")
+        # site imports the customize modules from sys.path AFTER the .pth files
+        # extend it, so a directory a .pth adds is searched too (main src included:
+        # an untracked src/sitecustomize.py would run before genesis is imported).
+        if any(_shadows(Path(d), set(_CUSTOMIZE)) for d in added):
+            reasons.append("customize_module")
         # A path-line .pth puts main src AFTER site-packages on sys.path (and a
         # finder install runs after PathFinder), so a genesis there wins.
         if _shadows(site, {"genesis"}):
@@ -325,14 +333,28 @@ def secrets_file(env: dict[str, str], *, main_root: Path) -> Path | None:
     return main_root / "secrets.env"
 
 
-def _unchanged_since(path: Path, start: float) -> bool:
-    """Neither ``path`` nor any symlink on the way to it changed after ``start``."""
+def _links_unchanged_since(path: Path, start: float, _depth: int = 0) -> bool:
+    """No symlink met while resolving ``path`` changed after ``start``: every
+    link on the way, INCLUDING those inside a link's own target (a retargeted
+    link two levels down swaps the file as surely as one on the lexical path)."""
+    if _depth > 40:  # the kernel's own symlink-loop limit
+        return False
+    parts = path.parts
     probe = Path(path.anchor)
-    for part in path.parts[1:]:
+    for i, part in enumerate(parts[1:], start=1):
         probe = probe / part
-        if probe.is_symlink() and probe.lstat().st_ctime >= start:
-            return False
-    return path.stat().st_ctime < start
+        if probe.is_symlink():
+            if probe.lstat().st_ctime >= start:
+                return False
+            target = Path(os.readlink(probe))
+            resolved = target if target.is_absolute() else probe.parent / target
+            return _links_unchanged_since(resolved.joinpath(*parts[i + 1 :]), start, _depth + 1)
+    return True
+
+
+def _unchanged_since(path: Path, start: float) -> bool:
+    """Neither ``path`` nor any symlink met resolving it changed after ``start``."""
+    return _links_unchanged_since(path, start) and path.stat().st_ctime < start
 
 
 def secrets_values(path: Path | None, start: float) -> dict[str, str] | None:
@@ -410,10 +432,23 @@ def _resolve_db(env: dict[str, str], *, main_root: Path) -> Path | None:
     return main_root / "data" / "genesis.db"
 
 
-def db_scope(paths: list[Path | None], live: Path) -> tuple[bool, list[int] | None]:
-    """``(foreign, [st_dev, st_ino] of the primary)``. Foreign only when EVERY
-    database the process may use stats and differs from the live one; anything
-    unknown or missing counts as the live database."""
+def db_scope(
+    paths: list[Path | None],
+    live: Path,
+    *,
+    start: float,
+    open_files: set[tuple[int, int]] | None,
+) -> tuple[bool, list[int] | None]:
+    """``(foreign, [st_dev, st_ino] of the primary)``.
+
+    Foreign only when ALL of these hold: every database the process may use
+    stats and differs from the live one; no symlink met resolving those paths
+    changed since the process started (a retargeted link would describe a file
+    it never opened); and the process holds no open file that IS the live
+    database (``open_files``: the ``(st_dev, st_ino)`` of its open descriptors,
+    None when unreadable). The open handle is what a long-lived connection
+    actually uses; a path is only evidence of what it opened. Anything unknown
+    counts as the live database."""
     try:
         ours = live.stat()
     except OSError:
@@ -426,5 +461,29 @@ def db_scope(paths: list[Path | None], live: Path) -> tuple[bool, list[int] | No
             st = None
         idents.append(None if st is None else [st.st_dev, st.st_ino])
     live_ident = [ours.st_dev, ours.st_ino]
-    foreign = bool(idents) and all(i is not None and i != live_ident for i in idents)
+    foreign = (
+        bool(idents)
+        and all(i is not None and i != live_ident for i in idents)
+        and all(_links_unchanged_since(p, start) for p in paths if p is not None)
+        and open_files is not None
+        and (ours.st_dev, ours.st_ino) not in open_files
+    )
     return foreign, idents[0] if idents else None
+
+
+def open_file_identities(proc_root: Path, pid: int) -> set[tuple[int, int]] | None:
+    """``(st_dev, st_ino)`` of every regular file ``pid`` holds open, or None
+    when its descriptors cannot be listed (another user's process, or gone)."""
+    fd_dir = proc_root / str(pid) / "fd"
+    try:
+        fds = os.listdir(fd_dir)
+    except OSError:
+        return None
+    found: set[tuple[int, int]] = set()
+    for fd in fds:
+        try:
+            st = os.stat(fd_dir / fd)
+        except OSError:
+            continue  # closed between listing and stat
+        found.add((st.st_dev, st.st_ino))
+    return found

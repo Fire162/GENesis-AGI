@@ -26,6 +26,7 @@ MCP = ["/venv/bin/python", "/repo/scripts/genesis_mcp_server.py", "--server"]
 def _proc(
     root: Path, pid: int, argv: list[str], *, started: float, env=None, exe=None,
     ns="mnt:[1]",
+    fds=None,
 ) -> None:
     d = root / str(pid)
     d.mkdir(parents=True)
@@ -39,6 +40,9 @@ def _proc(
     (d / "exe").symlink_to(exe or "/usr/bin/python3.12")
     (d / "ns").mkdir()
     (d / "ns" / "mnt").symlink_to(ns)
+    (d / "fd").mkdir()
+    for i, target in enumerate(fds or (), start=3):
+        (d / "fd" / str(i)).symlink_to(target)
 
 
 @pytest.fixture
@@ -617,3 +621,23 @@ def test_the_default_secrets_file_is_main_checkouts(proc_root, repo, tmp_path, m
         proc_root2, repo, tmp_path, main_venv, env, secrets=False, started=1_700_000_100.0
     )
     assert p2["telemetry_off"] is None
+
+
+
+def test_a_bench_server_holding_the_live_db_open_is_counted(proc_root, repo, tmp_path, main_venv):
+    """Its path names a scratch DB, but its open descriptors include the live
+    one: that handle is what its long-lived connection uses."""
+    import time as _time
+
+    r, _, _ = repo
+    live = tmp_path / "live.db"
+    live.write_text("")
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    own = tmp_path / "proven.env"
+    own.touch()
+    env = {"GENESIS_DB_PATH": str(bench), "SECRETS_PATH": str(own)}
+    _proc(proc_root, 81, main_venv, started=_time.time() + 60, env=env,
+          exe=str(tmp_path / "sys" / "bin" / "python3.12"), fds=[live])
+    [p] = census.build_census(r, proc_root=proc_root, live_db=live)["procs"]
+    assert p["foreign"] is False

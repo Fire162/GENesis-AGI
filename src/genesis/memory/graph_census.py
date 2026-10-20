@@ -330,7 +330,12 @@ def build_census(
         # Each value derived the way THIS server derives it (its own SECRETS_PATH,
         # GENESIS_REPO_ROOT and HOME), never from the census process's state.
         file_vals = proof.secrets_values(proof.secrets_file(env, main_root=repo), proc["start"])
-        foreign, db_identity = proof.db_scope(proof.db_paths(env, file_vals, main_root=repo), live)
+        foreign, db_identity = proof.db_scope(
+            proof.db_paths(env, file_vals, main_root=repo),
+            live,
+            start=proc["start"],
+            open_files=proof.open_file_identities(proc_root, proc["pid"]),
+        )
         # The DB rules model main's own server code; with that code unproven, a
         # "foreign" reading is not evidence enough to skip the row.
         foreign = foreign and not source_reasons
