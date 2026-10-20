@@ -277,26 +277,39 @@ def test_the_box_lock_was_taken_before_the_redirect(request):
 
 _SUBRUN_EARLY_CONFTEST = """
 # A test* subdirectory conftest of a directory argument: pytest imports it
-# BEFORE pytest_configure, so this module binds the real home first.
+# BEFORE pytest_configure, so these modules bind their paths first.
+import genesis.cc.direct_session  # noqa: F401
 import genesis.cc.types  # noqa: F401
+import genesis.db.connection  # noqa: F401
 """
 
 _SUBRUN_EARLY_TEST = """
 from pathlib import Path
 
+import inspect
+
+import genesis.cc.direct_session as direct_session
 import genesis.cc.types as types
+import genesis.db.connection as connection
+from tests import _live_closure
 
 
 def test_bound_dir():
     print("HOME=" + str(Path.home()))
     print("BOUND=" + str(types._BACKGROUND_SESSION_DIR))
+    print("TMP_BOUND=" + str(direct_session._BG_CC_TMP_ROOT))
+    print("BASE=" + _live_closure._S.base)
+    print("DB_CONST=" + str(connection.DEFAULT_DB_PATH))
+    default = inspect.signature(connection.init_db).parameters["path"].default
+    print("DB_DEFAULT=" + str(default))
 """
 
 
 def test_a_path_bound_before_configure_is_moved_into_the_home(tmp_path):
     """CI's bare ``pytest`` (a directory) imports ``tests/test*/conftest.py`` before
     configure; a state path a module bound then is moved into the test home and
-    named in the summary."""
+    named in the summary, and the database path it bound is already the
+    closure's."""
     (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
     sub = tmp_path / "test_early"
     sub.mkdir()
@@ -308,7 +321,11 @@ def test_a_path_bound_before_configure_is_moved_into_the_home(tmp_path):
         "PYTHONPATH": os.pathsep.join([str(repo), str(repo / "src")]),
         "HOME": closure.REAL_HOME,
     }
-    for name in ("PYTEST_CURRENT_TEST", "GENESIS_LIVE_E2E"):
+    # TMPDIR in the real ~/tmp, as on an install whose Claude Code sessions use it:
+    # the closure's own directory then sits under a state root of the home, and
+    # ~/tmp state bound before configure must still move.
+    env["TMPDIR"] = str(Path(closure.REAL_HOME, "tmp"))
+    for name in ("PYTEST_CURRENT_TEST", "GENESIS_LIVE_E2E", "GENESIS_DB_PATH", "SECRETS_PATH"):
         env.pop(name, None)
     out = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", str(tmp_path)],
@@ -323,3 +340,10 @@ def test_a_path_bound_before_configure_is_moved_into_the_home(tmp_path):
     assert home != closure.REAL_HOME, out.stdout
     assert _value(out.stdout, "BOUND") == str(Path(home, ".genesis", "background-sessions"))
     assert "genesis.cc.types._BACKGROUND_SESSION_DIR" in out.stdout
+    assert _value(out.stdout, "TMP_BOUND") == str(Path(home, "tmp", "bg-cc-sessions"))
+    # The database path, bound at import AND as a default argument, which no
+    # rebase reaches: it must be the closure's file because the closure set
+    # GENESIS_DB_PATH when it was imported, before this conftest ran.
+    expected_db = str(Path(_value(out.stdout, "BASE"), "import-time-genesis.db"))
+    assert _value(out.stdout, "DB_CONST") == expected_db, out.stdout
+    assert _value(out.stdout, "DB_DEFAULT") == expected_db, out.stdout
