@@ -22,6 +22,7 @@ the payload contract.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -41,6 +42,9 @@ _BLOB_PLAN_PATH = re.compile(r"(/[^\s\"']+\.claude/plans/[^\s\"']+\.md)")
 #: the live section, and the adopt-first gate fails open on an empty plan.
 _DIVIDER = re.compile(r"^#+\s*(?:═+\s*)?SUPERSEDED BELOW")
 
+#: A fence delimiter (after stripping): the run, then any info string.
+_FENCE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+
 
 def plan_path(payload: dict) -> str:
     """The plan file this ExitPlanMode is about, or "" when it cannot be known.
@@ -59,6 +63,28 @@ def plan_path(payload: dict) -> str:
         direct = tool_input(payload).get(key) or payload.get(key)
         if isinstance(direct, str) and direct.endswith(".md"):
             return direct
+    # Older shapes: the path the TOOL returned before any path the plan's prose
+    # quotes (the bookmark always searched the output first). Claude Code's
+    # ExitPlanMode result is {plan, isAgent, filePath} with the plan text FIRST
+    # (MEASURED 2026-10-21, 3 of 3 recent results), so read its path field, then
+    # scan the result WITHOUT its plan text. Read straight from the payload, not
+    # hook_input.tool_response, whose legacy env fallback can hold another
+    # tool's result.
+    for source in (payload.get("tool_response"), payload.get("tool_output")):
+        if isinstance(source, str):
+            with contextlib.suppress(ValueError):
+                source = json.loads(source)
+        if isinstance(source, dict):
+            for key in ("filePath", "planFilePath", "plan_file_path"):
+                value = source.get(key)
+                if isinstance(value, str) and value.endswith(".md"):
+                    return value
+            source = {k: v for k, v in source.items() if k != "plan"}
+        if source:
+            text = source if isinstance(source, str) else json.dumps(source)
+            match = _BLOB_PLAN_PATH.search(text)
+            if match:
+                return match.group(1)
     match = _BLOB_PLAN_PATH.search(json.dumps(payload))
     if match:
         return match.group(1)
@@ -78,6 +104,35 @@ def plan_path(payload: dict) -> str:
     return ""
 
 
+def _fence_mask(lines: list[str]) -> tuple[list[bool], bool]:
+    """Which lines are inside (or delimit) a fenced block, and whether every
+    fence closed.
+
+    CommonMark's fence rules, as ``git_push_guard``'s review-body parser applies
+    them: a delimiter is a run of three or more backticks or tildes with at most
+    three leading spaces. A closing fence uses the opener's character, is at
+    least as long, and has no info string, so a ```md line inside a ````
+    block, or ``` inside ~~~, is content. An unclosed fence runs to the end.
+    """
+    mask = [False] * len(lines)
+    fence_char, fence_len = "", 0
+    for idx, line in enumerate(lines):
+        indent = len(line) - len(line.lstrip(" "))
+        fence = _FENCE.match(line.strip()) if indent <= 3 else None
+        if fence:
+            run, info = fence.group(1), fence.group(2).strip()
+            if not fence_char:
+                fence_char, fence_len = run[0], len(run)
+                mask[idx] = True
+                continue
+            if run[0] == fence_char and len(run) >= fence_len and not info:
+                fence_char, fence_len = "", 0
+                mask[idx] = True
+                continue
+        mask[idx] = bool(fence_char)
+    return mask, not fence_char
+
+
 def outside_fences(lines: list[str]) -> Iterator[tuple[int, str]]:
     """Yield ``(index, line)`` for lines that are NOT inside a fenced block.
 
@@ -85,25 +140,20 @@ def outside_fences(lines: list[str]) -> Iterator[tuple[int, str]]:
     heading both appear inside ``` examples in perfectly ordinary plans — this
     repo's own reference doc does exactly that. Matching those is how a plan
     truncates itself at its own illustration.
-
-    Fence detection is the CommonMark-ish subset that markdown writers actually
-    use: a line whose first non-space run is three or more backticks or tildes
-    toggles the state. The info string is ignored, and a closing fence of a
-    different character does not close — ``` inside a ~~~ block is content.
     """
-    fence_char = ""
+    mask, _ = _fence_mask(lines)
     for idx, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped[:3] in ("```", "~~~"):
-            char = stripped[0]
-            if not fence_char:
-                fence_char = char
-                continue
-            if char == fence_char:
-                fence_char = ""
-            continue
-        if not fence_char:
+        if not mask[idx]:
             yield idx, line
+
+
+def strip_fences(text: str) -> str:
+    """``text`` with every fenced line blanked (line count kept): quoted
+    material, not proposals or verdicts. The one fence parser every plan hook
+    uses, so the live section and the gate's searches cannot disagree."""
+    lines = text.split("\n")
+    mask, _ = _fence_mask(lines)
+    return "\n".join("" if m else line for m, line in zip(mask, lines, strict=True))
 
 
 def live_section(content: str) -> str:
@@ -122,11 +172,29 @@ def live_section(content: str) -> str:
     document, and skipped inside FENCED blocks so a plan that documents the
     convention by showing it does not truncate itself at its own example.
 
-    Known residual: an UNCLOSED fence above the divider hides it, so the whole
-    plan reads as live (0 of 66 real plans on the measuring install, 2026-10-19).
+    Two readings fail CLOSED for the adopt-first gate (more of the plan stays
+    live, never less): a divider inside an HTML comment does not divide, and a
+    document whose FIRST heading begins with the phrase is a plan about the
+    divider, not one. When a fence never closes the fence reading cannot be
+    trusted, so the first divider heading anywhere divides, as before this
+    reader existed: hiding it would let an old verdict below it clear a new
+    proposal. Lines are split on newline only: ``splitlines()`` also breaks at
+    U+2028, which Markdown does not.
     """
-    lines = content.splitlines()
-    for idx, line in outside_fences(lines):
-        if _DIVIDER.match(line):
-            return "\n".join(lines[:idx])
+    lines = content.split("\n")
+    mask, closed = _fence_mask(lines)
+    in_comment = False
+    first_heading = True
+    for idx, line in enumerate(lines):
+        if in_comment:
+            in_comment = "-->" not in line
+            continue
+        if not closed or not mask[idx]:
+            if line.lstrip().startswith("<!--") and "-->" not in line:
+                in_comment = True
+                continue
+            if line.startswith("#"):
+                if _DIVIDER.match(line) and not first_heading:
+                    return "\n".join(lines[:idx])
+                first_heading = False
     return content

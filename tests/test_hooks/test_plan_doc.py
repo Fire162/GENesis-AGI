@@ -116,6 +116,26 @@ def test_a_divider_shown_inside_a_fence_does_not_divide(plan_doc):
     assert "still live" in plan_doc.live_section(text)
 
 
+@pytest.mark.parametrize(
+    "fenced",
+    [
+        "````\n```\n## SUPERSEDED BELOW\n```\n````",  # shorter inner fence is content
+        "```\n```md\n## SUPERSEDED BELOW\n```",  # a fence line with an info string never closes
+        "~~~\n```\n## SUPERSEDED BELOW\n```\n~~~",  # other character is content
+        "```\n    ```\n## SUPERSEDED BELOW\n```",  # 4-space indent is content, not a delimiter
+    ],
+)
+def test_a_divider_inside_a_nested_example_does_not_divide(plan_doc, fenced):
+    text = f"# Plan\n\n{fenced}\n\nstill live\n"
+    assert "still live" in plan_doc.live_section(text)
+
+
+def test_a_longer_closing_fence_closes_and_a_later_divider_divides(plan_doc):
+    text = "# Plan\n\n```\nexample\n`````\n\nlive\n\n## SUPERSEDED BELOW\n\nold\n"
+    live = plan_doc.live_section(text)
+    assert "live" in live and "old" not in live
+
+
 def test_the_divider_phrase_in_prose_does_not_divide(plan_doc):
     text = "# Plan\n\nWe keep a SUPERSEDED BELOW divider here.\n\nstill live\n"
     assert "still live" in plan_doc.live_section(text)
@@ -139,6 +159,24 @@ def test_bookmark_records_the_plan_that_was_approved(bookmark, home):
     mine = _write_plan(home, "mine.md", f"# My plan\n\nBuilds on {other}.\n")
     path, title = bookmark._extract_plan_info(_real_payload(mine))
     assert (path, title) == (str(mine), "My plan")
+
+
+@pytest.mark.parametrize("key", ["tool_response", "tool_output"])
+def test_without_the_field_the_tools_returned_path_beats_one_quoted_in_the_plan(
+    plan_doc, bookmark, home, key
+):
+    """An older payload with no planFilePath: the plan's prose serializes first,
+    so a whole-payload scan would take the path it QUOTES, not the approved one."""
+    other = _write_plan(home, "other.md", "# Other plan\n")
+    mine = _write_plan(home, "mine.md", f"# My plan\n\nSee {other}.\n")
+    payload = {
+        "tool_name": "ExitPlanMode",
+        "tool_input": {"plan": mine.read_text(encoding="utf-8")},
+        # Claude Code's real ExitPlanMode result: the plan text serializes first.
+        key: {"plan": mine.read_text(encoding="utf-8"), "isAgent": False, "filePath": str(mine)},
+    }
+    assert plan_doc.plan_path(payload) == str(mine)
+    assert bookmark._extract_plan_info(payload) == (str(mine), "My plan")
 
 
 def test_bookmark_never_takes_another_sessions_newest_plan(bookmark, home):
@@ -220,4 +258,71 @@ def test_a_fenced_divider_example_does_not_hide_a_live_proposal(home, repo):
         "# Plan\n\n```\n## ═══ SUPERSEDED BELOW ═══\n```\n\nAdd src/genesis/brand_new.py\n",
     )
     result = _gate(_real_payload(plan), home, repo)
+    assert result.returncode == 2 and "adopt-first" in result.stderr
+
+
+def test_a_nested_fenced_divider_does_not_hide_a_live_proposal(home, repo):
+    plan = _write_plan(
+        home,
+        "plan.md",
+        "# Plan\n\n````\n```\n## SUPERSEDED BELOW\n```\n````\n\nAdd src/genesis/brand_new.py\n",
+    )
+    result = _gate(_real_payload(plan), home, repo)
+    assert result.returncode == 2 and "adopt-first" in result.stderr
+
+
+
+_VERDICT = "## Adopt / Adapt / Build\n\nBUILD — no substitute. Searched: pypi, github\n"
+
+
+def test_an_unpaired_nested_fence_does_not_hide_a_live_proposal(home, repo):
+    """The gate's own fence regex closed a ```` block at the first bare ``` line."""
+    plan = _write_plan(
+        home, "plan.md", "# Plan\n\n````md\n```md\nfoo\n```\n````\n\nAdd src/genesis/brand_new.py\n"
+    )
+    result = _gate(_real_payload(plan), home, repo)
+    assert result.returncode == 2 and "adopt-first" in result.stderr
+
+
+def test_a_verdict_shown_only_inside_a_nested_example_is_not_a_verdict(home, repo):
+    plan = _write_plan(
+        home,
+        "plan.md",
+        f"# Plan\n\nAdd src/genesis/brand_new.py\n\n````\n```\n{_VERDICT}```\n````\n",
+    )
+    result = _gate(_real_payload(plan), home, repo)
+    assert result.returncode == 2 and "adopt-first" in result.stderr
+
+
+def test_an_unclosed_fence_never_lets_an_old_verdict_below_the_divider_clear_a_proposal(home, repo):
+    plan = _write_plan(
+        home,
+        "plan.md",
+        f"# Plan\n\nAdd src/genesis/brand_new.py\n\n```\nexample\n\n## SUPERSEDED BELOW\n\n{_VERDICT}",
+    )
+    result = _gate(_real_payload(plan), home, repo)
+    assert result.returncode == 2 and "adopt-first" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# Plan\n\n<!--\n## SUPERSEDED BELOW\n-->\n\nstill live\n",
+        "# SUPERSEDED BELOW: teach the hooks the divider\n\nstill live\n",
+        "# Plan\n\nline\u2028## SUPERSEDED BELOW\n\nstill live\n",
+    ],
+)
+def test_readings_that_would_empty_the_live_plan_do_not_divide(plan_doc, text):
+    assert "still live" in plan_doc.live_section(text)
+
+
+def test_an_unreadable_plan_path_falls_back_to_the_plan_text(home, repo):
+    payload = {
+        "tool_name": "ExitPlanMode",
+        "tool_input": {
+            "plan": "# Plan\n\nAdd src/genesis/brand_new.py\n",
+            "planFilePath": str(home / ".claude" / "plans" / "gone.md"),
+        },
+    }
+    result = _gate(payload, home, repo)
     assert result.returncode == 2 and "adopt-first" in result.stderr

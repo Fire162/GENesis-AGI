@@ -59,8 +59,8 @@ from pathlib import Path
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload  # noqa: E402
-from plan_doc import live_section, plan_path  # noqa: E402
+from hook_input import field, read_payload, tool_input  # noqa: E402
+from plan_doc import live_section, plan_path, strip_fences  # noqa: E402
 
 _STATE_DIR = Path.home() / ".genesis" / "adopt_first"
 
@@ -90,16 +90,6 @@ _SOURCE_PATH = re.compile(
 #: "## Adopt / Adapt / Build", "## Adopt/Adapt/Build", "### ADOPT vs BUILD".
 _VERDICT_HEADER = re.compile(
     r"^#{1,6}\s*adopt\s*[/|vs.．\- ]+\s*(adapt|build)", re.IGNORECASE | re.MULTILINE
-)
-
-#: Fenced code blocks are quoted material, not proposals. A plan showing an
-#: example snippet that names a path is not proposing to create it. Both
-#: Markdown fence forms strip: ``` and ~~~, each up to three spaces indented,
-#: and an unclosed fence runs to EOF rather than exposing its contents.
-_FENCE = re.compile(
-    r"^[ \t]{0,3}`{3,}[^\n]*\n.*?(?:^[ \t]{0,3}`{3,}[ \t]*$|\Z)"
-    r"|^[ \t]{0,3}~{3,}[^\n]*\n.*?(?:^[ \t]{0,3}~{3,}[ \t]*$|\Z)",
-    re.DOTALL | re.MULTILINE,
 )
 
 #: The evaluate skill's vocabulary. A verdict is still judged by WHERE the
@@ -287,7 +277,8 @@ def _has_verdict(content: str) -> bool:
     nxt = re.search(rf"^#{{1,{max(depth, 1)}}}\s", rest, re.MULTILINE)
     body = rest[: nxt.start()] if nxt else rest
 
-    body = _FENCE.sub("", body)
+    # Fenced blocks are quoted material: an example verdict is not a verdict.
+    body = strip_fences(body)
     # Strip <placeholder> spans so an unfilled copy of the emitted template
     # (`<ADOPT|ADAPT|BUILD> — <why>. Searched: <terms>`) satisfies nothing.
     body = re.sub(r"<[^>\n]*>", "", body)
@@ -316,14 +307,20 @@ def _check_plan(payload: dict) -> int:
     try:
         content = Path(path).read_text(encoding="utf-8")
     except OSError:
-        return 0
+        # The payload carries the plan text itself; an unreadable path must not
+        # turn the check off when the plan is right there.
+        content = tool_input(payload).get("plan")
+        if not isinstance(content, str) or not content:
+            return 0
 
     # Plans are append-only documents: everything below the superseded divider
     # is archaeology, so old proposals must not block the exit and old verdicts
     # must not clear the current one.
     live = live_section(content)
 
-    named = sorted(set(_SOURCE_PATH.findall(_FENCE.sub('', live))))
+    # Fenced blocks are quoted material: a path in an example is not a proposal.
+    prose = strip_fences(live)
+    named = sorted(set(_SOURCE_PATH.findall(prose)))
     if not named:
         return 0  # proposes no source files — not this gate's business
 
@@ -352,14 +349,14 @@ def _check_plan(payload: dict) -> int:
     # A rename's destination reads as "does not exist yet" without being a new
     # capability. When the plan describes a rename/move joining an existing
     # source to the candidate, exclude it.
-    for rm in _RENAME.finditer(live):
+    for rm in _RENAME.finditer(prose):
         if rm.group(1).strip("'`") in existing:
             renamed = rm.group(2).lstrip("'`\"").rstrip("'`\".,;:")
             sources = [s for s in sources if s != renamed and not renamed.endswith("/" + s)]
     if not sources:
         return 0
 
-    if _has_verdict(live):
+    if _has_verdict(prose):
         return 0
 
     shown = ", ".join(sources[:4]) + (" …" if len(sources) > 4 else "")
