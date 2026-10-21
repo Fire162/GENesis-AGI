@@ -375,3 +375,35 @@ def test_html_comments_and_indented_code_are_quoted_material(plan_doc):
     text = "# Plan\n\n<!-- src/genesis/a.py -->\n\n    src/genesis/b.py\n\nAdd src/genesis/c.py\n"
     stripped = plan_doc.strip_quoted(text)
     assert "a.py" not in stripped and "b.py" not in stripped and "c.py" in stripped
+
+
+
+# ── round 3 confirmation findings ───────────────────────────────────────────
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# Plan\n\nlive\n\n## **SUPERSEDED BELOW**\n\nold\n",
+        "# Plan\n\nlive\n\n## *═══ SUPERSEDED BELOW ═══*\n\nold\n",
+    ],
+)
+def test_emphasis_does_not_hide_a_divider(plan_doc, text):
+    assert "old" not in plan_doc.live_section(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # a thematic break, a live plan, another break: not frontmatter
+        "---\n# Plan\n\nstill live\n\n---\n\n## SUPERSEDED BELOW\n\nold\n",
+        # an indented rule inside a block scalar does not close real frontmatter
+        "---\nnote: |\n  ---\nstatus: x\n---\n# Plan\n\nstill live\n\n## SUPERSEDED BELOW\n\nold\n",
+    ],
+)
+def test_only_real_frontmatter_is_skipped(plan_doc, text):
+    live = plan_doc.live_section(text)
+    assert "still live" in live and "old" not in live
+
+
+def test_a_leading_comment_does_not_make_the_title_a_divider(plan_doc):
+    text = "<!-- generated -->\n# SUPERSEDED BELOW handling\n\nstill live\n"
+    assert "still live" in plan_doc.live_section(text)

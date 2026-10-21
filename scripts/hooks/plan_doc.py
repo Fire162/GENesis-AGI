@@ -122,13 +122,40 @@ def _frontmatter_end(lines: list[str]) -> int:
     """Index of the first line after a leading YAML frontmatter block (0 if none).
 
     CommonMark has no frontmatter: it would read the block as a rule plus a
-    setext heading, so it is skipped before parsing.
+    setext heading, so it is skipped before parsing. Same definition as
+    ``plan_bookmark_hook._title_candidate_lines``: both fences are exactly
+    ``---`` at column zero, and the content between them must load as a YAML
+    mapping, so a plan that opens with a thematic break and uses another later
+    is not mistaken for one.
     """
-    if lines and lines[0].strip() == "---":
+    if lines and lines[0] == "---":
         for idx in range(1, len(lines)):
-            if lines[idx].strip() == "---":
-                return idx + 1
+            if lines[idx] == "---":
+                return idx + 1 if _is_yaml_mapping("\n".join(lines[1:idx])) else 0
     return 0
+
+
+def _is_yaml_mapping(block: str) -> bool:
+    """Whether ``block`` loads as a YAML mapping. True without PyYAML, as in
+    ``plan_bookmark_hook._is_yaml_mapping`` (the paired-fence reading)."""
+    try:
+        import yaml  # noqa: PLC0415 — optional at import time
+    except ImportError:
+        return True
+    try:
+        return isinstance(yaml.safe_load(block), dict)
+    except yaml.YAMLError:
+        return False
+
+
+def _visible_text(inline) -> str:
+    """An inline token's rendered text: emphasis markers and inline HTML dropped,
+    as ``git_push_guard._rework_inline_text`` reads a CommonMark heading."""
+    return "".join(
+        child.content
+        for child in (inline.children or [])
+        if child.type in ("text", "code_inline")
+    )
 
 
 def _blocks(text: str):
@@ -174,8 +201,9 @@ def live_section(content: str) -> str:
     The divider is a TOP-LEVEL heading (ATX or setext) as CommonMark renders it,
     so the phrase inside a code block, an HTML comment, a blockquote or a list,
     or quoted in a paragraph, never divides. A divider with no block above it
-    is a plan TITLED with the phrase, not a divider: taking it would leave an
-    empty live section. Without a parser the whole plan is live.
+    (a comment renders nothing, so it does not count) is a plan TITLED with
+    the phrase, not a divider: taking it would leave an empty live section. The
+    heading is matched on its RENDERED text, so emphasis does not hide it. Without a parser the whole plan is live.
     """
     parsed = _blocks(content)
     if parsed is None:
@@ -186,8 +214,12 @@ def live_section(content: str) -> str:
         if tok.level != 0 or tok.type.endswith("_close"):
             continue
         if tok.type == "heading_open" and seen_block and tok.map:
-            text = tokens[i + 1].content.strip() if i + 1 < len(tokens) else ""
+            text = _visible_text(tokens[i + 1]).strip() if i + 1 < len(tokens) else ""
             if _DIVIDER.match(text):
                 return "\n".join(lines[: offset + tok.map[0]])
+        # A comment-only HTML block renders nothing, so it is not a block above
+        # a title (as ``git_push_guard._rework_blocks`` omits it).
+        if tok.type == "html_block" and not re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip():
+            continue
         seen_block = True
     return content
