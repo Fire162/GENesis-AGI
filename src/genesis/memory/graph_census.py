@@ -259,7 +259,9 @@ def scan_mcp_servers(
                 "db_path": env.get("GENESIS_DB_PATH"),
                 # For the proof rules (graph_census_proof); never written to a row.
                 "argv": tuple(argv),
-                "env": {k: env[k] for k in proof.PROOF_ENV_KEYS if k in env},
+                "env": {
+                    k: env[k] for k in env if k in proof.PROOF_ENV_KEYS or k.startswith("PYTHON")
+                },
                 "exe": _realpath_or_none(base / "exe"),
                 "mnt_ns": _readlink_or_none(base / "ns" / "mnt"),
             }
@@ -356,6 +358,7 @@ def build_census(
     host_pid: int | None = None,
     include_host: bool = False,
     live_held_by: int | None = None,
+    host_home: Path | None = None,
 ) -> dict:
     """One census row's metrics. Blocking (``/proc`` and ``git``): run it in a
     thread. ``host_pid`` is this process, skipped by the scan; with
@@ -363,10 +366,11 @@ def build_census(
     ``live_held_by`` is the pid whose connection the row will be written
     through: the live database is the file IT holds open, so a path retargeted
     since that connection opened makes the census incomplete."""
-    from genesis.env import genesis_db_path, repo_root
+    from genesis.env import genesis_db_path, genesis_home, repo_root
 
     repo = repo or repo_root()
     live = (live_db or genesis_db_path()).resolve()
+    host_home = host_home or genesis_home()
     own_ns = _readlink_or_none(proc_root / "self" / "ns" / "mnt")
     procs, complete = scan_mcp_servers(proc_root, main_root=repo, skip_pid=host_pid)
     reasons: list[str] = [] if complete else ["proc_unreadable"]
@@ -433,7 +437,7 @@ def build_census(
         if server is None:
             row = _producer_row(
                 proc, repo=repo, live=live, own_ns=own_ns, history=history,
-                proc_root=proc_root,
+                proc_root=proc_root, host_home=host_home,
             )
             if row is not None:
                 memory.append(row)
@@ -469,6 +473,9 @@ def build_census(
         # The DB rules model main's own server code; with that code unproven, a
         # "foreign" reading is not evidence enough to skip the row.
         foreign = foreign and not source_reasons
+        # Its graph engine socket and lost-writes file come from ITS home.
+        if not foreign and not proof.same_home(proof.genesis_home_of(env, file_vals), host_home):
+            source_reasons = [*source_reasons, "other_genesis_home"]
         memory.append(
             {
                 "pid": proc["pid"],
@@ -540,7 +547,8 @@ def _window_held(reader, reflog: str, since: float, head: str, cutoff: int) -> l
 
 
 def _producer_row(
-    proc: dict, *, repo: Path, live: Path, own_ns, history, proc_root: Path
+    proc: dict, *, repo: Path, live: Path, own_ns, history, proc_root: Path,
+    host_home: Path,
 ) -> dict | None:
     """The row of a non-MCP traversal producer, by role."""
     role = proc["role"]
@@ -569,6 +577,17 @@ def _producer_row(
     if not os.path.isabs(argv0) and "/" in argv0:
         # exec resolved it against a cwd that may be gone: maybe main's venv.
         telemetry_ok, unknown, foreign = None, "interpreter_unresolved", False
+    elif proof.options_unmodelled(proc["argv"]):
+        # An option that shifts what reads as the script: it may be a server.
+        telemetry_ok, unknown, foreign = None, "interpreter_options_unmodelled", False
+    elif (
+        not foreign
+        and own_ns is not None
+        and proc["mnt_ns"] == own_ns  # another namespace is the documented residual
+        and not proof.same_home(proof.genesis_home_of(env), host_home)
+    ):
+        # Its graph engine socket and lost-writes file come from ITS home.
+        telemetry_ok, unknown = None, "other_genesis_home"
     row = {
         **base,
         "commit": held[0] if held else None,

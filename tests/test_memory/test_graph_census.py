@@ -1024,3 +1024,42 @@ def test_an_edited_loader_outside_the_memory_package_marks_head_dirty(proc_root,
     f.write_text("edited = True\n")
     assert census.build_census(r, proc_root=proc_root)["head_dirty"] is True
 
+
+def test_a_memory_server_with_another_genesis_home_is_unknown(proc_root, repo, tmp_path, main_venv):
+    """Its graph engine socket and lost-writes file come from ITS home, so its
+    traversals could be served by another engine."""
+    env = {"GENESIS_GRAPH_TELEMETRY_DISABLED": "0", "GENESIS_DB_PATH": str(tmp_path / "live.db"),
+           "GENESIS_HOME": str(tmp_path / "other-home")}
+    p = _census_one(proc_root, repo, tmp_path, main_venv, env)
+    assert "other_genesis_home" in p["unknown_reasons"]
+
+
+def test_a_generic_process_with_another_genesis_home_is_unknown(proc_root, repo, tmp_path, main_venv):
+    m = _roles_census(proc_root, repo, tmp_path,
+                      [(110, [main_venv[0], "-"], {"GENESIS_HOME": str(tmp_path / "other-home")}, None)])
+    [p] = m["procs"]
+    assert (p["telemetry"], p["unknown"]) == (None, "other_genesis_home")
+
+
+def test_a_generic_process_with_an_unmodelled_option_is_unknown(proc_root, repo, tmp_path, main_venv):
+    """An attached module option may be a second server: never history-only."""
+    m = _roles_census(proc_root, repo, tmp_path, [(111, [main_venv[0], '-mgenesis', "serve"], {}, None)])
+    [p] = m["procs"]
+    assert (p["telemetry"], p["unknown"]) == (None, "interpreter_options_unmodelled")
+
+
+def test_a_sandboxed_process_with_its_own_home_does_not_reset_the_clock(
+    proc_root, repo, tmp_path, main_venv
+):
+    """The test sandbox runs in another mount namespace with its own home: the
+    documented residual. Reading it unknown would reset the 14-day clock on
+    every census that lands during a sandboxed test run."""
+    import time as _time
+
+    r, _, _ = repo
+    (tmp_path / "live.db").touch()
+    _proc(proc_root, 112, [main_venv[0], "-m", "pytest"], started=_time.time() + 60,
+          env={"GENESIS_HOME": str(tmp_path / "sandbox-home")},
+          exe=str(tmp_path / "sys" / "bin" / "python3.12"), ns="mnt:[2]")
+    [p] = census.build_census(r, proc_root=proc_root, live_db=tmp_path / "live.db")["procs"]
+    assert p["unknown"] != "other_genesis_home"
