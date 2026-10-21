@@ -20,11 +20,14 @@ Verdicts, in order:
    merged HEAD, and a state without the key (older, or hand-edited) cannot rule
    that out; else GUARDS;
 5. phase "merging" with the rollback tag at HEAD, no MERGE_HEAD, and no merge
-   residue (``genesis_merge_residue`` in deploy_checkout.sh; it counts every
-   tracked change, ephemeral paths included): CONFLICT_PENDING when
-   update_conflicts.json names the same ``deploy_head`` (update.sh writes it
-   only for a real conflict), otherwise SAFE (a run killed before its merge).
-   With residue, MIXED_TREE: the checkout holds part of a half-written update;
+   residue (``genesis_merge_residue`` in deploy_checkout.sh; it counts tracked
+   changes, ephemeral paths included, on the paths the merge
+   ``rollback...deploy_head`` writes, and every tracked change when the row
+   names no ``deploy_head``): CONFLICT_PENDING when update_conflicts.json names
+   the same ``deploy_head`` (update.sh writes it only for a real conflict),
+   otherwise SAFE (a run killed before its merge). With residue, MIXED_TREE: the
+   checkout holds part of a half-written update. A tracked change only outside
+   the merge's paths is someone else's edit: GUARDS, as before #3492;
 6. a "merging" row carrying the live engine's move record ``live_move``
    ({"to": <tip>, "phase": ref|moving|partial|clean|done}, which the engine
    writes into update.sh's own row before and after each move, #3492). Every
@@ -42,8 +45,8 @@ Verdicts, in order:
    one under any phase but "merging", GUARDS;
 6a. a "merging" row on `live` with no record and an own_head other than the
    tag (update.sh adopted the tip, and its row no longer carries the record)
-   is judged the same way toward own_head, for a half-written tree or a
-   foreign edit at the tag only; otherwise rule 5 or 7 answers as before;
+   is judged the same way toward own_head, and that verdict is final (main's
+   rule 5 would judge the upstream base range, which no live switch writes);
 7. every other "merging", any other phase, or none: GUARDS.
 
 The pid is not an input: callers answer liveness first (update.lock in the
@@ -294,11 +297,10 @@ def state_verdict(state: object, repo: str, conflicts_path: str | None = None) -
     if phase == "merging":
         adopted = _adopted_tip(state, repo)
         if adopted and not _rev(repo, "MERGE_HEAD"):
-            v, why = _live_verdict(state, repo, adopted, "done")
-            # Only what rule 6a adds: a half-written tree, or a foreign edit at
-            # the tag. Every other answer is the plain rule's, word for word.
-            if v == MIXED_TREE or (v == GUARDS and why.startswith("tracked files changed")):
-                return v, why
+            # Final: main's rule 5 would judge the upstream base range
+            # (deploy_head), which is not what a switch between the two live
+            # tips writes (#3532 round 1).
+            return _live_verdict(state, repo, adopted, "done")
         rb_commit = _tag_commit_is_head(state, repo)
         if not rb_commit:
             return GUARDS, "it merged code bootstrap has not run on"
@@ -307,6 +309,11 @@ def state_verdict(state: object, repo: str, conflicts_path: str | None = None) -
         residue = _merge_residue(repo, rb_commit, deploy_head)
         if residue:
             return _mixed(rb_commit, deploy_head, residue)
+        # A tracked change the merge never writes (residue counts only the
+        # merge's paths): someone else's edit. It guards, as it did before
+        # #3492, but is not a half-written tree, so --post-merge may finish.
+        if deploy_head and _merge_residue(repo, rb_commit, ""):
+            return GUARDS, "tracked files changed while it was merging"
         if deploy_head and conflicts_path and _conflict_recorded(conflicts_path, deploy_head):
             return CONFLICT_PENDING, "it stopped on merge conflicts; nothing was merged"
         return SAFE, "it stopped before merging anything"

@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -171,7 +172,12 @@ def test_merging_at_the_tag_with_tracked_changes_guards(guard, repo, path):
         _git(repo["root"], "tag", "-f", "pre")
     (repo["root"] / path).write_text("edited\n")
     state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": repo["incoming"]}
-    assert _verdict(guard, repo, state, {"deploy_head": repo["incoming"]}) == "mixed_tree"
+    # The merge (pre...incoming) writes only b.txt: an edit elsewhere is not
+    # its residue. It still guards, as it did before #3492, without claiming a
+    # half-written tree (--post-merge refuses only that).
+    assert _verdict(guard, repo, state, {"deploy_head": repo["incoming"]}) == "guards"
+    state["deploy_head"] = ""
+    assert _verdict(guard, repo, state) == "mixed_tree", "no range: every tracked change"
 
 
 def test_merging_at_the_tag_with_an_added_file_guards(guard, repo):
@@ -675,14 +681,18 @@ def _residue(root: Path, frm: str, to: str, *extra: str) -> str:
 
 
 def test_sf2_the_two_dot_residue_keeps_only_the_switchs_paths(live):
-    """--two-dot keeps tracked dirt on the switch's own paths only; main's mode
-    still lists every tracked change."""
+    """--two-dot keeps tracked dirt on the switch's own paths only. Main's mode
+    filters the same way over its own range (old...new writes neither A nor O
+    here), and with no range at all every tracked change is listed."""
     root = live["root"]
     (root / "A").write_text("foreign\n")
     (root / "O").write_text("half\n")
     two_dot = _residue(root, live["old"], live["new"], "--two-dot")
     assert " M O" in two_dot and " M A" not in two_dot, two_dot
-    assert " M A" in _residue(root, live["old"], live["new"]), "main's mode changed"
+    main = _residue(root, live["old"], live["new"])
+    assert " M A" not in main and " M O" not in main, main
+    whole = _residue(root, live["old"], "")
+    assert " M A" in whole and " M O" in whole, whole
 
 
 def _adopted_row(d: dict, **over) -> dict:
@@ -709,13 +719,11 @@ def test_sf4_a_rollback_killed_after_adoption_is_a_mixed_tree(guard, live):
 
 
 def test_sf4_a_clean_adopted_row_reads_as_before(guard, live):
-    """Control: clean at the adopted tip it guards with the same reason as
-    before; back at the tag, clean, it guards nothing."""
+    """Control: clean at the adopted tip it guards (moved, not bootstrapped);
+    back at the tag, clean, it guards nothing."""
     _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
-    assert _live_verdict(guard, live, _adopted_row(live)) == (
-        "guards",
-        "it merged code bootstrap has not run on",
-    )
+    verdict, reason = _live_verdict(guard, live, _adopted_row(live))
+    assert verdict == "guards" and "bootstrap has not run on" in reason, reason
     _git(live["root"], "checkout", "-q", "-B", "live", live["old"])
     assert _live_verdict(guard, live, _adopted_row(live))[0] == "safe"
 
@@ -749,6 +757,144 @@ def test_n5_control_characters_in_a_path_never_reach_the_terminal(guard, repo):
     state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
     verdict, reason = guard.verdict(str(_state(repo, state)), str(root))
     assert verdict == "mixed_tree", reason
-    assert "e?vil?name.txt" in reason, reason
+    # Shown in git's own C-style quoting (#3532 round 1): one path, one line.
+    assert '"e\\033vil\\tname.txt"' in reason, reason
     bad = [c for c in reason if (ord(c) < 0x20 and c != "\n") or ord(c) == 0x7F]
     assert not bad, repr(reason)
+
+
+def _incoming_editing(repo: dict, path: str) -> str:
+    """A commit off the tag that changes ``path`` (HEAD stays at the tag)."""
+    root = repo["root"]
+    (root / path).write_text("incoming\n")
+    _git(root, "add", "--", path)
+    _git(root, "commit", "-qm", f"incoming edits {path}")
+    sha = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", "pre")
+    return sha
+
+
+def test_main_a_foreign_edit_outside_the_merge_guards_not_mixed(guard, repo):
+    """Main's residue counts only the paths its merge writes (pre...deploy_head),
+    as a live row's does: an indexer's or another session's edit elsewhere
+    guards (as before #3492) and is not a half-written tree."""
+    incoming = _incoming_editing(repo, "b.txt")
+    (repo["root"] / "a.txt").write_text("a session's edit\n")
+    state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
+    verdict, reason = guard.verdict(str(_state(repo, state)), str(repo["root"]))
+    assert verdict == "guards", reason
+
+
+def test_main_an_edit_on_a_path_the_merge_writes_is_mixed(guard, repo):
+    incoming = _incoming_editing(repo, "a.txt")
+    (repo["root"] / "a.txt").write_text("half\n")
+    state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
+    verdict, reason = guard.verdict(str(_state(repo, state)), str(repo["root"]))
+    assert verdict == "mixed_tree" and "a.txt" in reason, reason
+
+
+# ── #3532 round 1 ───────────────────────────────────────────────────────────
+
+
+def _failing_git(tmp_path: Path, monkeypatch, *needles: str) -> None:
+    """Put a git on PATH that fails (exit 128) for a call whose arguments hold
+    every one of ``needles`` and runs the real git for every other call: a read
+    that fails inside a process substitution, whose status nothing checked."""
+    real = shutil.which("git")
+    bin_ = tmp_path / "failing-git-bin"
+    bin_.mkdir()
+    test = " && ".join(f'case " $* " in *" {n} "*) ;; *) false ;; esac' for n in needles)
+    (bin_ / "git").write_text(f'#!/bin/sh\nif {test}; then exit 128; fi\nexec "{real}" "$@"\n')
+    (bin_ / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+
+
+def _main_half_written(repo: dict, left: str) -> dict:
+    """A main merge killed with its own residue on disk: the merge
+    (pre...incoming) edits a.txt and adds b.txt. ``left`` "tracked": a.txt
+    half-edited (seen only through status); "added": b.txt written (seen only
+    through the collision scan)."""
+    root = repo["root"]
+    (root / "a.txt").write_text("incoming\n")
+    (root / "b.txt").write_text("b\n")
+    _git(root, "add", "a.txt", "b.txt")
+    _git(root, "commit", "-qm", "incoming")
+    incoming = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", "pre")
+    if left == "tracked":
+        (root / "a.txt").write_text("half\n")
+    else:
+        (root / "b.txt").write_text("b\n")
+    return {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
+
+
+@pytest.mark.parametrize(
+    ("needles", "left"),
+    [
+        (("status", "-z"), "tracked"),
+        (("diff", "-z", "--name-only"), "tracked"),
+        (("diff", "--name-only"), "tracked"),
+        (("diff", "-z", "--diff-filter=d"), "added"),
+    ],
+    ids=["status", "diff-names", "both-diff-listings", "collision-diff"],
+)
+def test_r1_a_failed_listing_never_reads_as_no_residue(
+    guard, repo, tmp_path, monkeypatch, needles, left
+):
+    """Item 1: a read inside a process substitution whose status nothing
+    checked turned a failure into an empty list, so residue vanished and the
+    tree read as not half-written. Every such read now fails closed (the lines
+    are kept, or the range is reported unreadable). Each case leaves only the
+    residue that one read sees."""
+    state = _main_half_written(repo, left)
+    assert _verdict(guard, repo, state) == "mixed_tree", "control"
+    _failing_git(tmp_path, monkeypatch, *needles)
+    verdict, reason = guard.verdict(str(_state(repo, state)), str(repo["root"]))
+    assert verdict == "mixed_tree", reason
+
+
+def test_r1_a_path_with_a_newline_is_one_quoted_line(guard, repo):
+    """Item 4: NUL-separated records joined with newlines showed a file name
+    holding a newline as two paths. Every displayed path (tracked change,
+    collision) is git's C-style quoted form."""
+    root = repo["root"]
+    tracked, added = "m\nn.txt", "a\nb.txt"
+    (root / tracked).write_text("m\n")
+    _git(root, "add", "--", tracked)
+    _git(root, "commit", "-qm", "a tracked file with a newline")
+    _git(root, "tag", "-f", "pre")
+    (root / tracked).write_text("incoming\n")
+    (root / added).write_text("x\n")
+    _git(root, "add", "--", tracked, added)
+    _git(root, "commit", "-qm", "incoming")
+    incoming = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", "pre")
+    (root / tracked).write_text("half\n")
+    (root / added).write_text("x\n")
+    state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
+    verdict, reason = guard.verdict(str(_state(repo, state)), str(root))
+    assert verdict == "mixed_tree", reason
+    assert '"m\\nn.txt"' in reason and '"a\\nb.txt"' in reason, reason
+    lines = [ln.strip() for ln in reason.split("\n")]
+    assert "n.txt" not in lines and "b.txt" not in lines and "a" not in lines, reason
+
+
+def test_r1_an_adopted_row_at_the_tag_is_judged_only_as_a_live_row(guard, live):
+    """Item 5: after adoption (no record, own_head the tip), HEAD back at the
+    tag and clean as far as a switch between the two tips goes: a file at a
+    path only the upstream base range names, which neither live tip has, is not
+    this update's residue. It used to fall through to main's rule and read
+    mixed_tree."""
+    root = live["root"]
+    _git(root, "checkout", "-q", "--detach", live["main0"])
+    (root / "P").write_text("p\n")
+    _git(root, "add", "P")
+    _git(root, "commit", "-qm", "an upstream base with P")
+    base = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-q", "-B", "live", live["old"])
+    (root / "P").write_text("p\n")
+    row = live_row(live)
+    row.pop("live_move")
+    row.update(own_head=live["new"], deploy_head=base)
+    verdict, reason = _live_verdict(guard, live, row)
+    assert verdict == "safe", reason

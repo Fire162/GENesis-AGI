@@ -1362,6 +1362,7 @@ def _recover_with(
         '. "$SCRIPT_DIR/lib/deploy_marker.sh"\n. "$SCRIPT_DIR/lib/deploy_checkout.sh"\n'
         '. "$SCRIPT_DIR/lib/deploy_recovery.sh"\nEPHEMERAL_BACKUP_ROOT="${TEST_BACKUP_ROOT:?}"\n'
         + _crash_recovery_source()
+        + "\necho AFTER_RECOVERY\n"
     )
     env = _recovery_env(
         HOME=str(home),
@@ -1487,10 +1488,21 @@ def test_t4k_control_the_guards_exit_10_proceeds(tmp_path):
     assert proc.returncode == 0 and not path.exists(), proc.stdout + proc.stderr
 
 
+def _holding(lock: Path) -> subprocess.Popen:
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "120"])
+    deadline = time.monotonic() + 30
+    while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+        assert time.monotonic() < deadline, "the holder never took the lock"
+        time.sleep(0.05)
+    return holder
+
+
 def test_t4l_an_update_lock_still_held_means_still_running(tmp_path):
     """T4l (S-5): the state's pid is dead, but update.lock is held (an orphaned
     engine keeps update.sh's fd): the update is still running, possibly mid
-    switch, so recovery does nothing and keeps the state."""
+    switch, so recovery does nothing and keeps the state, and bootstrap STOPS
+    there (#3532 round 1): nothing after it may install or rewrite config under
+    a move still in flight."""
     root, _common, rollback = _recovery_repo(tmp_path)
     home = tmp_path / "home"
     lock = home / ".genesis" / "locks" / "update.lock"
@@ -1515,8 +1527,63 @@ def test_t4l_an_update_lock_still_held_means_still_running(tmp_path):
         holder.kill()
         holder.wait()
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 0 and "update.lock" in out and "not interfering" in out, out
+    assert proc.returncode == 1 and "update.lock" in out, out
+    assert "AFTER_RECOVERY" not in out, "bootstrap went on under an update still running"
     assert path.exists() and _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_t4l_update_sh_running_bootstrap_under_its_own_lock_goes_on(tmp_path):
+    """Control: update.sh runs bootstrap while it is alive and holds update.lock
+    (its state names its own pid): that is the normal path and must go on."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    lock = tmp_path / "home" / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    holder = _holding(lock)
+    try:
+        state = {
+            "phase": "bootstrap",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": os.getpid(),
+        }
+        proc, path = _recover_with(tmp_path, root, state)
+    finally:
+        holder.kill()
+        holder.wait()
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0 and "still running" in out and "AFTER_RECOVERY" in out, out
+    assert path.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens a mode-000 file")
+def test_t4l_an_unopenable_update_lock_is_named_as_such(tmp_path):
+    """An update.lock bootstrap cannot open is "maybe held": it refuses, and says
+    the lock cannot be opened rather than telling the reader to wait for a
+    holder that may not exist."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    lock = tmp_path / "home" / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    lock.chmod(0)
+    try:
+        state = {
+            "phase": "merging",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": 2_147_483_647,
+        }
+        proc, path = _recover_with(tmp_path, root, state)
+    finally:
+        lock.chmod(0o600)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "cannot be opened" in out, out
+    assert "AFTER_RECOVERY" not in out and path.exists()
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
 
 
 def test_t4l_control_a_free_update_lock_recovers(tmp_path):

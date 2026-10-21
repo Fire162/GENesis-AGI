@@ -118,11 +118,18 @@ _genesis_hidden_dirty_lines() {
     # shell's copy (deploy_health.py's probe does, on a timeout).
     idx="$(git -C "$root" rev-parse --path-format=absolute --git-path index)" || return 2
     tmp="$(mktemp "${idx%/*}/genesis-hidden-index.$$.XXXXXX")" || return 2
-    if cp "$idx" "$tmp" \
-        && _genesis_flagged_paths "$root" '[a-z]' \
-            | GIT_INDEX_FILE="$tmp" xargs -0 -r git -C "$root" update-index --no-assume-unchanged -- \
-        && _genesis_flagged_paths "$root" '[Ss]' \
-            | GIT_INDEX_FILE="$tmp" xargs -0 -r git -C "$root" update-index --no-skip-worktree --; then
+    # The two flagged lists are read with their status (a listing that fails
+    # must not read as "nothing flagged", which would hide every hidden change).
+    local -a lower=() skip=()
+    mapfile -d '' -t lower < <(_genesis_flagged_paths "$root" '[a-z]')
+    wait $! || rc=2
+    mapfile -d '' -t skip < <(_genesis_flagged_paths "$root" '[Ss]')
+    wait $! || rc=2
+    if [ "$rc" -eq 0 ] && cp "$idx" "$tmp" \
+        && { [ "${#lower[@]}" -eq 0 ] || printf '%s\0' "${lower[@]}" \
+            | GIT_INDEX_FILE="$tmp" xargs -0 -r git -C "$root" update-index --no-assume-unchanged --; } \
+        && { [ "${#skip[@]}" -eq 0 ] || printf '%s\0' "${skip[@]}" \
+            | GIT_INDEX_FILE="$tmp" xargs -0 -r git -C "$root" update-index --no-skip-worktree --; }; then
         GIT_INDEX_FILE="$tmp" git -C "$root" update-index -q --refresh >/dev/null 2>&1 || true
         seen="$(GIT_INDEX_FILE="$tmp" git -C "$root" diff-files --name-status --no-renames)" || rc=2
         real="$(git -C "$root" diff-files --name-status --no-renames)" || rc=2
@@ -150,10 +157,11 @@ genesis_has_flagged_entries() {
 # glob <tag>.
 _genesis_flagged_paths() {
     local root="$1" tag="$2" e
-    git -C "$root" ls-files -v -z | while IFS= read -r -d '' e; do
+    while IFS= read -r -d '' e; do
         # shellcheck disable=SC2254  # <tag> is a glob on purpose
         case "${e%% *}" in $tag) printf '%s\0' "${e#? }" ;; esac
-    done
+    done < <(git -C "$root" ls-files -v -z)
+    wait $!
 }
 
 # Does <path> (relative to <root>) hold anything git does not track: an untracked
@@ -206,24 +214,47 @@ genesis_two_dot_collisions() {
     _genesis_diff_collisions "$1" "$2" "$3"
 }
 
-# The walk both share; arguments after <root> are the diff's revisions.
+# The paths `git diff --name-only <args>` names, in its order, into the caller's
+# array _raw (exact, read NUL-separated) and associative array _shown (each raw
+# path -> the path as git prints it: C-style quoted when it holds a newline, a
+# control character, a quote or a backslash, so one path is always one display
+# line). Every read is checked: either listing failing, or the two disagreeing,
+# returns 1, never an empty list that reads as "nothing changed".
+_genesis_diff_paths() {
+    local root="$1" i
+    shift
+    local -a shown=()
+    mapfile -d '' -t _raw < <(git -C "$root" diff -z --no-renames --name-only "$@" 2>/dev/null)
+    wait $! || return 1
+    mapfile -t shown < <(git -C "$root" diff --no-renames --name-only "$@" 2>/dev/null)
+    wait $! || return 1
+    [ "${#_raw[@]}" -eq "${#shown[@]}" ] || return 1
+    for i in "${!_raw[@]}"; do
+        _shown["${_raw[$i]}"]="${shown[$i]}"
+    done
+}
+
+# The walk both share; arguments after <root> are the diff's revisions. The
+# paths printed are git's display form (_genesis_diff_paths).
 _genesis_diff_collisions() {
     local root="$1" collisions="" f p t
     shift
-    git -C "$root" diff --no-renames --name-only --diff-filter=d "$@" >/dev/null 2>&1 \
-        || return 2
+    local -a _raw=()
+    local -A _shown=()
+    _genesis_diff_paths "$root" --diff-filter=d "$@" || return 2
     # A path in the index can never collide, and the second scan runs while the
     # server is stopped, so the index is read ONCE and those paths skip the two
-    # per-path git calls below. An unreadable index leaves the set empty: every
-    # path then takes the full check, which is slower, never less safe.
+    # per-path git calls below. An unreadable index (its read checked) leaves the
+    # set empty: every path then takes the full check, slower, never less safe.
     local -A tracked=()
     while IFS= read -r -d '' t; do
         tracked["$t"]=1
     done < <(git -C "$root" ls-files -z 2>/dev/null)
-    while IFS= read -r -d '' f; do
+    wait $! || tracked=()
+    for f in "${_raw[@]}"; do
         [ -n "${tracked[$f]:-}" ] && continue
         if genesis_untracked_node "$root" "$f"; then
-            collisions+="$f"$'\n'
+            collisions+="${_shown[$f]}"$'\n'
             continue
         fi
         [ -e "$root/$f" ] || [ -L "$root/$f" ] && continue
@@ -232,11 +263,11 @@ _genesis_diff_collisions() {
             p="${p%/*}"
             [ -d "$root/$p" ] && [ ! -L "$root/$p" ] && break
             if genesis_untracked_node "$root" "$p"; then
-                collisions+="$f"$'\n'
+                collisions+="${_shown[$f]}"$'\n'
                 break
             fi
         done
-    done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "$@" 2>/dev/null)
+    done
     printf '%s' "$collisions"
     [ -z "$collisions" ]
 }
@@ -245,49 +276,39 @@ _genesis_diff_collisions() {
 # still sits at its rollback commit <rb_commit>: a fast-forward killed mid-write
 # leaves HEAD unmoved and the files half new. Prints one line per sign of that, and
 # nothing when there is none; never fails (a step it cannot read prints a line
-# saying so). Every tracked path counts, the ephemeral allowlist included: the
-# merge writes those too. git status cannot see a file whose index entry is
-# flagged skip-worktree or assume-unchanged, so the hidden-edit scan runs as
-# well. A fast-forward killed after writing only the files the range ADDS leaves
-# them untracked, which status cannot show; update.sh's pre-stop scan refuses a
-# range that lands on an existing untracked path, so one present now appeared
-# during the run (<deploy_head> empty: not checked). With a fourth argument
-# --two-dot, the files checked are the two-dot diff <rb_commit> <deploy_head>
-# (genesis_two_dot_collisions): what a `git switch` between the two writes, the
-# range every residue check on a `live` row uses (#3492); <rb_commit> is then
-# whichever end HEAD is at. Without it, main's merge range (rb...deploy_head).
+# saying so). Tracked changes count only on the paths the update writes (the
+# ephemeral allowlist included: the merge writes those too); a tracked change
+# anywhere else is not its doing (an indexer's or another session's edit), which
+# the caller judges on its own (#3492). git status cannot see a file whose index
+# entry is flagged skip-worktree or assume-unchanged, so the hidden-edit scan
+# runs as well. A fast-forward killed after writing only the files the range
+# ADDS leaves them untracked, which status cannot show; update.sh's pre-stop
+# scan refuses a range that lands on an existing untracked path, so one present
+# now appeared during the run. The paths written are main's merge range
+# <rb_commit>...<deploy_head> (a fast-forward's is exactly the two-dot one), or
+# with a fourth argument --two-dot the two-dot diff <rb_commit> <deploy_head>:
+# what a `git switch` between the two writes, the range every residue check on a
+# `live` row uses; <rb_commit> is then whichever end HEAD is at. <deploy_head>
+# empty: no range, so every tracked change counts and no collision is checked.
 # Read by scripts/lib/update_state_guard.py (the one rule bootstrap.sh's crash
 # recovery, update.sh, deploy_code_only.sh, the live engine and the dashboard
 # ask) and by update.sh's live rollback.
 genesis_merge_residue() {
     local root="$1" rb_commit="$2" deploy_head="$3" mode="${4:-}" dirty="" hidden="" new="" rc=0
+    local -a range=()
     dirty="$(git -C "$root" status --porcelain --untracked-files=no --no-renames 2>/dev/null)" \
         || dirty="(status unreadable)"
     hidden="$(_genesis_hidden_dirty_lines "$root" 2>/dev/null)" \
         || hidden="(flagged-entry status unreadable)"
-    if [ -n "$deploy_head" ] && [ "$mode" = --two-dot ]; then
-        # A switch writes only diff(<rb_commit>, <deploy_head>), so tracked dirt
-        # anywhere else is not its doing (another session's edit, which the
-        # caller judges on its own): only lines on the switch's paths are
-        # residue. Read NUL-separated, renames off, so a path is one record and
-        # never quoted. A range that cannot be listed keeps every line.
-        local -A moved=()
-        local p rec kept=""
-        if git -C "$root" diff --no-renames --name-only "$rb_commit" "$deploy_head" >/dev/null 2>&1 \
-            && [ "$dirty" != "(status unreadable)" ]; then
-            while IFS= read -r -d '' p; do
-                moved["$p"]=1
-            done < <(git -C "$root" diff -z --no-renames --name-only "$rb_commit" "$deploy_head" 2>/dev/null)
-            while IFS= read -r -d '' rec; do
-                if [ -n "${moved[${rec:3}]:-}" ]; then kept+="$rec"$'\n'; fi
-            done < <(git -C "$root" status --porcelain -z --untracked-files=no --no-renames 2>/dev/null)
-            dirty="$kept"
-            kept=""
-            while IFS= read -r rec; do
-                if [ -n "$rec" ] && [ -n "${moved[${rec:3}]:-}" ]; then kept+="$rec"$'\n'; fi
-            done <<< "$hidden"
-            case "$hidden" in "("*) ;; *) hidden="$kept" ;; esac
+    if [ -n "$deploy_head" ]; then
+        if [ "$mode" = --two-dot ]; then
+            range=("$rb_commit" "$deploy_head")
+        else
+            range=("$rb_commit...$deploy_head")
         fi
+        _genesis_dirt_on_range "$root" "${range[@]}"
+    fi
+    if [ -n "$deploy_head" ] && [ "$mode" = --two-dot ]; then
         new="$(genesis_two_dot_collisions "$root" "$rb_commit" "$deploy_head" 2>/dev/null)" || rc=$?
         [ "$rc" -ne 2 ] || new="(the checkout's range cannot be listed)"
     elif [ -n "$deploy_head" ]; then
@@ -295,6 +316,39 @@ genesis_merge_residue() {
         [ "$rc" -ne 2 ] || new="(the update's incoming range cannot be listed)"
     fi
     printf '%s\n%s\n%s\n' "$dirty" "$hidden" "$new" | grep -v '^$' || true
+}
+
+# genesis_merge_residue's filter: keeps, in the caller's $dirty and $hidden, only
+# the lines whose path the diff over the given revisions names (deletions
+# included). Membership is exact: status is read NUL-separated with renames off,
+# and its paths matched against the diff's raw paths; every kept line shows git's
+# diff's quoted form (_genesis_diff_paths; unlike `git status`, it leaves a
+# trailing space unquoted). A listing
+# that fails or cannot be read keeps every line: doubt never shrinks the residue.
+_genesis_dirt_on_range() {
+    local root="$1" rec kept="" path
+    shift
+    local -a _raw=() recs=()
+    local -A _shown=() quoted=()
+    [ "$dirty" != "(status unreadable)" ] || return 0
+    _genesis_diff_paths "$root" "$@" || return 0
+    mapfile -d '' -t recs < <(git -C "$root" status --porcelain -z --untracked-files=no --no-renames 2>/dev/null)
+    wait $! || return 0
+    for rec in "${recs[@]}"; do
+        path="${rec:3}"
+        if [ -n "${_shown[$path]+set}" ]; then kept+="${rec:0:3}${_shown[$path]}"$'\n'; fi
+    done
+    dirty="$kept"
+    # Hidden lines come from diff-files, in git's quoted form already.
+    case "$hidden" in "("*) return 0 ;; esac
+    for path in "${_raw[@]}"; do
+        quoted["${_shown[$path]}"]=1
+    done
+    kept=""
+    while IFS= read -r rec; do
+        if [ -n "$rec" ] && [ -n "${quoted[${rec:3}]:-}" ]; then kept+="$rec"$'\n'; fi
+    done <<< "$hidden"
+    hidden="$kept"
 }
 
 # Is <root> still on <branch> at exactly <head> (a full commit id)? Another

@@ -300,7 +300,6 @@ class Engine(Repo):
         was judged safe is exactly what every later re-check compares to, and
         the checkout must still match it here. It is never read again."""
         self.require_main_checkout()
-        self._remove_retired_move_record()
         if self.env.get(OWN_STATE_PID) and not self._own_update_state():
             # A caller that names itself is update.sh, whose "merging" row the
             # move records into (live_move). If the row is not that run's own,
@@ -320,6 +319,9 @@ class Engine(Repo):
             raise Refusal(reasons[0])
         plan.refuse_moved_source(self, source, "nothing changed")
         self._retire_harmless_update_state()
+        # Only now: update_state.json is gone or this caller's own row, so the
+        # retired side file is no interrupted update's last record.
+        self._remove_retired_move_record()
         return data
 
     def _expected_source(self, expect: tuple[str, str] | None) -> plan.Source:
@@ -427,8 +429,13 @@ class Engine(Repo):
     def _remove_retired_move_record(self) -> None:
         """The side file earlier versions recorded the move in, now retired (the
         record is the row's live_move): a dead run's leftover is removed, under
-        update.lock, before any move. A failure only warns."""
+        update.lock, before any move, and only once preflight has passed, so
+        update_state.json is absent or the caller's own row. While another
+        update's state still guards, the move refuses before this and the file
+        stays with it. A failure only warns."""
         path = self.lock_path.parent.parent / "live_move.json"
+        if os.path.lexists(self.update_state) and not self._own_update_state():
+            return
         try:
             path.unlink()
         except FileNotFoundError:

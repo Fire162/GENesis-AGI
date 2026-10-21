@@ -1194,6 +1194,24 @@ def test_an_orphaned_engine_never_writes_its_callers_row(dc, dc_ready, capsys, m
     assert state.read_bytes() == before
 
 
+def test_a_leftover_side_file_is_kept_while_an_update_state_guards(dc, dc_ready, capsys):
+    """#3532 round 1: the retired file may be the only record an interrupted
+    update left. While its state still guards (the rebuild refuses on it), the
+    file stays; it goes only once the state is gone or the caller's own row."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    left = w.home / ".genesis" / "live_move.json"
+    left.parent.mkdir(parents=True, exist_ok=True)
+    left.write_text('{"to": "' + "e" * 40 + '", "phase": "moving"}')
+    state = w.home / ".genesis" / "update_state.json"
+    state.write_text(json.dumps({"phase": "bootstrap", "rollback_tag": "pre"}))
+    assert w.run(dc, "rebuild") == 1
+    assert "update_state.json" in capsys.readouterr().err
+    assert left.exists(), "the record of an update still guarded was deleted"
+    assert state.exists()
+
+
 def test_a_leftover_side_file_is_removed_by_the_run(dc, dc_ready, capsys):
     """T4o: the retired live_move.json a dead run left is removed, once."""
     w = dc_ready

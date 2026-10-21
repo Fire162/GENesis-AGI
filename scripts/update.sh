@@ -387,7 +387,8 @@ _live_adopt_tip() {
         moving|ref)
             rb="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "$ROLLBACK_TAG^{commit}" 2>/dev/null || true)"
             if [ -n "$rb" ]; then
-                residue="$(genesis_merge_residue "$GENESIS_ROOT" "$rb" "$to" --two-dot)"
+                residue="$(genesis_merge_residue "$GENESIS_ROOT" "$rb" "$to" --two-dot)" \
+                    || residue="(the residue check failed)"
             else
                 residue="(the rollback tag cannot be resolved)"
             fi

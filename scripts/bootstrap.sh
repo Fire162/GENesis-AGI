@@ -75,7 +75,9 @@ _crash_state_guard() {
 _update_lock_held() {
     local _lock="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" _fd _rc=0
     [ -e "$_lock" ] || return 1
-    exec {_fd}<"$_lock" || return 0
+    # Returns 2 when the lock cannot be opened: "maybe held", said apart so the
+    # message names the real cause instead of waiting on a holder.
+    exec {_fd}<"$_lock" || return 2
     flock -n "$_fd" || _rc=$?
     exec {_fd}<&-
     [ "$_rc" -ne 0 ]
@@ -144,14 +146,26 @@ PY
     # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
     # zombie or reused pid: the "dead" branch below resets the tree, so here a
     # stale holder must err toward "still running", never toward the reset. A held
-    # update.lock means the same, whatever the pid: update.sh SIGKILLed while the
-    # live engine it ran still holds the lock through the inherited fd, possibly
-    # mid-switch (#3492). (A validation hold, flock -s, reads the same; waiting for
-    # it is the safe side.)
+    # update.lock with the pid gone means an update is still running too
+    # (update.sh SIGKILLed while the live engine it ran holds the lock through the
+    # inherited fd, possibly mid-switch, #3492), and there bootstrap stops: no
+    # update asked for it. (A validation hold, flock -s, reads the same; waiting
+    # for it is the safe side.)
     if [ "$STATE_PID" -gt 1 ] 2>/dev/null && kill -0 "$STATE_PID" 2>/dev/null; then
         echo "  Update process (pid $STATE_PID) still running in phase '$STATE_PHASE' — not interfering."
-    elif _update_lock_held; then
-        echo "  An update still holds update.lock (phase '$STATE_PHASE'; pid $STATE_PID is gone) — not interfering."
+    elif { _lock_rc=0; _update_lock_held || _lock_rc=$?; [ "$_lock_rc" -ne 1 ]; }; then
+        if [ "$_lock_rc" -eq 2 ]; then
+            echo "  REFUSE: ${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock cannot be opened (check its owner and mode), so whether an update still holds it is unknown: bootstrap does not run." >&2
+            exit 1
+        fi
+        # Unlike the branch above (update.sh running bootstrap itself, alive and
+        # holding the lock: bootstrap is its step and goes on), nobody here
+        # asked for this run: its update died and something it left (an
+        # orphaned live engine, possibly mid-switch) still holds the lock.
+        # Installing or rewriting config under that would race it, so stop.
+        echo "  REFUSE: an update still holds update.lock (phase '$STATE_PHASE'; pid $STATE_PID is gone): bootstrap does not run under it." >&2
+        echo "  Re-run scripts/bootstrap.sh once it has finished (nothing holds ${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock); a validation hold (flock -s) reads the same." >&2
+        exit 1
     elif [ "$STATE_PHASE" = "done" ]; then
         echo "  Update completed successfully — cleaning up state file."
         rm -f "$UPDATE_STATE"
@@ -209,8 +223,9 @@ PY
             # partway (its move record in the row names the target; only the
             # two-dot range sees what a switch writes). Installing over it would
             # run half-written code. The shared guard decides
-            # (scripts/lib/update_state_guard.py: every tracked path, flagged
-            # entries, the files the range writes), so its verdict and this
+            # (scripts/lib/update_state_guard.py: tracked and flagged changes on
+            # the paths the range writes, a tracked change elsewhere guards, and
+            # the files the range adds), so its verdict and this
             # recovery cannot disagree, and recovery goes on ONLY on its exit
             # 10. Every other exit refuses with what it said: 4 is a half-written
             # tree, 0 a state it guards, and 1, 2, 126 or 127 a guard that

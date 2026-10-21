@@ -408,3 +408,40 @@ def test_n1_post_merge_refuses_a_guard_whose_check_failed(world, tmp_path):
     r = subprocess.run([str(bin_ / "bash"), "-c", script], capture_output=True, text=True, env=env)
     assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
     assert "could not be checked" in r.stdout, r.stdout
+
+
+def _main_merge_killed(world: dict, edited: str) -> None:
+    """A main merge row at the tag whose merge (pre...incoming) writes b.txt,
+    with a tracked edit to ``edited``."""
+    root = world["root"]
+    (root / "a.txt").write_text("a\n")
+    _git(root, "add", "a.txt")
+    _git(root, "commit", "-qm", "a")
+    _git(root, "tag", "-f", "pre")
+    (root / "b.txt").write_text("b\n")
+    _git(root, "add", "b.txt")
+    _git(root, "commit", "-qm", "incoming")
+    incoming = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", "pre")
+    if edited == "b.txt":
+        (root / "b.txt").write_text("half\n")
+    else:
+        (root / edited).write_text("a session's edit\n")
+    world["state"].write_text(
+        json.dumps({"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming})
+    )
+
+
+def test_main_post_merge_is_not_refused_by_a_foreign_edit(world):
+    """A tracked edit the merge never writes guards (exit 0), which --post-merge
+    finishes, as it did before #3492; only real residue refuses."""
+    _main_merge_killed(world, "a.txt")
+    r = _guard_run(world, post_merge=True)
+    assert r.returncode == 0 and "PASSED_GUARD" in r.stdout, r.stdout + r.stderr
+
+
+def test_main_post_merge_refuses_residue_on_a_path_the_merge_writes(world):
+    _main_merge_killed(world, "b.txt")
+    r = _guard_run(world, post_merge=True)
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+    assert "b.txt" in r.stdout, r.stdout

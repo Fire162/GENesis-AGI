@@ -3956,7 +3956,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   merge residue and no recorded conflict guard nothing; anything unreadable
   guards. Merge residue at the tag is `mixed_tree` (exit 4): a half-written
   checkout, whose message lists the paths and says to save, restore and
-  Dismiss. A "merging" row carrying the live engine's move record
+  Dismiss. Residue counts tracked changes only on the paths the merge
+  (`rollback...deploy_head`) writes; a tracked change elsewhere (an indexer's,
+  another session's) guards as before but is not `mixed_tree`. A "merging" row carrying the live engine's move record
   (`live_move`, #3492) is judged by the TWO-DOT diff a `git switch` writes
   (the old and new `live` tips diverge, so main's symmetric range would miss
   what a dropped candidate had deleted), toward the record's target with HEAD
@@ -3978,7 +3980,7 @@ tool-disabled CC probe without changing its schedule or routing authority.
   run that had not written yet), a rollback that left merged code keeps it, and
   bootstrap's crash recovery keeps a pending conflict. Bootstrap's crash
   recovery treats a held update.lock as a running update (an orphaned engine
-  keeps update.sh's fd), and at the tag in "merging" it goes on only on the
+  keeps update.sh's fd) and stops when its pid is gone, and at the tag in "merging" it goes on only on the
   guard's exit 10, printing the guard's message otherwise. The dashboard's
   progress poll is read-only: it reports the verdict and offers Dismiss, the
   one retirement by hand. The residue check is `genesis_merge_residue` in
