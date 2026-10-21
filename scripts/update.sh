@@ -48,7 +48,9 @@
 # an earlier update's ~/.genesis/update_state.json still guards code it merged and
 # never activated, or a merge conflict it is waiting on (the rule is
 # scripts/lib/update_state_guard.py). Finish that one with --post-merge, resolve
-# its conflicts, or Dismiss it on the dashboard's update card.
+# its conflicts, or Dismiss it on the dashboard's update card. --post-merge itself
+# exits 5 when that rule finds the checkout half-written (its exit 4: the paths it
+# names are put back by hand first) or could not run at all.
 
 set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
                     # (see _on_err's BASH_SUBSHELL guard for the subshell case)
@@ -325,50 +327,78 @@ _live_new_commit() {
     NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_HEAD" 2>/dev/null || echo "untagged")
     NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short "$DEPLOY_HEAD")
 }
+# The engine's move record: "live_move" in this run's own state row ($STATE_FILE),
+# which the engine writes before and after each move (#3492; deploy_candidates.py
+# record_move). Prints "<to> <phase>" and returns 0; returns 2 when the row has no
+# record (the engine never wrote one: it moved nothing), 1 when it cannot be read.
 # Both successful adoption and rollback consume the same exact move identity.
 _live_read_move_record() {
     python3 -I -S -c '
 import json, re, sys
-with open(sys.argv[1], encoding="utf-8") as fh:
-    d = json.load(fh)
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        state = json.load(fh)
+except FileNotFoundError:
+    raise SystemExit(2)
+if not isinstance(state, dict):
+    raise SystemExit(1)
+if "live_move" not in state:
+    raise SystemExit(2)
+d = state["live_move"]
+if not isinstance(d, dict):
+    raise SystemExit(1)
 to, phase = d.get("to"), d.get("phase")
 if not (isinstance(to, str) and re.fullmatch("[0-9a-f]{40}(?:[0-9a-f]{24})?", to)
         and phase in ("ref", "moving", "partial", "clean", "done")):
     raise SystemExit(1)
 print(to, phase)
-' "$_LIVE_MOVE_REC" 2>/dev/null
+' "$STATE_FILE" 2>/dev/null
 }
 # A rebuild that moved `live` and then failed, or was interrupted (the shell runs a
 # trap only once the engine has exited), leaves the checkout at a tip this run made
-# but never adopted. What the engine did is read from its move record
-# ($_LIVE_MOVE_REC, written by deploy_candidates_plan.py before and after each
-# move), never inferred from git: the tip is taken as this run's own (and so moved
-# back to the tag) only when the record names it and HEAD is on this run's branch at
-# exactly that commit. Anything else stays "moved by someone else". Nothing from
-# the moved tree runs here. A record that cannot be read, or that says the switch
-# began ("moving") or wrote part of the tree ("partial") while HEAD is not at its
-# target, marks the tree suspect: the rollback then restarts nothing on it.
+# but never adopted. What the engine did is read from its move record, never
+# inferred from git: the tip is taken as this run's own (and so moved back to the
+# tag) only when the record names it and HEAD is on this run's branch at exactly
+# that commit. Anything else stays "moved by someone else". Nothing from the moved
+# tree runs here. The tree is suspect (the rollback then restarts nothing on it)
+# when the record cannot be read, when it says git wrote part of the tree
+# ("partial"), or when it says the switch began ("moving", or "ref") and the
+# two-dot residue toward its target is non-empty: the paths a switch from the tag
+# to it writes, the range update_state_guard.py judges a live row by. A switch
+# that began and wrote nothing leaves the old tip as it was, and it restarts. The
+# record stays in the row: if the rollback keeps the state, every later reader
+# sees it.
 _live_adopt_tip() {
     [ "${ON_LIVE:-0}" = 1 ] && [ "${_LIVE_ENGINE_RAN:-0}" = 1 ] || return 0
-    local rec="${_LIVE_MOVE_REC:-}" got="" to="" phase="" valid=0
-    [ -n "$rec" ] || return 0
-    { [ -e "$rec" ] || [ -L "$rec" ]; } || return 0
-    if got="$(_live_read_move_record)" && [ -n "$got" ]; then
+    local got="" to="" phase="" rc=0 rb="" residue=""
+    got="$(_live_read_move_record)" || rc=$?
+    [ "$rc" -ne 2 ] || return 0
+    if [ "$rc" -eq 0 ] && [ -n "$got" ]; then
         to="${got% *}"
         phase="${got#* }"
-        valid=1
+        if genesis_checkout_unmoved "$GENESIS_ROOT" "$to" "$ORIGINAL_BRANCH"; then
+            [ "$to" != "${UPDATE_OWN_HEAD:-}" ] || return 0
+            echo "  The rebuild had moved live to ${to:0:12} before it stopped; rolling that back."
+            UPDATE_OWN_HEAD="$to"
+            return 0
+        fi
     fi
-    rm -f "$rec" 2>/dev/null || true
-    if [ "$valid" = 1 ] && genesis_checkout_unmoved "$GENESIS_ROOT" "$to" "$ORIGINAL_BRANCH"; then
-        [ "$to" != "${UPDATE_OWN_HEAD:-}" ] || return 0
-        echo "  The rebuild had moved live to ${to:0:12} before it stopped; rolling that back."
-        UPDATE_OWN_HEAD="$to"
-        return 0
-    fi
-    if [ "$valid" != 1 ] || [ "$phase" = moving ] || [ "$phase" = partial ]; then
-        _LIVE_TREE_SUSPECT=1
-        echo "  The rebuild may have written part of the new tree (move record: ${phase:-unreadable}); HEAD is not at its target."
-    fi
+    case "$phase" in
+        moving|ref)
+            rb="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "$ROLLBACK_TAG^{commit}" 2>/dev/null || true)"
+            if [ -n "$rb" ]; then
+                residue="$(genesis_merge_residue "$GENESIS_ROOT" "$rb" "$to" --two-dot)"
+            else
+                residue="(the rollback tag cannot be resolved)"
+            fi
+            [ -n "$residue" ] || return 0
+            ;;
+        partial|"") ;;
+        *) return 0 ;;
+    esac
+    _LIVE_TREE_SUSPECT=1
+    echo "  The rebuild may have written part of the new tree (move record: ${phase:-unreadable}); HEAD is not at its target."
+    [ -z "$residue" ] || printf '%s\n' "$residue" | sed 's/^/    /'
     return 0
 }
 # END live-helpers
@@ -396,7 +426,6 @@ fi
 ON_LIVE=0
 _LIVE_BASE=""
 _LIVE_ENGINE_RAN=0
-_LIVE_MOVE_REC=""
 _LIVE_TREE_SUSPECT=0
 # Nor these, which decide a rollback's checkout lock and exit 4: only this run
 # sets them.
@@ -504,6 +533,22 @@ if [[ "$POST_MERGE" != "true" ]] && { [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE"
     _prior_state_msg="$(python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$STATE_FILE" "$GENESIS_ROOT" 2>&1)" \
         || _prior_state_rc=$?
     if [ "$_prior_state_rc" -ne 10 ]; then
+        echo "REFUSED: ${_prior_state_msg:-$STATE_FILE could not be checked (exit $_prior_state_rc); it is kept.}"
+        echo "         Nothing was changed."
+        exit 5
+    fi
+elif { [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; }; then
+    # --post-merge finishes the merge a state records, but never over a
+    # half-written checkout (the guard's exit 4, main and `live` alike): it would
+    # bootstrap and restart on part of two trees (#3492), and never when the
+    # guard could not say (1 an uncaught failure, 2 a usage error, 126/127 not
+    # runnable). It guards (0), a pending conflict (3) and nothing to guard (10)
+    # are what --post-merge exists to finish. A failure INSIDE the guard's check
+    # (a git call failing or timing out) exits 1, so it refuses here too.
+    _prior_state_rc=0
+    _prior_state_msg="$(python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$STATE_FILE" "$GENESIS_ROOT" 2>&1)" \
+        || _prior_state_rc=$?
+    if [ "$_prior_state_rc" -ne 0 ] && [ "$_prior_state_rc" -ne 3 ] && [ "$_prior_state_rc" -ne 10 ]; then
         echo "REFUSED: ${_prior_state_msg:-$STATE_FILE could not be checked (exit $_prior_state_rc); it is kept.}"
         echo "         Nothing was changed."
         exit 5
@@ -2316,10 +2361,25 @@ with open(sys.argv[11], 'w') as f:
     # (checkout_ok): a rollback that left merged code on disk keeps it, because
     # it is what stops deploy_code_only.sh and the live engine restarting onto
     # that code. The same holds for a --post-merge, whose state it is finishing.
+    # A tree the live rollback marked suspect (part of a rebuild's checkout on
+    # disk) gets the shared guard's own words instead: --post-merge refuses a
+    # half-written tree, so recommending it there would be false (#3492).
+    _kept_msg="" _kept_rc=0
     if [ "$checkout_ok" = "true" ]; then
         rm -f "$STATE_FILE" 2>/dev/null || true
     else
-        echo "  $STATE_FILE is kept as the restart guard: finish with scripts/update.sh --post-merge, or Dismiss it on the dashboard's update card."
+        if [ "${_LIVE_TREE_SUSPECT:-0}" = 1 ]; then
+            _kept_msg="$(python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$STATE_FILE" "$GENESIS_ROOT" 2>&1)" \
+                || _kept_rc=$?
+        fi
+        if [ "$_kept_rc" -eq 4 ] && [ -n "$_kept_msg" ]; then
+            echo "  $STATE_FILE is kept as the restart guard."
+            printf '%s\n' "$_kept_msg" | sed 's/^/  /'
+        elif [ "${_LIVE_TREE_SUSPECT:-0}" = 1 ]; then
+            echo "  $STATE_FILE is kept as the restart guard: the rebuild may have left part of its checkout on disk. Put back the paths the rebuild's message above names (save any edits of yours first), then Dismiss it on the dashboard's update card."
+        else
+            echo "  $STATE_FILE is kept as the restart guard: finish with scripts/update.sh --post-merge, or Dismiss it on the dashboard's update card."
+        fi
     fi
     _clear_deploy_marker
     # END rollback-state-clear
@@ -2711,34 +2771,33 @@ while IFS= read -r _line; do
 done <<< "$_live_status"
 genesis_checkout_unlock
 echo "--- Rebuilding live ---"
-# The engine's move record says how far its move got (live-helpers reads it on a
-# rollback). This run holds update.lock, so a file left there is a dead run's.
-_LIVE_MOVE_REC="${GENESIS_HOME:-$HOME/.genesis}/live_move.json"
-rm -f "$_LIVE_MOVE_REC"
+# The engine records how far its move got as "live_move" in this run's own
+# "merging" row (live-helpers reads it on a rollback; update_state_guard.py and
+# bootstrap's crash recovery read it after a crash), never in a file of its own.
 _LIVE_ENGINE_RAN=1
 _eng_rc=0
 DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE" \
-    DEPLOY_CANDIDATES_OWN_STATE_PID="$$" DEPLOY_CANDIDATES_MOVE_RECORD="$_LIVE_MOVE_REC" \
+    DEPLOY_CANDIDATES_OWN_STATE_PID="$$" \
     python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" rebuild \
     --expect-branch "$ORIGINAL_BRANCH" --expect-head "$UPDATE_OWN_HEAD" || _eng_rc=$?
 # Success must leave the checkout at the exact recorded move, not another
 # actor's valid live tip. An unchanged rebuild writes no record and may retain
-# only the head this updater already owns. Keep the record for rollback until
-# both ownership and rebuild shape have been verified.
+# only the head this updater already owns. The record stays in the row for the
+# rollback until both ownership and rebuild shape have been verified.
 _live_tip=""
 _live_new_base=""
 if [ "$_eng_rc" -eq 0 ]; then
     _live_expected="$UPDATE_OWN_HEAD"
-    if [ -e "$_LIVE_MOVE_REC" ] || [ -L "$_LIVE_MOVE_REC" ]; then
-        if _live_move="$(_live_read_move_record)"; then
-            _live_expected="${_live_move% *}"
-            case "${_live_move#* }" in
-                ref|moving|done) ;; # A failed final receipt write can retain the pre-move phase.
-                *) _eng_rc=1 ;;
-            esac
-        else
-            _eng_rc=1
-        fi
+    _live_rec_rc=0
+    _live_move="$(_live_read_move_record)" || _live_rec_rc=$?
+    if [ "$_live_rec_rc" -eq 0 ]; then
+        _live_expected="${_live_move% *}"
+        case "${_live_move#* }" in
+            ref|moving|done) ;; # A failed final receipt write can retain the pre-move phase.
+            *) _eng_rc=1 ;;
+        esac
+    elif [ "$_live_rec_rc" -ne 2 ]; then
+        _eng_rc=1
     fi
     _live_tip="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'refs/heads/live^{commit}' 2>/dev/null || true)"
     if [ "$_eng_rc" -ne 0 ] || [ -z "$_live_tip" ] || [ "$_live_tip" != "$_live_expected" ] \
@@ -2759,8 +2818,8 @@ fi
 UPDATE_OWN_HEAD="$_live_tip"
 _LIVE_BASE="$_live_new_base"
 DEPLOY_HEAD="$_LIVE_BASE"
+# The row is rewritten without the record: own_head is the tip from here.
 _write_state "merging"
-rm -f "$_LIVE_MOVE_REC"
 _live_new_commit
 echo "  live is at ${_live_tip:0:12} on origin/$DEPLOY_BRANCH ${DEPLOY_HEAD:0:12}."
 # A unit template only the rebuilt tip brings is judged now, by the same checker

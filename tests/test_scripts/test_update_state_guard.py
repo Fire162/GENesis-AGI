@@ -171,14 +171,14 @@ def test_merging_at_the_tag_with_tracked_changes_guards(guard, repo, path):
         _git(repo["root"], "tag", "-f", "pre")
     (repo["root"] / path).write_text("edited\n")
     state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": repo["incoming"]}
-    assert _verdict(guard, repo, state, {"deploy_head": repo["incoming"]}) == "guards"
+    assert _verdict(guard, repo, state, {"deploy_head": repo["incoming"]}) == "mixed_tree"
 
 
 def test_merging_at_the_tag_with_an_added_file_guards(guard, repo):
     """A fast-forward killed after writing only an added file leaves it untracked."""
     (repo["root"] / "b.txt").write_text("b\n")
     state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": repo["incoming"]}
-    assert _verdict(guard, repo, state) == "guards"
+    assert _verdict(guard, repo, state) == "mixed_tree"
 
 
 def test_a_merge_in_progress_guards(guard, repo):
@@ -286,17 +286,21 @@ def _cli(repo, path, env=None) -> subprocess.CompletedProcess:
     )
 
 
-def test_a_check_that_cannot_run_git_guards(repo, tmp_path):
+def test_a_check_that_cannot_run_git_could_not_run(repo, tmp_path):
     """SF-A: git not on PATH used to raise OSError, and Python's exit 1 for an
-    uncaught exception was the old "safe" code."""
+    uncaught exception was the old "safe" code. Now a check that fails partway
+    exits 1, the "could not run" class every caller refuses: a guarding 0
+    would let --post-merge (which finishes a guarding state) go past a
+    half-written tree it never judged (#3492 N1)."""
     path = _state(
         repo, {"phase": "merging", "rollback_tag": "pre", "deploy_head": repo["incoming"]}
     )
     empty = tmp_path / "no-tools"
     empty.mkdir()
     r = _cli(repo, path, env={"PATH": str(empty), "HOME": str(repo["home"])})
-    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.returncode == 1, r.stdout + r.stderr
     assert "could not be checked" in r.stdout and "FileNotFoundError" in r.stdout
+    assert not post_merge_advice(r.stdout), r.stdout
 
 
 def test_a_state_nested_too_deeply_to_parse_guards(repo):
@@ -310,7 +314,7 @@ def test_safe_is_a_code_no_default_failure_produces():
     """Python's uncaught exception (1), a usage error (2) and a shell's cannot-run
     codes (126, 127) must never mean safe."""
     text = GUARD.read_text()
-    assert "EXIT_CODES = {GUARDS: 0, SAFE: 10, CONFLICT_PENDING: 3}" in text
+    assert "EXIT_CODES = {GUARDS: 0, SAFE: 10, CONFLICT_PENDING: 3, MIXED_TREE: 4}" in text
 
 
 def test_a_hung_git_guards_and_returns(guard, repo, tmp_path, monkeypatch):
@@ -334,5 +338,417 @@ def test_a_hung_git_guards_and_returns(guard, repo, tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{hang}:{os.environ['PATH']}")
     monkeypatch.setattr(guard, "_TIMEOUT_S", 0.5, raising=False)
     started = time.monotonic()
-    assert guard.main([str(path), str(repo["root"])]) == guard.EXIT_CODES[guard.GUARDS]
+    assert guard.main([str(path), str(repo["root"])]) == 1
     assert time.monotonic() - started < 10, "the git call was not bounded"
+
+
+# ── a live row: the engine's move record in update.sh's own row (#3492 gap 4) ──
+
+LIB = REPO / "scripts" / "lib"
+
+
+def diverged_live(root: Path, *, tag_only: bool = True) -> dict:
+    """The shape of a normal `live` rebuild (each rebuild is a new merge chain on
+    a new base, so the old and new tips diverge): main0 holds F and A; the old
+    tip (tag `pre`, checked out on `live`) is main0 plus a candidate that deleted
+    F and added O; the new tip is main1 (adds Z) with that candidate gone, so F
+    comes back and O goes. The switch from old to new writes diff(old, new):
+    F and Z; the symmetric old...new names only Z. ``tag_only`` False: no O,
+    so a switch has nothing to delete (it deletes before it writes)."""
+    root.mkdir(parents=True)
+    _git(root, "init", "-q", "-b", "main")
+    (root / "F").write_text("f\n")
+    (root / "A").write_text("a\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "main0")
+    main0 = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-qb", "cand")
+    _git(root, "rm", "-q", "F")
+    if tag_only:
+        (root / "O").write_text("o\n")
+        _git(root, "add", "O")
+    _git(root, "commit", "-qm", "candidate deletes F, adds O")
+    cand = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-q", "--detach", main0)
+    (root / "Z").write_text("z\n")
+    _git(root, "add", "Z")
+    _git(root, "commit", "-qm", "main1")
+    new = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-q", "--detach", main0)
+    _git(root, "merge", "-q", "--no-ff", "--no-edit", cand)
+    old = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-q", "-B", "live", old)
+    _git(root, "tag", "pre", old)
+    two_dot = _git(root, "diff", "--name-only", "--diff-filter=d", old, new).split()
+    assert sorted(two_dot) == ["F", "Z"]
+    assert _git(root, "diff", "--name-only", "--diff-filter=d", f"{old}...{new}").split() == ["Z"]
+    return {"root": root, "old": old, "new": new, "main0": main0}
+
+
+def live_row(d: dict, phase: str = "moving", **over) -> dict:
+    """update.sh's own "merging" row on `live`, with the engine's record."""
+    return {
+        "phase": "merging",
+        "rollback_tag": "pre",
+        "original_branch": "live",
+        "own_head": d["old"],
+        "deploy_head": d["main0"],
+        "post_merge": False,
+        "pid": 2_147_483_647,
+        "live_move": {"to": d["new"], "phase": phase},
+        **over,
+    }
+
+
+@pytest.fixture
+def live(tmp_path: Path) -> dict:
+    d = diverged_live(tmp_path / "repo")
+    d["home"] = tmp_path / "home"
+    d["home"].mkdir()
+    return d
+
+
+def _live_verdict(guard, d: dict, state: dict) -> tuple[str, str]:
+    return guard.verdict(str(_state(d, state)), str(d["root"]))
+
+
+def kill_switch_after(root: Path, new: str, victim: str) -> None:
+    """A real `git switch -C live <new>`, SIGKILLed by a smudge filter on
+    ``victim`` (no sleep: deterministic): every file git writes before it is on
+    disk, nothing after it is, and HEAD, `live` and the index stay put (git
+    moves HEAD last). The stale index.lock a SIGKILL leaves is removed."""
+    (root / ".git" / "info").mkdir(exist_ok=True)
+    (root / ".git" / "info" / "attributes").write_text(f"{victim} filter=killer\n")
+    _git(root, "config", "filter.killer.smudge", "kill -9 $PPID")
+    _git(root, "config", "filter.killer.required", "true")
+    r = subprocess.run(
+        ["git", "-C", str(root), "switch", "--no-overwrite-ignore", "-C", "live", new],
+        capture_output=True,
+        text=True,
+        env=_git_env(),
+    )
+    assert r.returncode != 0, "the switch was not killed"
+    (root / ".git" / "index.lock").unlink(missing_ok=True)
+    (root / ".git" / "info" / "attributes").unlink()
+
+
+def test_t4a_an_added_file_written_by_a_killed_switch_is_a_mixed_tree(guard, live):
+    """T4a: HEAD at the tag, the record says the switch began, and a file the
+    new tip adds is on disk untracked (git status shows nothing)."""
+    (live["root"] / "Z").write_text("z\n")
+    assert _git(live["root"], "status", "--porcelain", "--untracked-files=no") == ""
+    verdict, reason = _live_verdict(guard, live, live_row(live))
+    assert verdict == "mixed_tree", reason
+    r = _cli(live, live["home"] / "update_state.json")
+    assert r.returncode == 4, r.stdout + r.stderr
+    assert "  Z" in r.stdout and "save any you want to keep" in r.stdout, r.stdout
+
+
+def test_t4g_a_path_a_dropped_candidate_had_deleted_is_seen(guard, live):
+    """T4g (S-1): F, which the old tip's candidate deleted and the new tip has
+    again, is what the switch writes; the symmetric range never names it."""
+    (live["root"] / "F").write_text("f\n")
+    verdict, reason = _live_verdict(guard, live, live_row(live))
+    assert verdict == "mixed_tree", reason
+    assert "  F" in reason, reason
+
+
+def test_t4g_a_real_switch_killed_after_its_first_file_is_a_mixed_tree(guard, tmp_path):
+    """T4g, against a real switch: killed on Z, so F (which sorts first) is
+    already written and nothing else is (no tag-only file: git deletes those
+    first, which tracked dirt would show)."""
+    live = diverged_live(tmp_path / "repo", tag_only=False)
+    live["home"] = tmp_path / "home"
+    live["home"].mkdir()
+    root = live["root"]
+    kill_switch_after(root, live["new"], "Z")
+    assert _git(root, "rev-parse", "HEAD") == live["old"], "the kill came after HEAD moved"
+    assert (root / "F").exists() and not (root / "Z").exists(), "the kill did not land after F"
+    assert _git(root, "status", "--porcelain", "--untracked-files=no") == "", "not invisible"
+    verdict, reason = _live_verdict(guard, live, live_row(live))
+    assert verdict == "mixed_tree" and "  F" in reason, reason
+
+
+def test_t4b_a_partial_record_over_a_clean_tree_is_a_mixed_tree(guard, live):
+    verdict, reason = _live_verdict(guard, live, live_row(live, "partial"))
+    assert verdict == "mixed_tree", reason
+
+
+@pytest.mark.parametrize("phase", ["moving", "ref", "clean"])
+def test_t4c_a_record_over_an_untouched_tree_guards_nothing(guard, live, phase):
+    """T4c: the switch began (or git refused cleanly) and wrote nothing."""
+    assert _live_verdict(guard, live, live_row(live, phase))[0] == "safe"
+
+
+def test_a_clean_refusal_is_not_blamed_for_a_file_that_was_already_there(guard, live):
+    """ "clean": the engine compared the tree before and after and git wrote
+    nothing, so an untracked file at a path the tip adds was there before (the
+    reason git refused). A tracked change is then not the move's either: it
+    guards, as a foreign edit always has, but is not a half-written tree."""
+    (live["root"] / "Z").write_text("someone's\n")
+    assert _live_verdict(guard, live, live_row(live, "clean"))[0] == "safe"
+    (live["root"] / "A").write_text("edited\n")
+    assert _live_verdict(guard, live, live_row(live, "clean"))[0] == "guards"
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "x",
+        [],
+        {"to": "e" * 40},
+        {"to": "e" * 39, "phase": "moving"},
+        {"to": "E" * 40, "phase": "moving"},
+        {"to": "e" * 40, "phase": "halfway"},
+        {"to": 7, "phase": "moving"},
+    ],
+    ids=["string", "list", "no-phase", "short", "uppercase", "unknown-phase", "non-string"],
+)
+def test_t4d_a_malformed_record_guards(guard, live, record):
+    state = live_row(live)
+    state["live_move"] = record
+    assert _live_verdict(guard, live, state)[0] == "guards"
+
+
+@pytest.mark.parametrize("phase", ["fetching", "bootstrap", "done"])
+def test_t4e_a_record_under_any_other_phase_guards(guard, live, phase):
+    """The engine writes its record only into the "merging" row, and update.sh's
+    next row drops it: anywhere else it is a hand edit or a writer gone wrong."""
+    state = live_row(live)
+    state["phase"] = phase
+    assert _live_verdict(guard, live, state)[0] == "guards"
+
+
+def test_t4i_a_rollback_killed_midway_back_to_the_tag_is_a_mixed_tree(guard, live):
+    """S18: the move finished (HEAD on `live` at its target), then the rollback's
+    checkout back to the tag was killed after writing O, a file only the tag
+    has: HEAD is still at the target."""
+    root = live["root"]
+    _git(root, "checkout", "-q", "-B", "live", live["new"])
+    assert _live_verdict(guard, live, live_row(live, "done"))[0] == "guards", "control"
+    (root / "O").write_text("o\n")
+    verdict, reason = _live_verdict(guard, live, live_row(live, "done"))
+    assert verdict == "mixed_tree" and "  O" in reason, reason
+
+
+def test_t4f_main_residue_is_a_mixed_tree_for_every_caller(guard, repo):
+    """T4f: main keeps its range (rb...deploy_head), and what used to be the
+    plain GUARDS verdict on it is the new verdict: exit 4, which every caller
+    (exit 10 or not) still refuses."""
+    (repo["root"] / "b.txt").write_text("b\n")
+    state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": repo["incoming"]}
+    assert _verdict(guard, repo, state) == "mixed_tree"
+    r = _cli(repo, repo["home"] / "update_state.json")
+    assert r.returncode == 4 and "b.txt" in r.stdout, r.stdout + r.stderr
+
+
+def post_merge_advice(text: str) -> list[str]:
+    """Every sentence naming --post-merge that does not say it refuses (T4t)."""
+    return [
+        s
+        for s in text.replace("\n", " ").split(". ")
+        if "--post-merge" in s and "NOT" not in s and "refuses" not in s
+    ]
+
+
+def test_t4t_a_mixed_tree_message_never_recommends_post_merge(guard, live):
+    (live["root"] / "Z").write_text("z\n")
+    r = _cli(live, _state(live, live_row(live)))
+    assert r.returncode == 4
+    assert not post_merge_advice(r.stdout), r.stdout
+
+
+def test_t4g_prime_the_two_dot_residue_names_what_the_switch_writes(live):
+    """T4g': the probe, pinned: with F and Z on disk, the two-dot residue lists
+    both, the symmetric (main's) lists only Z."""
+    root = live["root"]
+    (root / "F").write_text("f\n")
+    (root / "Z").write_text("z\n")
+
+    def residue(*extra: str) -> list[str]:
+        r = subprocess.run(
+            [
+                "bash",
+                "-c",
+                '. "$1/deploy_checkout.sh" && genesis_merge_residue "$2" "$3" "$4" ${5:+"$5"}',
+                "t",
+                str(LIB),
+                str(root),
+                live["old"],
+                live["new"],
+                *extra,
+            ],
+            capture_output=True,
+            text=True,
+            env=_git_env(),
+        )
+        assert r.returncode == 0, r.stderr
+        return sorted(r.stdout.split())
+
+    assert residue() == ["Z"]
+    assert residue("--two-dot") == ["F", "Z"]
+
+
+# ── review fixes (#3492 PR C): direction, foreign edits, after adoption ──────
+
+
+def _sentences(text: str) -> list[str]:
+    return [s for s in text.replace("\n", " ").split(". ") if s.strip()]
+
+
+def forward_message_is_true(text: str) -> None:
+    """HEAD on `live` at the rebuilt tip: the remedy finishes FORWARD with
+    --post-merge; it never says not to, and never offers Dismiss without saying
+    the checkout then holds code bootstrap never ran on (SF1)."""
+    assert "finish with scripts/update.sh --post-merge" in text, text
+    assert "Do NOT run" not in text, text
+    for s in _sentences(text):
+        if "Dismiss" in s:
+            assert "bootstrap never ran on" in s, s
+
+
+def test_sf1_a_forward_mixed_tree_is_finished_with_post_merge(guard, live):
+    """SF1: HEAD at the target, a tag-side file written by a rollback killed
+    partway. Restoring to HEAD puts the FORWARD tree back, so the remedy is to
+    finish with --post-merge; a bare Dismiss would drop the only guard against
+    restarting onto code bootstrap never ran on."""
+    _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
+    (live["root"] / "O").write_text("o\n")
+    r = _cli(live, _state(live, live_row(live, "done")))
+    assert r.returncode == 4, r.stdout + r.stderr
+    forward_message_is_true(r.stdout)
+
+
+def test_sf1_a_tag_side_mixed_tree_never_recommends_post_merge(guard, live):
+    (live["root"] / "Z").write_text("z\n")
+    r = _cli(live, _state(live, live_row(live)))
+    assert r.returncode == 4
+    assert not post_merge_advice(r.stdout), r.stdout
+    assert "Dismiss" in r.stdout and "bootstrap never ran on" not in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("at", ["tag", "target"])
+def test_sf2_a_foreign_edit_outside_the_switch_is_not_a_mixed_tree(guard, live, at):
+    """SF2: A is the same in the tag and the target, so no switch between them
+    writes it: an edit there is someone else's, and it guards (as a foreign
+    tracked edit always has) without claiming the tree is half-written."""
+    phase = "moving"
+    if at == "target":
+        _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
+        phase = "done"
+    (live["root"] / "A").write_text("a session's edit\n")
+    verdict, reason = _live_verdict(guard, live, live_row(live, phase))
+    assert verdict == "guards", reason
+
+
+@pytest.mark.parametrize("at", ["tag", "target"])
+def test_sf2_an_edit_on_a_switch_path_is_still_a_mixed_tree(guard, live, at):
+    """Control: O (tag only) and Z (target only) are paths the switch writes."""
+    phase, path = "moving", "O"
+    if at == "target":
+        _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
+        phase, path = "done", "Z"
+    (live["root"] / path).write_text("half\n")
+    verdict, reason = _live_verdict(guard, live, live_row(live, phase))
+    assert verdict == "mixed_tree" and f"  M {path}" in reason, reason
+
+
+def _residue(root: Path, frm: str, to: str, *extra: str) -> str:
+    r = subprocess.run(
+        [
+            "bash",
+            "-c",
+            '. "$1/deploy_checkout.sh" && genesis_merge_residue "$2" "$3" "$4" ${5:+"$5"}',
+            "t",
+            str(LIB),
+            str(root),
+            frm,
+            to,
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        env=_git_env(),
+    )
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def test_sf2_the_two_dot_residue_keeps_only_the_switchs_paths(live):
+    """--two-dot keeps tracked dirt on the switch's own paths only; main's mode
+    still lists every tracked change."""
+    root = live["root"]
+    (root / "A").write_text("foreign\n")
+    (root / "O").write_text("half\n")
+    two_dot = _residue(root, live["old"], live["new"], "--two-dot")
+    assert " M O" in two_dot and " M A" not in two_dot, two_dot
+    assert " M A" in _residue(root, live["old"], live["new"]), "main's mode changed"
+
+
+def _adopted_row(d: dict, **over) -> dict:
+    """update.sh's "merging" row after it adopted the rebuilt tip: the record is
+    gone, own_head is the tip (SF4)."""
+    row = live_row(d, **over)
+    row.pop("live_move")
+    row["own_head"] = d["new"]
+    return row
+
+
+def test_sf4_a_rollback_killed_after_adoption_is_a_mixed_tree(guard, live):
+    """SF4: the rollback after adoption (a units refusal, a failed bootstrap,
+    migrations or health check) was killed partway back to the tag: HEAD at the
+    adopted tip, O (tag only) written. Without the record the row is still a
+    live row, judged toward own_head."""
+    _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
+    (live["root"] / "O").write_text("o\n")
+    verdict, reason = _live_verdict(guard, live, _adopted_row(live))
+    assert verdict == "mixed_tree" and "  O" in reason, reason
+    r = _cli(live, live["home"] / "update_state.json")
+    assert r.returncode == 4
+    forward_message_is_true(r.stdout)
+
+
+def test_sf4_a_clean_adopted_row_reads_as_before(guard, live):
+    """Control: clean at the adopted tip it guards with the same reason as
+    before; back at the tag, clean, it guards nothing."""
+    _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
+    assert _live_verdict(guard, live, _adopted_row(live)) == (
+        "guards",
+        "it merged code bootstrap has not run on",
+    )
+    _git(live["root"], "checkout", "-q", "-B", "live", live["old"])
+    assert _live_verdict(guard, live, _adopted_row(live))[0] == "safe"
+
+
+@pytest.mark.parametrize("tag", ["pre~0", "pre^{commit}", "pre@{0}", "-pre"])
+def test_n2_a_rollback_tag_that_is_not_a_tag_name_guards(guard, repo, tag):
+    """N2: the rollback tag is a NAME, never a revision expression: "pre~0" or
+    "pre^{commit}" would resolve to HEAD and clear a state no real tag clears."""
+    state = {
+        "phase": "fetching",
+        "rollback_tag": tag,
+        "deploy_head": repo["incoming"],
+        "post_merge": False,
+    }
+    assert _verdict(guard, repo, state) == "guards"
+    state["rollback_tag"] = "pre"
+    assert _verdict(guard, repo, state) == "safe", "control: the tag by its name"
+
+
+def test_n5_control_characters_in_a_path_never_reach_the_terminal(guard, repo):
+    """N5: residue paths are printed to terminals and into the supervising
+    session's summary; an ESC or a tab in a file name is shown as "?"."""
+    name = "e\x1bvil\tname.txt"
+    root = repo["root"]
+    (root / name).write_text("x\n")
+    _git(root, "add", "--", name)
+    _git(root, "commit", "-qm", "incoming with an odd name")
+    incoming = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", "pre")
+    (root / name).write_text("x\n")
+    state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
+    verdict, reason = guard.verdict(str(_state(repo, state)), str(root))
+    assert verdict == "mixed_tree", reason
+    assert "e?vil?name.txt" in reason, reason
+    bad = [c for c in reason if (ord(c) < 0x20 and c != "\n") or ord(c) == 0x7F]
+    assert not bad, repr(reason)

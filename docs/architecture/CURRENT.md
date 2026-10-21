@@ -3461,7 +3461,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 96e0a4de31a8 2026-10-18
+verified: 002d84054 2026-10-21
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3951,23 +3951,42 @@ tool-disabled CC probe without changing its schedule or routing authority.
   update that merged code and never activated it, or that stopped on merge
   conflicts, leaves it behind. Whether it still guards is ONE rule,
   `scripts/lib/update_state_guard.py` (stdlib; `safe` / `guards` /
-  `conflict_pending`, plus the remedy text): a "done" state, a plain run's
-  "fetching" at its rollback tag, and a "merging" at the tag with no merge
-  residue and no recorded conflict guard nothing; anything unreadable guards.
-  `deploy_code_only.sh` and the live engine refuse to restart or move the
-  checkout while it guards; a plain `update.sh` exits 5 (before tagging or
-  writing anything), and the dashboard's `/apply` answers 409 on both paths;
-  `--post-merge` is the run that finishes it. Only the run that wrote the file
-  deletes it on its exits (never a `--post-merge`, never a run that had not
-  written yet), a rollback that left merged code keeps it, and bootstrap's
-  crash recovery keeps a pending conflict. The dashboard's progress poll is
-  read-only: it reports the verdict and offers Dismiss, the one retirement by
-  hand. The merge-residue check is shared with bootstrap
-  (`genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`). One exception
+  `conflict_pending` / `mixed_tree`, plus the remedy text): a "done" state, a
+  plain run's "fetching" at its rollback tag, and a "merging" at the tag with no
+  merge residue and no recorded conflict guard nothing; anything unreadable
+  guards. Merge residue at the tag is `mixed_tree` (exit 4): a half-written
+  checkout, whose message lists the paths and says to save, restore and
+  Dismiss. A "merging" row carrying the live engine's move record
+  (`live_move`, #3492) is judged by the TWO-DOT diff a `git switch` writes
+  (the old and new `live` tips diverge, so main's symmetric range would miss
+  what a dropped candidate had deleted), toward the record's target with HEAD
+  at the tag, and back toward the tag with HEAD at the target (a rollback
+  checkout killed partway); only tracked changes on the switch's own paths
+  count there, one anywhere else guarding as someone else's edit. A "merging"
+  row on `live` whose record update.sh already dropped (it adopted the tip,
+  own_head is that tip) is judged the same way toward own_head, so a rollback
+  killed partway after adoption is caught too. The remedy follows HEAD: at the
+  tag, put the paths back and Dismiss; at the rebuilt tip, put them back and
+  finish with `--post-merge` (Dismissing there leaves code bootstrap never ran
+  on). The dashboard's progress poll returns the guard's remedy
+  (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
+  restart or move the checkout while it guards; a plain `update.sh` exits 5
+  (before tagging or writing anything), and the dashboard's `/apply` answers
+  409 on both paths; `--post-merge` is the run that finishes it, except over a
+  `mixed_tree`, or when the guard could not run, which it refuses (exit 5, main and `live` alike). Only the run
+  that wrote the file deletes it on its exits (never a `--post-merge`, never a
+  run that had not written yet), a rollback that left merged code keeps it, and
+  bootstrap's crash recovery keeps a pending conflict. Bootstrap's crash
+  recovery treats a held update.lock as a running update (an orphaned engine
+  keeps update.sh's fd), and at the tag in "merging" it goes on only on the
+  guard's exit 10, printing the guard's message otherwise. The dashboard's
+  progress poll is read-only: it reports the verdict and offers Dismiss, the
+  one retirement by hand. The residue check is `genesis_merge_residue` in
+  `scripts/lib/deploy_checkout.sh` (`--two-dot` for a live row). One exception
   in the engine: the "merging" row of the `update.sh` that is running the
   rebuild (its pid named in `DEPLOY_CANDIDATES_OWN_STATE_PID`, equal to the
   engine's parent, update.lock handed over, a plain run) is neither refused nor
-  retired.
+  retired; a run that names a pid whose row is not that run's own refuses.
 - **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
   is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
   rebuild`, the `live-engine` block). Everything else is main's path: one DB
@@ -3998,11 +4017,13 @@ tool-disabled CC probe without changing its schedule or routing authority.
   main while `live` already sat at the tip is not seen: git logs nothing
   then). A tracked edit in that last window, before git takes index.lock, is
   not warned about. What the engine did to the checkout is read
-  from its move record (`DEPLOY_CANDIDATES_MOVE_RECORD`, here
-  `~/.genesis/live_move.json`: `{"to", "phase"}` with phase `ref` / `moving` /
-  `partial` / `clean` / `done`, written by `deploy_candidates_plan.py` before and
-  after the move; a record that cannot be written before the move refuses it),
-  never inferred from git: a moved checkout is adopted only when HEAD is on
+  from its move record (`live_move` in update.sh's own "merging" row:
+  `{"to", "phase"}` with phase `ref` / `moving` / `partial` / `clean` / `done`,
+  written by the engine before and after the move, durably (fsynced) before it,
+  and only while the row is still that run's own; a record that cannot be
+  written before the move refuses it; the row outlives the run, so a crash
+  leaves it for every reader; the old `~/.genesis/live_move.json` side file is
+  retired and removed by the next engine run), never inferred from git: a moved checkout is adopted only when HEAD is on
   `live` at exactly the commit the record names, then moved back to the
   rollback tag with its git hooks restored (`restore-hooks`), and the services
   restart on the old tip. `restore-hooks` exits 1 when a hook could not be
@@ -4011,10 +4032,13 @@ tool-disabled CC probe without changing its schedule or routing authority.
   installed byte-identical and executable (readiness's own check,
   `hook_install_failures` in `deploy_candidates_gate.py`), a hand-edited hook
   included; the rollback then reports itself incomplete (a rebuild or drop,
-  past its commit point, only warns). A record that cannot be read, or that
-  says the switch began or wrote part of the tree while HEAD is not at its
-  target, means a possibly mixed working tree: nothing is restarted and the
-  rollback reports itself incomplete. Exit 4 after such a rollback needs it to
+  past its commit point, only warns). A record that cannot be read, that says
+  git wrote part of the tree, or that says the switch began while the two-dot
+  residue toward its target is non-empty (HEAD not at the target) means a
+  possibly mixed working tree: nothing is restarted, the rollback reports
+  itself incomplete, the state is kept with its record, and the guard's
+  `mixed_tree` message is printed. A switch that began and wrote nothing
+  restarts the old tip. Exit 4 after such a rollback needs it to
   have completed, hook restore, every service restart and a restarted
   genesis-server answering its health endpoint included; that health wait (up
   to 180 s) runs only on the units-refusal path that can exit 4, inside the

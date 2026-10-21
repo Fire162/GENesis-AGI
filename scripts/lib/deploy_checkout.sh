@@ -193,8 +193,24 @@ genesis_untracked_node() {
 # Prints the colliding paths, one per line. Returns 0 when there are none, 1 when
 # there are, 2 when the range cannot be listed.
 genesis_range_collisions() {
-    local root="$1" from="$2" to="$3" collisions="" f p t
-    git -C "$root" diff --no-renames --name-only --diff-filter=d "$from...$to" >/dev/null 2>&1 \
+    _genesis_diff_collisions "$1" "$2...$3"
+}
+
+# The same scan over the TWO-DOT diff <from> <to>: exactly the paths a checkout
+# (`git switch`) from <from> to <to> writes, which is what a killed switch can
+# have left behind. On `live` the old and new tips diverge (each rebuild is a new
+# merge chain on a new base), and the symmetric range above then misses every
+# path the new tip has back that a dropped candidate had deleted (MEASURED, git
+# 2.43: old...new named only the main-side addition; old new named both).
+genesis_two_dot_collisions() {
+    _genesis_diff_collisions "$1" "$2" "$3"
+}
+
+# The walk both share; arguments after <root> are the diff's revisions.
+_genesis_diff_collisions() {
+    local root="$1" collisions="" f p t
+    shift
+    git -C "$root" diff --no-renames --name-only --diff-filter=d "$@" >/dev/null 2>&1 \
         || return 2
     # A path in the index can never collide, and the second scan runs while the
     # server is stopped, so the index is read ONCE and those paths skip the two
@@ -220,7 +236,7 @@ genesis_range_collisions() {
                 break
             fi
         done
-    done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "$from...$to" 2>/dev/null)
+    done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "$@" 2>/dev/null)
     printf '%s' "$collisions"
     [ -z "$collisions" ]
 }
@@ -235,15 +251,46 @@ genesis_range_collisions() {
 # well. A fast-forward killed after writing only the files the range ADDS leaves
 # them untracked, which status cannot show; update.sh's pre-stop scan refuses a
 # range that lands on an existing untracked path, so one present now appeared
-# during the run (<deploy_head> empty: not checked). Shared by bootstrap.sh's
-# crash recovery and scripts/lib/update_state_guard.py, so the two agree.
+# during the run (<deploy_head> empty: not checked). With a fourth argument
+# --two-dot, the files checked are the two-dot diff <rb_commit> <deploy_head>
+# (genesis_two_dot_collisions): what a `git switch` between the two writes, the
+# range every residue check on a `live` row uses (#3492); <rb_commit> is then
+# whichever end HEAD is at. Without it, main's merge range (rb...deploy_head).
+# Read by scripts/lib/update_state_guard.py (the one rule bootstrap.sh's crash
+# recovery, update.sh, deploy_code_only.sh, the live engine and the dashboard
+# ask) and by update.sh's live rollback.
 genesis_merge_residue() {
-    local root="$1" rb_commit="$2" deploy_head="$3" dirty="" hidden="" new="" rc=0
+    local root="$1" rb_commit="$2" deploy_head="$3" mode="${4:-}" dirty="" hidden="" new="" rc=0
     dirty="$(git -C "$root" status --porcelain --untracked-files=no --no-renames 2>/dev/null)" \
         || dirty="(status unreadable)"
     hidden="$(_genesis_hidden_dirty_lines "$root" 2>/dev/null)" \
         || hidden="(flagged-entry status unreadable)"
-    if [ -n "$deploy_head" ]; then
+    if [ -n "$deploy_head" ] && [ "$mode" = --two-dot ]; then
+        # A switch writes only diff(<rb_commit>, <deploy_head>), so tracked dirt
+        # anywhere else is not its doing (another session's edit, which the
+        # caller judges on its own): only lines on the switch's paths are
+        # residue. Read NUL-separated, renames off, so a path is one record and
+        # never quoted. A range that cannot be listed keeps every line.
+        local -A moved=()
+        local p rec kept=""
+        if git -C "$root" diff --no-renames --name-only "$rb_commit" "$deploy_head" >/dev/null 2>&1 \
+            && [ "$dirty" != "(status unreadable)" ]; then
+            while IFS= read -r -d '' p; do
+                moved["$p"]=1
+            done < <(git -C "$root" diff -z --no-renames --name-only "$rb_commit" "$deploy_head" 2>/dev/null)
+            while IFS= read -r -d '' rec; do
+                if [ -n "${moved[${rec:3}]:-}" ]; then kept+="$rec"$'\n'; fi
+            done < <(git -C "$root" status --porcelain -z --untracked-files=no --no-renames 2>/dev/null)
+            dirty="$kept"
+            kept=""
+            while IFS= read -r rec; do
+                if [ -n "$rec" ] && [ -n "${moved[${rec:3}]:-}" ]; then kept+="$rec"$'\n'; fi
+            done <<< "$hidden"
+            case "$hidden" in "("*) ;; *) hidden="$kept" ;; esac
+        fi
+        new="$(genesis_two_dot_collisions "$root" "$rb_commit" "$deploy_head" 2>/dev/null)" || rc=$?
+        [ "$rc" -ne 2 ] || new="(the checkout's range cannot be listed)"
+    elif [ -n "$deploy_head" ]; then
         new="$(genesis_range_collisions "$root" "$rb_commit" "$deploy_head" 2>/dev/null)" || rc=$?
         [ "$rc" -ne 2 ] || new="(the update's incoming range cannot be listed)"
     fi

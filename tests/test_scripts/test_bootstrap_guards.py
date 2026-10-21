@@ -15,7 +15,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -729,6 +731,19 @@ def _assert_recovery_refused(proc: subprocess.CompletedProcess, state_path: Path
     assert state_path.exists(), "a refusal must retain update state"
 
 
+def _assert_refused_half_written(proc: subprocess.CompletedProcess, state_path: Path) -> None:
+    """A merging-phase refusal at the tag: the shared guard's half-written
+    verdict (#3492), whose message is the remedy (save, restore, Dismiss) and
+    says --post-merge refuses; the generic advice to finish forward is not added."""
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "REFUSE:" in output, output
+    assert "Current branch/HEAD:" in output and "holds part of an update's checkout" in output
+    assert "save any you want to keep" in output and "Dismiss" in output, output
+    assert "Do NOT run scripts/update.sh --post-merge" in output, output
+    assert "finish forward with" not in output, output
+    assert state_path.exists(), "a refusal must retain update state"
+
+
 def _assert_recovered(
     proc: subprocess.CompletedProcess, state_path: Path, root: Path, rollback: str
 ) -> None:
@@ -1011,8 +1026,7 @@ def test_recovery_warns_at_tag_or_skips_a_live_process(
         return
     if phase == "merging":
         # Refuse a dirty checkout at the rollback tag after an interrupted merge.
-        _assert_recovery_refused(proc, state_path)
-        assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+        _assert_refused_half_written(proc, state_path)
         assert _recovery_git(root, "rev-parse", "HEAD") == rollback
         assert local.read_text() == "operator edit\n"
         return
@@ -1036,8 +1050,7 @@ def test_a_merge_killed_writing_only_an_ephemeral_path_is_refused(tmp_path, phas
     (root / "AGENTS.md").write_text("index v2, half writ")
     proc, state_path = _recover(tmp_path, root, phase=phase, own_head="")
     if phase == "merging":
-        _assert_recovery_refused(proc, state_path)
-        assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+        _assert_refused_half_written(proc, state_path)
         assert "AGENTS.md" in proc.stdout + proc.stderr
     else:
         _assert_recovered(proc, state_path, root, rollback)
@@ -1070,8 +1083,7 @@ def test_a_merge_killed_writing_a_flagged_path_is_refused(tmp_path, flag):
     (root / "changed.txt").write_text("half-written by the merge\n")
     assert _recovery_git(root, "status", "--porcelain") == ""  # really hidden
     proc, state_path = _recover(tmp_path, root, phase="merging", own_head="")
-    _assert_recovery_refused(proc, state_path)
-    assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+    _assert_refused_half_written(proc, state_path)
     assert "changed.txt" in proc.stdout + proc.stderr
     assert _recovery_git(root, "rev-parse", "HEAD") == rollback
 
@@ -1142,7 +1154,7 @@ def test_a_merge_killed_after_writing_only_new_files_is_refused(tmp_path):
     proc, state_path = _recover(
         tmp_path, root, phase="merging", own_head="", deploy_head=deploy
     )
-    _assert_recovery_refused(proc, state_path)
+    _assert_refused_half_written(proc, state_path)
     assert "migrations/0099_new.py" in proc.stdout + proc.stderr
     assert _recovery_git(root, "rev-parse", "HEAD") == rollback
 
@@ -1317,3 +1329,214 @@ def test_a_crash_recovered_twice_from_the_same_state_is_recorded_once(tmp_path):
     other, _ = _recover(tmp_path, root, **{**run, "started_at": "2026-10-18T21:00:00+00:00"})
     assert other.returncode == 0, other.stderr
     assert len(_history(db)) == 2
+
+
+# ── a live row's move record, and the shared guard (#3492 gap 4) ───────────────
+
+
+def _guard_tests():
+    # Imported here: test_update_state_guard imports nothing from this module,
+    # but keep the dependency one-way and lazy.
+    from tests.test_scripts import test_update_state_guard as g
+
+    return g
+
+
+def _recover_with(
+    tmp_path: Path,
+    root: Path,
+    state: dict,
+    *,
+    scripts: Path | None = None,
+) -> tuple[subprocess.CompletedProcess, Path]:
+    """The crash-recovery block over ``state``, as _recover runs it, with
+    GENESIS_HOME unset (update.lock is then under HOME) and, optionally, another
+    scripts directory (a stub guard)."""
+    home = tmp_path / "home"
+    path = home / ".genesis" / "update_state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state))
+    script = (
+        '#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR="${RECOVERY_SCRIPTS:?}"\n'
+        'GENESIS_ROOT="${RECOVERY_ROOT:?}"\nUPDATE_STATE="$HOME/.genesis/update_state.json"\n'
+        '. "$SCRIPT_DIR/lib/deploy_marker.sh"\n. "$SCRIPT_DIR/lib/deploy_checkout.sh"\n'
+        '. "$SCRIPT_DIR/lib/deploy_recovery.sh"\nEPHEMERAL_BACKUP_ROOT="${TEST_BACKUP_ROOT:?}"\n'
+        + _crash_recovery_source()
+    )
+    env = _recovery_env(
+        HOME=str(home),
+        RECOVERY_SCRIPTS=str(scripts or REPO_ROOT / "scripts"),
+        RECOVERY_ROOT=str(root),
+        TEST_BACKUP_ROOT=str(home / ".genesis" / "premerge-backups" / "test-run"),
+    )
+    env.pop("GENESIS_HOME", None)
+    proc = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=60, env=env
+    )
+    return proc, path
+
+
+def _live_state(d: dict, phase: str = "moving", **over) -> dict:
+    g = _guard_tests()
+    return {**g.live_row(d, phase), **over}
+
+
+def test_t4h_a_live_switch_killed_after_a_dropped_candidates_path_is_refused(tmp_path):
+    """T4h (S5a): HEAD at the tag, the record "moving", and F on disk (the path
+    a dropped candidate had deleted, which only the two-dot range names).
+    Recovery used to delete the state and continue: now it refuses, keeps the
+    state and touches nothing."""
+    g = _guard_tests()
+    d = g.diverged_live(tmp_path / "repo")
+    (d["root"] / "F").write_text("f\n")
+    proc, path = _recover_with(tmp_path, d["root"], _live_state(d))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "REFUSE:" in out, out
+    assert "  F" in out and path.exists(), out
+    assert _recovery_git(d["root"], "rev-parse", "HEAD") == d["old"]
+    assert (d["root"] / "F").read_text() == "f\n"
+    assert not g.post_merge_advice(out), out
+
+
+def test_t4g_bootstrap_refuses_a_real_diverged_switch_kill(tmp_path):
+    """T4g, bootstrap: the same over a real `git switch` SIGKILLed after F."""
+    g = _guard_tests()
+    d = g.diverged_live(tmp_path / "repo", tag_only=False)
+    g.kill_switch_after(d["root"], d["new"], "Z")
+    proc, path = _recover_with(tmp_path, d["root"], _live_state(d))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "  F" in out and path.exists(), out
+
+
+def test_t4i_a_rollback_killed_midway_back_to_the_tag_is_refused_with_the_guards_remedy(
+    tmp_path,
+):
+    """T4i (S18): HEAD on `live` at the rebuilt tip, a tag-only file written by
+    a rollback checkout killed partway. The guard's message, and nothing else:
+    put the paths back, then finish forward (HEAD is the tip, SF1); never the
+    generic line, and never a bare Dismiss."""
+    g = _guard_tests()
+    d = g.diverged_live(tmp_path / "repo")
+    _recovery_git(d["root"], "checkout", "-q", "-B", "live", d["new"])
+    (d["root"] / "O").write_text("o\n")
+    proc, path = _recover_with(tmp_path, d["root"], _live_state(d, "done"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "REFUSE:" in out and path.exists(), out
+    assert "  O" in out and "save any you want to keep" in out, out
+    assert "finish forward with" not in out, "the generic remedy was added"
+    g.forward_message_is_true(out)
+
+
+def test_t4j_a_finished_live_move_is_told_to_finish_with_post_merge(tmp_path):
+    """T4j: HEAD on `live` at the rebuilt tip, nothing else written: the live
+    text (finish forward), not "the checkout is not at the merge it recorded"."""
+    g = _guard_tests()
+    d = g.diverged_live(tmp_path / "repo")
+    _recovery_git(d["root"], "checkout", "-q", "-B", "live", d["new"])
+    proc, path = _recover_with(tmp_path, d["root"], _live_state(d, "done"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and path.exists(), out
+    assert "the update ran on live" in out and "rebuilt tip" in out, out
+    assert "scripts/update.sh --post-merge" in out, out
+
+
+def _stub_scripts(tmp_path: Path, rc: int) -> Path:
+    """scripts/lib as shipped, with update_state_guard.py replaced by a stub that
+    prints a line and exits ``rc`` (a guard that crashed or could not run)."""
+    scripts = tmp_path / "stub-scripts"
+    shutil.copytree(REPO_ROOT / "scripts" / "lib", scripts / "lib")
+    (scripts / "lib" / "update_state_guard.py").write_text(
+        f"import sys\nprint('STUB GUARD SAID THIS')\nsys.exit({rc})\n"
+    )
+    return scripts
+
+
+@pytest.mark.parametrize("rc", [0, 1, 2, 4, 126, 127])
+def test_t4k_recovery_at_the_tag_proceeds_only_on_the_guards_exit_10(tmp_path, rc):
+    """T4k (S-3): at the tag in "merging", bootstrap delegates to the shared
+    guard and proceeds ONLY on its exit 10; any other code, a crash (1), a usage
+    error (2) or a shell that could not run it (126, 127) included, refuses and
+    prints what the guard said (deploy_code_only.sh's rule)."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    state = {
+        "phase": "merging",
+        "rollback_tag": "rollback",
+        "original_branch": "main",
+        "own_head": "",
+        "deploy_head": "",
+        "pid": 2_147_483_647,
+    }
+    proc, path = _recover_with(tmp_path, root, state, scripts=_stub_scripts(tmp_path, rc))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "REFUSE:" in out, out
+    assert "STUB GUARD SAID THIS" in out and path.exists(), out
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_t4k_control_the_guards_exit_10_proceeds(tmp_path):
+    root, _common, rollback = _recovery_repo(tmp_path)
+    state = {
+        "phase": "merging",
+        "rollback_tag": "rollback",
+        "original_branch": "main",
+        "own_head": "",
+        "deploy_head": "",
+        "pid": 2_147_483_647,
+    }
+    proc, path = _recover_with(tmp_path, root, state, scripts=_stub_scripts(tmp_path, 10))
+    assert proc.returncode == 0 and not path.exists(), proc.stdout + proc.stderr
+
+
+def test_t4l_an_update_lock_still_held_means_still_running(tmp_path):
+    """T4l (S-5): the state's pid is dead, but update.lock is held (an orphaned
+    engine keeps update.sh's fd): the update is still running, possibly mid
+    switch, so recovery does nothing and keeps the state."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    lock = home / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "120"])
+    try:
+        deadline = time.monotonic() + 30
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            assert time.monotonic() < deadline, "the holder never took the lock"
+            time.sleep(0.05)
+        state = {
+            "phase": "merging",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": 2_147_483_647,
+        }
+        proc, path = _recover_with(tmp_path, root, state)
+    finally:
+        holder.kill()
+        holder.wait()
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0 and "update.lock" in out and "not interfering" in out, out
+    assert path.exists() and _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_t4l_control_a_free_update_lock_recovers(tmp_path):
+    """Control: the lock file exists and nobody holds it; bootstrap never
+    creates it when it is absent."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    lock = home / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    state = {
+        "phase": "merging",
+        "rollback_tag": "rollback",
+        "original_branch": "main",
+        "own_head": "",
+        "deploy_head": "",
+        "pid": 2_147_483_647,
+    }
+    proc, path = _recover_with(tmp_path, root, state)
+    assert proc.returncode == 0 and not path.exists(), proc.stdout + proc.stderr
+    lock.unlink()
+    proc, path = _recover_with(tmp_path, root, state)
+    assert proc.returncode == 0 and not lock.exists(), proc.stdout + proc.stderr

@@ -19,11 +19,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from tests.test_scripts.test_update_state_guard import diverged_live, live_row, post_merge_advice
 
 REPO = Path(__file__).resolve().parents[2]
 UPDATE = REPO / "scripts" / "update.sh"
@@ -280,3 +283,128 @@ def test_a_rollback_keeps_the_state_when_merged_code_stayed(world, checkout_ok, 
     assert world["state"].exists() is kept
     if kept:
         assert "restart guard" in r.stdout
+
+
+# ── --post-merge over a half-written checkout (#3492) ───────────────────────────
+
+
+def test_t4s_post_merge_refuses_a_half_written_tree_on_main(world):
+    """T4s: a merge killed after writing only a file it adds (HEAD at the tag,
+    the file untracked): --post-merge would bootstrap and restart on part of two
+    trees, so it refuses (exit 5) with the guard's message, and keeps the state."""
+    root = world["root"]
+    (root / "b.txt").write_text("b\n")
+    _git(root, "add", "b.txt")
+    _git(root, "commit", "-qm", "incoming")
+    incoming = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", "pre")
+    (root / "b.txt").write_text("b\n")
+    world["state"].write_text(
+        json.dumps({"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming})
+    )
+    before = world["state"].read_bytes()
+    r = _guard_run(world, post_merge=True)
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+    assert "b.txt" in r.stdout and not post_merge_advice(r.stdout), r.stdout
+    assert world["state"].read_bytes() == before
+
+
+def _live_world(tmp_path: Path) -> tuple[dict, dict]:
+    d = diverged_live(tmp_path / "repo")
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    w = {"root": d["root"], "home": home, "state": home / ".genesis" / "update_state.json"}
+    return d, w
+
+
+def test_t4s_post_merge_refuses_a_half_written_tree_on_live(tmp_path):
+    """T4s on `live`: the switch was killed after writing F, which only the
+    two-dot range names."""
+    d, w = _live_world(tmp_path)
+    (d["root"] / "F").write_text("f\n")
+    w["state"].write_text(json.dumps(live_row(d)))
+    r = _guard_run(w, post_merge=True)
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+    assert "  F" in r.stdout and not post_merge_advice(r.stdout), r.stdout
+
+
+def test_post_merge_still_finishes_a_live_move_that_completed(tmp_path):
+    """Control: the move finished (HEAD on `live` at its target, nothing else
+    written). That guards, and --post-merge is what finishes it."""
+    d, w = _live_world(tmp_path)
+    _git(d["root"], "checkout", "-q", "-B", "live", d["new"])
+    w["state"].write_text(json.dumps(live_row(d, "done")))
+    r = _guard_run(w, post_merge=True)
+    assert r.returncode == 0 and "PASSED_GUARD" in r.stdout, r.stdout + r.stderr
+
+
+def test_sf4_post_merge_refuses_a_rollback_killed_after_adoption(tmp_path):
+    """SF4: after update.sh adopted the rebuilt tip (record gone, own_head the
+    tip), its rollback was killed partway back to the tag. --post-merge would
+    install over that tree, so it refuses."""
+    d, w = _live_world(tmp_path)
+    _git(d["root"], "checkout", "-q", "-B", "live", d["new"])
+    (d["root"] / "O").write_text("o\n")
+    row = live_row(d)
+    row.pop("live_move")
+    row["own_head"] = d["new"]
+    w["state"].write_text(json.dumps(row))
+    r = _guard_run(w, post_merge=True)
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+    assert "  O" in r.stdout, r.stdout
+
+
+def _stub_guard(tmp_path: Path, rc: int) -> Path:
+    scripts = tmp_path / "stub-scripts"
+    (scripts / "lib").mkdir(parents=True)
+    (scripts / "lib" / "update_state_guard.py").write_text(
+        f"import sys\nprint('STUB GUARD SAID THIS')\nsys.exit({rc})\n"
+    )
+    return scripts
+
+
+@pytest.mark.parametrize("rc", [1, 2, 4, 126, 127])
+def test_post_merge_refuses_when_the_guard_could_not_run(world, tmp_path, rc):
+    """NOTE 5: 1, 2, 126 and 127 mean the guard crashed or could not run, so
+    --post-merge cannot know the tree is whole; it refuses with what the guard
+    said (exit 4: the half-written verdict)."""
+    world["state"].write_text(json.dumps({"phase": "bootstrap", "rollback_tag": "pre"}))
+    r = _guard_run(world, post_merge=True, scripts=_stub_guard(tmp_path, rc))
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+    assert "STUB GUARD SAID THIS" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("rc", [0, 3, 10])
+def test_post_merge_finishes_what_the_guard_judged(world, tmp_path, rc):
+    """Control: guards (0), a pending conflict (3) and nothing to guard (10) are
+    what --post-merge exists to finish."""
+    world["state"].write_text(json.dumps({"phase": "bootstrap", "rollback_tag": "pre"}))
+    r = _guard_run(world, post_merge=True, scripts=_stub_guard(tmp_path, rc))
+    assert r.returncode == 0 and "PASSED_GUARD" in r.stdout, r.stdout + r.stderr
+
+
+def test_n1_post_merge_refuses_a_guard_whose_check_failed(world, tmp_path):
+    """N1: the real guard, with git unrunnable inside its check (python3 and
+    bash are reachable, git is not): it could not judge the tree, so it exits
+    1, and --post-merge refuses instead of finishing a state it never judged."""
+    # "merging" at the tag: judging it needs git (a "bootstrap" row guards on
+    # its phase alone and would never reach the failing call).
+    world["state"].write_text(
+        json.dumps({"phase": "merging", "rollback_tag": "pre", "deploy_head": world["head"]})
+    )
+    bin_ = tmp_path / "no-git-bin"
+    bin_.mkdir()
+    for tool in ("python3", "bash"):
+        (bin_ / tool).symlink_to(shutil.which(tool))
+    script = (
+        "set -Eeuo pipefail\n"
+        f'GENESIS_ROOT="{world["root"]}"\nSCRIPT_DIR="{REPO / "scripts"}"\n'
+        f'STATE_FILE="{world["state"]}"\nPOST_MERGE=true\n'
+        + _block("prior-state-guard")
+        + "echo PASSED_GUARD\n"
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "GENESIS_"))}
+    env.update(HOME=str(world["home"]), PATH=str(bin_))
+    r = subprocess.run([str(bin_ / "bash"), "-c", script], capture_output=True, text=True, env=env)
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+    assert "could not be checked" in r.stdout, r.stdout
