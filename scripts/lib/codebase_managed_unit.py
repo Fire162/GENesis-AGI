@@ -338,6 +338,52 @@ def parent_identity(path: Path):
     return value.st_dev, value.st_ino
 
 
+def _writable_path(path: Path, *, directory: bool, readable: bool = False) -> None:
+    """Observe this caller's namespace without creating a probe or directory."""
+    target = path
+    while True:
+        try:
+            info = target.stat()
+            break
+        except FileNotFoundError:
+            if target.is_symlink() or target == target.parent:
+                raise
+            target = target.parent
+    if (directory or target != path) and not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"managed worker requires a directory: {path}")
+    if target == path and not directory and not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"managed worker requires a regular file: {path}")
+    permission = os.W_OK | (os.X_OK if stat.S_ISDIR(info.st_mode) else 0)
+    if readable and target == path:
+        permission |= os.R_OK
+    if (os.statvfs(target).f_flag & os.ST_RDONLY
+            or not os.access(target, permission, effective_ids=True)):
+        raise ValueError(
+            f"managed worker write path unavailable: {path}; check permissions and the "
+            "runner's operator-owned ReadWritePaths allowlist"
+        )
+
+
+def verify_worker_writes(config: dict, persistence: bool) -> None:
+    """Advisory write prerequisites; real IO failures retain their classification."""
+    state = absolute(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
+    cache = Path(config["cache"])
+    queue = state / "index-requests"
+    for path in (Path(config["runtime"]), state / "locks"):
+        _writable_path(path, directory=True)
+    for path in (cache, queue):
+        _writable_path(path, directory=True, readable=True)
+    _writable_path(state / "code-intelligence-runner.log", directory=False)
+    for database in (queue / "queue.sqlite3", *cache.glob("*.db")):
+        if database.name == "_config.db":
+            continue  # immutable configuration is validated through the RO reader
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            _writable_path(Path(str(database) + suffix), directory=False, readable=True)
+    if persistence:
+        _writable_path(Path("/tmp"), directory=True)  # noqa: S108 - observe pinned root; no creation
+        _writable_path(Path(config["main"]) / ".codebase-memory", directory=True)
+
+
 def absolute(raw: str) -> Path:
     if not isinstance(raw, str) or not raw or any(c in raw for c in "\n\r\x00"):
         raise ValueError("invalid managed path")
@@ -349,6 +395,13 @@ def absolute(raw: str) -> Path:
 
 def units_dir() -> Path:
     return Path.home() / ".config/systemd/user"
+
+
+def first_existing_parent(path: Path) -> Path:
+    parent = path.parent
+    while not parent.exists():
+        parent = parent.parent
+    return parent
 
 
 def config_path(raw: str) -> Path:
@@ -515,52 +568,6 @@ def verify_binary_access(fd: int, *, execute: bool) -> None:
     if (not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111
             or (execute and not os.access(f"/proc/self/fd/{fd}", os.X_OK, effective_ids=True))):
         raise ValueError("managed binary must be a regular executable")
-
-
-def _writable_path(path: Path, *, directory: bool, readable: bool = False) -> None:
-    """Observe this caller's namespace without creating a probe or directory."""
-    target = path
-    while True:
-        try:
-            info = target.stat()
-            break
-        except FileNotFoundError:
-            if target.is_symlink() or target == target.parent:
-                raise
-            target = target.parent
-    if (directory or target != path) and not stat.S_ISDIR(info.st_mode):
-        raise ValueError(f"managed worker requires a directory: {path}")
-    if target == path and not directory and not stat.S_ISREG(info.st_mode):
-        raise ValueError(f"managed worker requires a regular file: {path}")
-    permission = os.W_OK | (os.X_OK if stat.S_ISDIR(info.st_mode) else 0)
-    if readable and target == path:
-        permission |= os.R_OK
-    if (os.statvfs(target).f_flag & os.ST_RDONLY
-            or not os.access(target, permission, effective_ids=True)):
-        raise ValueError(
-            f"managed worker write path unavailable: {path}; check permissions and the "
-            "runner's operator-owned ReadWritePaths allowlist"
-        )
-
-
-def verify_worker_writes(config: dict, persistence: bool) -> None:
-    """Advisory write prerequisites; real IO failures retain their classification."""
-    state = absolute(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
-    cache = Path(config["cache"])
-    queue = state / "index-requests"
-    for path in (Path(config["runtime"]), state / "locks"):
-        _writable_path(path, directory=True)
-    for path in (cache, queue):
-        _writable_path(path, directory=True, readable=True)
-    _writable_path(state / "code-intelligence-runner.log", directory=False)
-    for database in (queue / "queue.sqlite3", *cache.glob("*.db")):
-        if database.name == "_config.db":
-            continue  # immutable configuration is validated through the RO reader
-        for suffix in ("", "-wal", "-shm", "-journal"):
-            _writable_path(Path(str(database) + suffix), directory=False, readable=True)
-    if persistence:
-        _writable_path(Path("/tmp"), directory=True)  # noqa: S108 - observe pinned root; no creation
-        _writable_path(Path(config["main"]) / ".codebase-memory", directory=True)
 
 
 def parse_arguments(argv: list[str] | None, description: str | None) -> argparse.Namespace:

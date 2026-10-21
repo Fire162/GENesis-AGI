@@ -41,6 +41,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     canonical_sources,
     cgroup_empty,
     config_path,
+    first_existing_parent,
     frontend_command,
     implicit_slice_absent,
     index_writer_targets_main,
@@ -518,7 +519,10 @@ def verified_binary(path: Path, *, execute: bool = True):
     stream = os.fdopen(fd, "rb")
     try:
         verify_binary_access(fd, execute=execute)
-        if hashlib.file_digest(stream, "sha256").hexdigest() != BUILD:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != BUILD:
             raise ValueError("unsupported managed executable; repeat acceptance before upgrading")
         stream.seek(0)
     except BaseException:
@@ -543,13 +547,6 @@ def sync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-
-
-def first_existing_parent(path: Path) -> Path:
-    parent = path.parent
-    while not parent.exists():
-        parent = parent.parent
-    return parent
 
 
 def sync_ancestors(path: Path, stop: Path) -> None:
