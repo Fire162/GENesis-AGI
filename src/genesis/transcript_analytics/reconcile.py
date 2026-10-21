@@ -94,20 +94,22 @@ WITH candidates AS (
 ), g AS (
  SELECT event_key,count(DISTINCT actor_id) AS all_actors,
  count(DISTINCT actor_id) FILTER(WHERE NOT inherited) AS remaining,
+ count(*) FILTER(WHERE NOT inherited AND actor_id IS NULL) AS missing_actors,
  any_value(actor_id ORDER BY actor_id) FILTER(WHERE NOT inherited) AS executor,
  bool_or(inherited) AS has_inference,bool_or(context_conflict) AS context_conflict,
  list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions
  FROM candidates GROUP BY event_key
 )
 SELECT g.*, CASE WHEN s.content_conflict OR g.context_conflict THEN 'conflicting'
- WHEN remaining=1 THEN CASE WHEN has_inference THEN 'inferred' ELSE 'confirmed' END
+ WHEN remaining=1 AND missing_actors=0 THEN CASE WHEN has_inference THEN 'inferred' ELSE 'confirmed' END
  ELSE 'unresolved' END AS attribution_status,
- CASE WHEN remaining=1 AND NOT s.content_conflict AND NOT g.context_conflict THEN executor END AS executor_id,
+ CASE WHEN remaining=1 AND missing_actors=0 AND NOT s.content_conflict AND NOT g.context_conflict THEN executor END AS executor_id,
  CASE WHEN g.context_conflict THEN 'source path contradicts record context/actor'
  WHEN s.content_conflict THEN 'conflicting identity content'
+ WHEN missing_actors>0 THEN 'missing observed actor'
  WHEN remaining=1 AND has_inference THEN 'shared containing-main prefix'
  WHEN remaining=1 THEN 'unique observed actor'
- ELSE 'multiple or missing observed actors' END AS attribution_reason
+ ELSE 'multiple observed actors' END AS attribution_reason
 FROM g JOIN event_states s USING(event_key);
 
 -- Evidence/availability precede presentation selection. Every distinct event
