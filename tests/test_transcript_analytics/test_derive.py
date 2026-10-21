@@ -211,3 +211,23 @@ def test_history_live_snapshot_and_fresh_archive_restore_without_originals(tmp_p
         historical = query._READS[con]["coverage"]["historical"]
         assert historical[0]["adapter"] == format_name
         assert historical[0]["unknown"]["unrecoverable"]
+
+
+def test_snapshot_preserves_reconciliation_query_surface(tmp_path):
+    projects, data = tmp_path / "projects", tmp_path / "data"
+    projects.mkdir()
+    _write(projects / "source.jsonl", 1)
+    assert store.ingest(projects, data)["rebuilt"] == 1
+    before = {
+        view: query.run_query(data, f"SELECT count(*) FROM {view}")[1]
+        for view in ("fragments", "spawn_associations", "tool_ownership")
+    }
+    derive.build(data)
+    after = {
+        view: query.run_query(data, f"SELECT count(*) FROM {view}")[1]
+        for view in before
+    }
+    assert after == before
+    with query.read_connection(data) as con:
+        assert query._READS[con]["snapshot"] is not None
+        assert con.sql("SELECT count(*) FROM fragments").fetchone() == (1,)

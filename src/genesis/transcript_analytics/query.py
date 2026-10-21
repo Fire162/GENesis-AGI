@@ -22,7 +22,7 @@ import duckdb
 from genesis.transcript_analytics import history, store
 from genesis.transcript_analytics.extract import TABLES
 
-VIEWS_VERSION = "18"
+VIEWS_VERSION = "19"
 _READS = weakref.WeakKeyDictionary()
 _DERIVED = (
     "tool_calls",
@@ -37,6 +37,26 @@ _DERIVED = (
     "delegation_rollups",
     "context_rollups",
     "metric_coverage",
+    # Reconciliation outputs are part of the shared query surface, so the
+    # disposable snapshot carries them alongside the deduplicated views.
+    "observations",
+    "provider_candidates",
+    "turn_events",
+    "event_states",
+    "canonical_fragments",
+    "fragments",
+    "message_sequences",
+    "representation",
+    "message_copy",
+    "inherited",
+    "event_ownership",
+    "turn_evidence",
+    "assembled_fragments",
+    "result_candidates",
+    "producers",
+    "companion_assertions",
+    "spawn_associations",
+    "tool_ownership",
 )
 
 
