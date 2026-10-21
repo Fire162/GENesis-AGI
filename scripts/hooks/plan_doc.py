@@ -16,8 +16,8 @@ copy of both questions, which disagreed:
   recent transcripts carry ``planFilePath``.
 
 So this module holds one copy of each answer, taken from the hook that had it
-right. Stdlib only, plus the sibling ``hook_input`` — the one place that knows
-the payload contract.
+right. Stdlib, the sibling ``hook_input`` (the one place that knows the payload
+contract) and markdown-it-py, the CommonMark parser the merge gate already uses.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ import json
 import os
 import re
 import sys
-from collections.abc import Iterator
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,15 +34,16 @@ from hook_input import tool_input  # noqa: E402
 
 _BLOB_PLAN_PATH = re.compile(r"(/[^\s\"']+\.claude/plans/[^\s\"']+\.md)")
 
-#: A divider is a heading whose text BEGINS with the phrase, after an optional
-#: decorative rule: `## ═══ SUPERSEDED BELOW ═══`, `# ═══ SUPERSEDED BELOW — …`,
-#: `## SUPERSEDED BELOW`. A heading that merely MENTIONS the phrase (a plan titled
-#: "teach hooks the SUPERSEDED BELOW divider") is not one: matching it would empty
-#: the live section, and the adopt-first gate fails open on an empty plan.
-_DIVIDER = re.compile(r"^#+\s*(?:═+\s*)?SUPERSEDED BELOW")
+#: A divider is a heading whose rendered text BEGINS with the phrase, after an
+#: optional decorative rule: `## ═══ SUPERSEDED BELOW ═══`, `# ═══ SUPERSEDED BELOW
+#: — …`, `## SUPERSEDED BELOW`. A heading that merely MENTIONS the phrase (a plan
+#: titled "teach hooks the SUPERSEDED BELOW divider") is not one: matching it would
+#: empty the live section, and the adopt-first gate passes an empty plan.
+_DIVIDER = re.compile(r"^(?:═+\s*)?SUPERSEDED BELOW")
 
-#: A fence delimiter (after stripping): the run, then any info string.
-_FENCE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+#: Block tokens whose lines are quoted material, never the author's proposal or
+#: verdict: fenced and indented code, and raw HTML blocks (comments included).
+_QUOTED = frozenset({"fence", "code_block", "html_block"})
 
 
 def plan_path(payload: dict) -> str:
@@ -104,97 +104,90 @@ def plan_path(payload: dict) -> str:
     return ""
 
 
-def _fence_mask(lines: list[str]) -> tuple[list[bool], bool]:
-    """Which lines are inside (or delimit) a fenced block, and whether every
-    fence closed.
+def _parser():
+    """A CommonMark parser (markdown-it-py, a declared dependency), or None.
 
-    CommonMark's fence rules, as ``git_push_guard``'s review-body parser applies
-    them: a delimiter is a run of three or more backticks or tildes with at most
-    three leading spaces. A closing fence uses the opener's character, is at
-    least as long, and has no info string, so a ```md line inside a ````
-    block, or ``` inside ~~~, is content. An unclosed fence runs to the end.
+    The plan is read AS IT RENDERS, the same way the merge gate reads PR bodies
+    (``git_push_guard._rework_markdown``): hand-written line rules for fences,
+    comments and dividers drew a new edge case in each review round.
     """
-    mask = [False] * len(lines)
-    fence_char, fence_len = "", 0
-    for idx, line in enumerate(lines):
-        indent = len(line) - len(line.lstrip(" "))
-        fence = _FENCE.match(line.strip()) if indent <= 3 else None
-        if fence:
-            run, info = fence.group(1), fence.group(2).strip()
-            if not fence_char:
-                fence_char, fence_len = run[0], len(run)
-                mask[idx] = True
-                continue
-            if run[0] == fence_char and len(run) >= fence_len and not info:
-                fence_char, fence_len = "", 0
-                mask[idx] = True
-                continue
-        mask[idx] = bool(fence_char)
-    return mask, not fence_char
+    try:
+        from markdown_it import MarkdownIt  # noqa: PLC0415 — optional at import time
+    except ImportError:
+        return None
+    return MarkdownIt("commonmark")
 
 
-def outside_fences(lines: list[str]) -> Iterator[tuple[int, str]]:
-    """Yield ``(index, line)`` for lines that are NOT inside a fenced block.
+def _frontmatter_end(lines: list[str]) -> int:
+    """Index of the first line after a leading YAML frontmatter block (0 if none).
 
-    A plan documents a convention by SHOWING it, so the divider and the title
-    heading both appear inside ``` examples in perfectly ordinary plans — this
-    repo's own reference doc does exactly that. Matching those is how a plan
-    truncates itself at its own illustration.
+    CommonMark has no frontmatter: it would read the block as a rule plus a
+    setext heading, so it is skipped before parsing.
     """
-    mask, _ = _fence_mask(lines)
-    for idx, line in enumerate(lines):
-        if not mask[idx]:
-            yield idx, line
+    if lines and lines[0].strip() == "---":
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() == "---":
+                return idx + 1
+    return 0
 
 
-def strip_fences(text: str) -> str:
-    """``text`` with every fenced line blanked (line count kept): quoted
-    material, not proposals or verdicts. The one fence parser every plan hook
-    uses, so the live section and the gate's searches cannot disagree."""
-    lines = text.split("\n")
-    mask, _ = _fence_mask(lines)
-    return "\n".join("" if m else line for m, line in zip(mask, lines, strict=True))
+def _blocks(text: str):
+    """``(lines, offset, tokens)`` for ``text``, or None without a parser.
+
+    ``offset`` is where the parsed body starts (after frontmatter); token
+    ``map`` ranges are relative to it. Lines are split on newline only, as
+    CommonMark does (``splitlines()`` also breaks at U+2028).
+    """
+    md = _parser()
+    if md is None:
+        return None
+    lines = text.replace("\r\n", "\n").split("\n")
+    offset = _frontmatter_end(lines)
+    return lines, offset, md.parse("\n".join(lines[offset:]))
+
+
+def strip_quoted(text: str) -> str:
+    """``text`` with every line of quoted material blanked (line count kept):
+    fenced or indented code and raw HTML blocks. A path or a verdict shown in an
+    example is not a proposal or a verdict. Without a parser nothing is
+    stripped, so every path in the plan counts."""
+    parsed = _blocks(text)
+    if parsed is None:
+        return text
+    lines, offset, tokens = parsed
+    for tok in tokens:
+        if tok.type in _QUOTED and tok.map:
+            for idx in range(offset + tok.map[0], offset + tok.map[1]):
+                lines[idx] = ""
+    return "\n".join(lines)
 
 
 def live_section(content: str) -> str:
     """The part of a plan above its superseded-content divider.
 
     The convention is documented in the genesis-development skill
-    (`references/plan-docs.md`): a heading containing SUPERSEDED BELOW divides
-    live plan content from archaeology kept for provenance. No divider means
-    the whole document is live, which is also the correct reading for every
-    plan written before the convention existed.
+    (`references/plan-docs.md`): a heading beginning SUPERSEDED BELOW divides
+    live plan content from archaeology kept for provenance. No divider means the
+    whole document is live, which is also the correct reading for every plan
+    written before the convention existed.
 
-    Matched on the WORDS at the start of a heading (``_DIVIDER``), not on the
-    decorative rule the template draws around them — the box characters are
-    ornament and a plan that omits them still means it. Anchored at column zero
-    on a `#` heading so the phrase quoted inside a paragraph cannot truncate the
-    document, and skipped inside FENCED blocks so a plan that documents the
-    convention by showing it does not truncate itself at its own example.
-
-    Two readings fail CLOSED for the adopt-first gate (more of the plan stays
-    live, never less): a divider inside an HTML comment does not divide, and a
-    document whose FIRST heading begins with the phrase is a plan about the
-    divider, not one. When a fence never closes the fence reading cannot be
-    trusted, so the first divider heading anywhere divides, as before this
-    reader existed: hiding it would let an old verdict below it clear a new
-    proposal. Lines are split on newline only: ``splitlines()`` also breaks at
-    U+2028, which Markdown does not.
+    The divider is a TOP-LEVEL heading (ATX or setext) as CommonMark renders it,
+    so the phrase inside a code block, an HTML comment, a blockquote or a list,
+    or quoted in a paragraph, never divides. A divider with no block above it
+    is a plan TITLED with the phrase, not a divider: taking it would leave an
+    empty live section. Without a parser the whole plan is live.
     """
-    lines = content.split("\n")
-    mask, closed = _fence_mask(lines)
-    in_comment = False
-    first_heading = True
-    for idx, line in enumerate(lines):
-        if in_comment:
-            in_comment = "-->" not in line
+    parsed = _blocks(content)
+    if parsed is None:
+        return content
+    lines, offset, tokens = parsed
+    seen_block = False
+    for i, tok in enumerate(tokens):
+        if tok.level != 0 or tok.type.endswith("_close"):
             continue
-        if not closed or not mask[idx]:
-            if line.lstrip().startswith("<!--") and "-->" not in line:
-                in_comment = True
-                continue
-            if line.startswith("#"):
-                if _DIVIDER.match(line) and not first_heading:
-                    return "\n".join(lines[:idx])
-                first_heading = False
+        if tok.type == "heading_open" and seen_block and tok.map:
+            text = tokens[i + 1].content.strip() if i + 1 < len(tokens) else ""
+            if _DIVIDER.match(text):
+                return "\n".join(lines[: offset + tok.map[0]])
+        seen_block = True
     return content

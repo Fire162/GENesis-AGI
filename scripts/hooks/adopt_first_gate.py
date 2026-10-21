@@ -60,7 +60,7 @@ from pathlib import Path
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload, tool_input  # noqa: E402
-from plan_doc import live_section, plan_path, strip_fences  # noqa: E402
+from plan_doc import live_section, plan_path, strip_quoted  # noqa: E402
 
 _STATE_DIR = Path.home() / ".genesis" / "adopt_first"
 
@@ -277,8 +277,8 @@ def _has_verdict(content: str) -> bool:
     nxt = re.search(rf"^#{{1,{max(depth, 1)}}}\s", rest, re.MULTILINE)
     body = rest[: nxt.start()] if nxt else rest
 
-    # Fenced blocks are quoted material: an example verdict is not a verdict.
-    body = strip_fences(body)
+    # Code and HTML blocks are quoted material: an example verdict is not a verdict.
+    body = strip_quoted(body)
     # Strip <placeholder> spans so an unfilled copy of the emitted template
     # (`<ADOPT|ADAPT|BUILD> — <why>. Searched: <terms>`) satisfies nothing.
     body = re.sub(r"<[^>\n]*>", "", body)
@@ -318,8 +318,8 @@ def _check_plan(payload: dict) -> int:
     # must not clear the current one.
     live = live_section(content)
 
-    # Fenced blocks are quoted material: a path in an example is not a proposal.
-    prose = strip_fences(live)
+    # Code and HTML blocks are quoted material: a path in an example is not a proposal.
+    prose = strip_quoted(live)
     named = sorted(set(_SOURCE_PATH.findall(prose)))
     if not named:
         return 0  # proposes no source files — not this gate's business

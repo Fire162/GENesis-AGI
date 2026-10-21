@@ -326,3 +326,52 @@ def test_an_unreadable_plan_path_falls_back_to_the_plan_text(home, repo):
     }
     result = _gate(payload, home, repo)
     assert result.returncode == 2 and "adopt-first" in result.stderr
+
+
+
+# ── round 3: the plan is read as CommonMark renders it ──────────────────────
+@pytest.mark.parametrize(
+    "text",
+    [
+        # a closed example stays quoted when a later fence never closes (Codex r2)
+        "# Plan\n\n```\n## SUPERSEDED BELOW\n```\n\nstill live\n\n```\nunclosed\n",
+        # a comment opened after prose hides its heading (Codex r2)
+        "# Plan\n\n<!--\nnote\n## SUPERSEDED BELOW\n-->\n\nstill live\n",
+        # quoted or listed, the phrase is not a top-level heading
+        "# Plan\n\n> ## SUPERSEDED BELOW\n\nstill live\n",
+        "# Plan\n\n- item\n\n  ## SUPERSEDED BELOW\n\nstill live\n",
+        # nothing above it: a plan titled with the phrase
+        "---\nstatus: draft\n---\n# SUPERSEDED BELOW handling\n\nstill live\n",
+    ],
+)
+def test_the_phrase_that_does_not_render_as_a_divider_keeps_the_plan_live(plan_doc, text):
+    assert "still live" in plan_doc.live_section(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # a title-less plan: prose, then the divider (Codex r2)
+        "Intro prose, no title.\n\n## SUPERSEDED BELOW\n\nold\n",
+        # an inline `<!--` in code does not open a comment (premise check)
+        "# Plan\n\nWrite `<!--` to comment.\n\n## SUPERSEDED BELOW\n\nold\n",
+        # a setext heading renders as a heading
+        "# Plan\n\nlive\n\nSUPERSEDED BELOW\n----------------\n\nold\n",
+        "---\nstatus: draft\n---\n# Plan\n\nlive\n\n## SUPERSEDED BELOW\n\nold\n",
+    ],
+)
+def test_a_rendered_divider_divides(plan_doc, text):
+    assert "old" not in plan_doc.live_section(text)
+
+
+def test_without_a_parser_the_whole_plan_is_live_and_nothing_is_stripped(plan_doc, monkeypatch):
+    monkeypatch.setattr(plan_doc, "_parser", lambda: None)
+    text = "# Plan\n\n```\nsrc/genesis/x.py\n```\n\n## SUPERSEDED BELOW\n\nold\n"
+    assert plan_doc.live_section(text) == text
+    assert plan_doc.strip_quoted(text) == text
+
+
+def test_html_comments_and_indented_code_are_quoted_material(plan_doc):
+    text = "# Plan\n\n<!-- src/genesis/a.py -->\n\n    src/genesis/b.py\n\nAdd src/genesis/c.py\n"
+    stripped = plan_doc.strip_quoted(text)
+    assert "a.py" not in stripped and "b.py" not in stripped and "c.py" in stripped
