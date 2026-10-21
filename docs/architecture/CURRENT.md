@@ -1718,6 +1718,20 @@ the shared banner is not an assertion about all concurrent sessions.
   `card_url_before_pay`). WebSocket URLs are not covered. This guards a trusted
   merchant's flawed form, not a hostile page script: one that reads a field can
   still send it another way (a request body, an encoding the guard does not undo).
+  Selectors are plain CSS (a `>>` chain, an `engine=` part, quoted text or XPath
+  is refused, mirroring Playwright's own selector parser) and every
+  resolved element must live in the frame whose origin the tap shows
+  (`owner_frame`); a checkout whose host is itself a public suffix is refused;
+  the accessibility tree is off while card fill is on (owner ruling Q14).
+  Top-level navigation requests (sent, committed or not; a fragment or history
+  change sends none) and new windows are counted from the first keystroke: a
+  checkout that moves on while the card is typed ends `moved_while_filling`
+  (do not retry), never "nothing paid", unless the card number also went out in
+  a URL, which ends `card_url_before_pay` (also do not retry). Not seen: a
+  script-only submit (fetch, no navigation) and a navigation inside a child
+  frame (a hosted card frame posting its own form). The network-guard flags are checked
+  again after the last await before the click; a bank frame preloaded hidden
+  and shown after Pay is a `challenge`.
   Before the tap it waits up to 10 s for a hosted widget's frames, fields, Pay
   and total to mount (after it, a missing element means the page changed).
   After the grant, after the claim and before Pay it re-checks the tapped

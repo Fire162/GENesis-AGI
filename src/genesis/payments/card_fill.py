@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 # Pinned at Camoufox launch while card fill is on, for all browsing (owner
 # ruling): no form history, autofill, password capture (a CVC field can be
 # type=password), restorable closed tabs, session-store form data, cached
-# documents, X11 primary-selection copies, places history or disk cache.
+# documents, X11 primary-selection copies, places history or disk cache; and
+# no accessibility tree (owner ruling Q14): an AT-SPI client of the same user
+# read a masked page's typed card number off it (measured), and with this pref
+# Camoufox does not expose the tree.
 CARD_FILL_PREFS = {
     "browser.formfill.enable": False,
     "signon.autofillForms": False,
@@ -46,6 +49,7 @@ CARD_FILL_PREFS = {
     "signon.formlessCapture.enabled": False,
     "places.history.enabled": False,
     "browser.cache.disk.enable": False,
+    "accessibility.force_disabled": 1,
 }
 
 CARD_KINDS = ("number", "expiry", "exp_month", "exp_year", "cvc", "name", "postal_code")
@@ -64,9 +68,11 @@ _NO_RETRY = " Outcome unknown: do NOT retry; the owner checks the merchant accou
 TEXTS = {
     "card_fill_disabled": "Card fill is off (config/payments.yaml card_fill.enabled, or "
     "GENESIS_CARD_FILL_DISABLED=1). Hand the payment to the owner.",
-    "playwright_debug_on": "Refused: Playwright debug logging is on; it would log what is typed.",
+    "playwright_debug_on": "Refused: Playwright or Firefox debug logging is on; it could log "
+    "what is typed.",
     "bad_card_ref": "card_ref must be card_ followed by 12 hex characters.",
-    "bad_amount": "amount must be the total as the page states it (1-32 printable characters).",
+    "bad_amount": "amount must be the total as the page states it (1-32 printable characters, "
+    "with its digits).",
     "bad_fields": "fields must map number (required), expiry or exp_month+exp_year, cvc, "
     "name, postal_code to a selector or {selector, frames}.",
     "bad_pay": "pay must be the Pay control's selector, or {selector, frames}.",
@@ -76,6 +82,8 @@ TEXTS = {
     "no_page": "No page open. Open the checkout with browser_navigate first.",
     "not_camoufox": "Card fill works only on Camoufox: browser_navigate(stealth=True).",
     "not_http": "The checkout page is not an http(s) page.",
+    "checkout_on_public_suffix": "The checkout's host is itself a public suffix, a domain "
+    "shared by many unrelated sites; refused.",
     "prefs_not_pinned": "Camoufox started before card fill was on. Restart the browser first.",
     "browser_packages_changed": "The browser packages changed; restart the session first.",
     "payment_in_flight": "A card payment is in progress; wait for it to finish.",
@@ -119,12 +127,17 @@ TEXTS = {
     "failed_before_pay": "Filling stopped part-way; Pay was NOT clicked and the payment "
     "window was closed." + _SPENT,
     "card_url_before_pay": "Pay was NOT clicked: while the card was typed, the checkout sent "
-    "or tried to send the card number in a URL. Treat the card as exposed and tell the "
-    "owner." + _SPENT,
+    "or tried to send the card number in a URL (and may have moved on with it). Treat the "
+    "card as exposed and tell the owner." + _NO_RETRY,
     "submitted_unverified": "Pay was clicked and the checkout moved on. Not verified: "
     "check the order page or the merchant account.",
     "challenge": "Pay was clicked, then a bank check appeared or the checkout did not move "
     "on within 60 s; the payment window was closed." + _NO_RETRY,
+    "pay_click_unknown": "The Pay click raised an error and the checkout did not move on: "
+    "it is unknown whether Pay was clicked; the payment window was closed." + _NO_RETRY,
+    "moved_while_filling": "Pay was NOT clicked, but the checkout moved on (navigated or "
+    "opened a window) while the card was typed: it may have submitted the payment itself. "
+    "The payment window was closed." + _NO_RETRY,
     "card_url_blocked": "Pay was clicked; the payment window blocked a request that would have "
     "carried the card number in a URL. Whether the checkout went ahead another way is "
     "unknown." + _NO_RETRY,
@@ -192,6 +205,18 @@ def card_fill_enabled() -> bool:
     return isinstance(section, dict) and section.get("enabled") is True
 
 
+# Firefox's log configuration variables, the older names included: it reads
+# MOZ_LOG, then MOZ_LOG_MODULES, then NSPR_LOG_MODULES, and MOZ_LOG_FILE, then
+# NSPR_LOG_FILE (xpcom/base/Logging.cpp).
+_FIREFOX_LOG_VARS = (
+    "MOZ_LOG",
+    "MOZ_LOG_MODULES",
+    "NSPR_LOG_MODULES",
+    "MOZ_LOG_FILE",
+    "NSPR_LOG_FILE",
+)
+
+
 def playwright_debug_on() -> bool:
     """Whether a Playwright debug log would carry what is typed: DEBUGP (the
     Python client prints every protocol message to stdout, the MCP transport),
@@ -199,8 +224,13 @@ def playwright_debug_on() -> bool:
     (pw:channel logs every command with its arguments; pw:server:channel the
     commands the driver received). Playwright's namespaces are not a closed
     list, so any pattern with a wildcard counts, and so does one naming pw. A
-    negation never clears it: refusing is the safe reading."""
-    if any(os.environ.get(v) is not None for v in ("DEBUGP", "PWDEBUG", "DEBUG_FILE")):
+    negation never clears it: refusing is the safe reading. Firefox's own
+    logging counts too: any of its log variables set at all (its HTTP modules
+    record what a page sends)."""
+    if any(
+        os.environ.get(v) is not None
+        for v in ("DEBUGP", "PWDEBUG", "DEBUG_FILE", *_FIREFOX_LOG_VARS)
+    ):
         return True
     return any(
         p and not p.startswith("-") and (p.startswith("pw") or any(c in p for c in "*?["))
@@ -208,8 +238,31 @@ def playwright_debug_on() -> bool:
     )
 
 
+# Playwright reads a selector part as another engine than CSS when the text
+# before its first "=" is an engine name (``internal:control=enter-frame``,
+# ``xpath =//x``, ``*css=``: its parseSelectorString), when it is quoted
+# (text), or when it starts with ``//``, ``(//`` or ``..`` (XPath); a ``>>``
+# chain joins parts. A chain can step into a child frame, so the element found
+# would not live in the frame whose origin the tap shows. Mirrored here so only
+# plain CSS passes (an element in another frame is also refused on the page).
+_ENGINE_NAME = re.compile(r"[A-Za-z0-9_+:*-]+")
+_XPATH_START = re.compile(r"\(*//|\.\.")
+
+
+def _plain_css(s: str) -> bool:
+    if ">>" in s:
+        return False
+    part = s.strip()
+    eq = part.find("=")
+    if eq != -1 and _ENGINE_NAME.fullmatch(part[:eq].strip()):
+        return False
+    return not (part[:1] in ("'", '"') or _XPATH_START.match(part))
+
+
 def _selector(s, code: str) -> str:
     if not isinstance(s, str) or not s.strip() or len(s) > MAX_SELECTOR or contains_card_number(s):
+        raise Refused(code)
+    if not s.isprintable() or not _plain_css(s):  # JS trim() strips a BOM strip() keeps
         raise Refused(code)
     return s
 
@@ -246,6 +299,7 @@ def validate(card_ref, amount, fields, pay, expiry_format, extra_fields) -> Card
         and 0 < len(amount) <= 32
         and amount.isprintable()
         and amount.strip()
+        and any(c.isdigit() for c in amount)  # a price, not generic page text
         and not holds_long_digit_run(amount)
     ):
         raise Refused("bad_amount")

@@ -75,11 +75,17 @@ class El:
         self.mangle = False  # the page shows something other than what was typed
         self.on_click = None
         self.sent = False  # SENT_WITH_PAY_JS's answer: a native submit of Pay's form sends it
+        self.owner = None  # the frame the element really lives in (None: the one it was found in)
+        self.labels: dict = {}  # a select's option value -> label, where the two differ
 
 
 class Handle:
-    def __init__(self, el):
+    def __init__(self, el, frame=None):
         self.el = el
+        self.frame = frame
+
+    async def owner_frame(self):
+        return self.el.owner if self.el.owner is not None else self.frame
 
     async def content_frame(self):
         return self.el.child
@@ -99,14 +105,21 @@ class Handle:
         if js is pc.SENT_WITH_PAY_JS:
             return self.el.sent
         if js is pc.EXTRA_VALUE_JS:
-            return [self.el.value]
+            return [
+                self.el.value,
+                *([self.el.labels[self.el.value]] if self.el.value in self.el.labels else []),
+            ]
         raise AssertionError("unexpected script")
 
     async def fill(self, value, timeout=None):
         self.el.value = "x" if self.el.mangle else value
 
     async def select_option(self, timeout=None, value=None, label=None):
-        want = value if value is not None else label
+        if label is not None:
+            by_label = {lab: v for v, lab in self.el.labels.items()}
+            want = by_label.get(label, label)
+        else:
+            want = value
         if want not in self.el.options:
             raise RuntimeError("no option")
         self.el.value = want
@@ -140,7 +153,7 @@ class Loc:
         return len(self.frame.elements.get(self.sel, []))
 
     async def element_handle(self, timeout=None):
-        return Handle(self.frame.elements[self.sel][0])
+        return Handle(self.frame.elements[self.sel][0], self.frame)
 
 
 class Frame:
@@ -153,13 +166,27 @@ class Frame:
         self.mask_absent = False  # no mask at all (the init script never ran here)
         self.injected = 0
         self.parent_frame = None
+        self.mask_raises = 0  # the next N mask checks raise (a frame still navigating)
         self.session: dict = {}
+        self.visible = False  # its iframe element is shown (a revealed bank frame)
 
     def locator(self, sel):
         return Loc(self, sel)
 
+    async def frame_element(self):
+        frame = self
+
+        class FrameEl:
+            async def is_visible(self):
+                return frame.visible
+
+        return FrameEl()
+
     async def evaluate(self, js):
         if js == pc._MASK_CHECK_JS:
+            if self.mask_raises:
+                self.mask_raises -= 1
+                raise RuntimeError("Execution context was destroyed")
             return self.masked
         if js == pc._MASK_ABSENT_JS:
             return self.mask_absent
@@ -205,6 +232,17 @@ class Page:
         self.url = self.main_frame.url = self.goto_to or url
 
     def navigate(self, url):
+        """A new document: its request, then the commit."""
+        self.request_navigation(url)
+        self.same_document(url)
+
+    def request_navigation(self, url):
+        """A top-level navigation sent, not (yet) committed: an in-flight submit."""
+        for fn in getattr(self.context, "handlers", {}).get("request", []):
+            fn(_request(url, redirected=False, nav_frame=self.main_frame))
+
+    def same_document(self, url):
+        """A URL change with no request (a fragment, pushState, replaceState)."""
         self.url = self.main_frame.url = url
         for fn in self.handlers.get("framenavigated", []):
             fn(self.main_frame)
@@ -646,6 +684,24 @@ async def test_the_url_guard_aborts_when_it_cannot_judge(monkeypatch, logs):
     _sweep(logs)
 
 
+async def test_the_tap_shows_pay_as_it_reads_after_the_extra_fields(vault):
+    # Filling an address can re-render the checkout: the tap must show Pay's
+    # label as it stands after the extras, not as it read before them.
+    ns = checkout()
+    real_fill = Handle.fill
+
+    async def fill(self, value, timeout=None):
+        await real_fill(self, value, timeout)
+        if self.el is ns.els["email"]:
+            ns.els["pay"].pay.update(label="Pay $19.99 now")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "fill", fill)
+        out, _ = await _run(ns)
+    assert vault.ops("release_request")[0]["button_label"] == "Pay $19.99 now"
+    assert out["code"] == "submitted_unverified"
+
+
 async def test_a_url_too_heavy_to_judge_is_aborted_unrecorded():
     flow, g = _guard()
     heavy = "https://t.example.org/x?d=" + "1" * (pc._MAX_WINDOWS + 16)
@@ -666,8 +722,13 @@ async def test_a_failed_pass_on_is_logged_not_raised(logs):
     assert any("could not pass a request on" in line for line in logs)
 
 
-def _request(url, redirected=True):
-    return types.SimpleNamespace(url=url, redirected_from=object() if redirected else None)
+def _request(url, redirected=True, nav_frame=None):
+    return types.SimpleNamespace(
+        url=url,
+        redirected_from=object() if redirected else None,
+        is_navigation_request=lambda: nav_frame is not None,
+        frame=nav_frame,
+    )
 
 
 def test_a_redirect_hop_carrying_the_number_is_recorded_as_leaked():
@@ -739,6 +800,8 @@ async def test_a_card_number_url_while_typing_stops_before_pay(vault, logs):
         out, _ = await _run(ns)
     assert out["code"] == "card_url_before_pay" and clicked == []
     assert "exposed" in out["status"] and "NOT clicked" in out["status"]
+    # Nothing more is typed once the number went out: the next field stays empty.
+    assert out["filled"] == ["number"] and ns.els["expiry"].value == ""
     _sweep(out, logs)
 
 
@@ -763,7 +826,11 @@ async def test_a_card_number_url_after_the_last_field_stops_before_pay(vault, lo
 
 @pytest.mark.parametrize(
     ("blocked", "leaked", "code"),
-    [(True, False, "card_url_blocked"), (False, True, "card_url_leaked"), (True, True, "card_url_leaked")],
+    [
+        (True, False, "card_url_blocked"),
+        (False, True, "card_url_leaked"),
+        (True, True, "card_url_leaked"),
+    ],
 )
 async def test_the_outcome_ends_at_once_on_a_guard_flag(monkeypatch, blocked, leaked, code):
     # The settle wait is long; a flag ends it on the first tick, leaked before blocked.
@@ -896,8 +963,83 @@ async def test_a_click_that_raises_still_counts_as_paid(vault):
 
     ns.els["pay"].on_click = boom
     out, _ = await _run(ns)
-    assert out["code"] == "challenge"  # never "not paid"
+    # Never "not paid", and never "Pay was clicked": it is not known whether it landed.
+    assert out["code"] == "pay_click_unknown"
+    assert "do NOT retry" in out["status"] and not out["status"].startswith("Pay was clicked")
     _sweep(out)
+
+
+async def test_the_last_check_before_the_click_is_its_own_guard(vault):
+    # Re-label Pay right AFTER the first Pay read once every field is typed (the
+    # full pre-Pay re-check has just passed): only the final check before the
+    # click can see the change, so Pay must not be clicked. Keyed on the flow's
+    # state, not on a call count, so removing the final check cannot shift it.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    real = Handle.evaluate
+    done = {"changed": False}
+
+    async def evaluate(self, js, arg=None):
+        out = await real(self, js, arg)
+        flow = pc._flow
+        if (
+            js is pc.PAY_JS
+            and self.el is ns.els["pay"]
+            and flow is not None
+            and len(flow.typed) == len(ns.fields)
+            and not done["changed"]
+        ):
+            done["changed"] = True
+            ns.els["pay"].pay.update(label="Pay $99.99")
+        return out
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "evaluate", evaluate)
+        out, _ = await _run(ns)
+    assert done["changed"], "the fixture never reached the pre-Pay re-check"
+    assert out["code"] == "failed_before_pay" and clicked == []
+
+
+async def test_a_cancel_after_the_claim_is_logged_without_values(vault, logs):
+    # The caller cancels while Pay is being clicked: the card is spent and Pay
+    # may have landed, so it must not vanish silently.
+    ns = checkout()
+    clicking = asyncio.Event()
+
+    async def hang(self, timeout=None):
+        clicking.set()
+        await asyncio.sleep(3600)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "click", hang)
+        task = asyncio.ensure_future(_run(ns))
+        await asyncio.wait_for(clicking.wait(), 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    line = [x for x in logs if "cancelled by its caller after the claim" in x]
+    assert line and "paid=True" in line[0]
+    _sweep(logs)
+
+
+async def test_a_click_that_raised_but_moved_the_checkout_on_landed(vault):
+    ns = checkout()
+
+    def lands_then_raises():
+        ns.ppage.navigate("https://shop.example.com/done")
+        raise RuntimeError("detached")
+
+    ns.els["pay"].on_click = lands_then_raises
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+
+
+async def test_a_clean_click_with_no_settle_is_still_a_challenge(vault):
+    ns = checkout()
+    ns.els["pay"].on_click = lambda: None  # clicked, nothing moved
+    out, _ = await _run(ns)
+    assert out["code"] == "challenge"
 
 
 @pytest.mark.parametrize(
@@ -918,6 +1060,21 @@ async def test_a_click_that_raises_still_counts_as_paid(vault):
         (lambda ns: ns.ppage.main_frame.elements.pop("#pay"), "pay_not_found"),
         (lambda ns: ns.main_page.main_frame.elements.pop("iframe#card"), "frame_not_found:number"),
         (lambda ns: setattr(ns.els["email"], "extra", "card"), "extra_field_is_card_field"),
+        # An element that lives in another frame than the one its origin is read from.
+        (lambda ns: setattr(ns.els["number"], "owner", Frame(CARDS)), "field_origin:number"),
+        (lambda ns: setattr(ns.els["pay"], "owner", Frame(SHOP)), "field_origin:pay"),
+        (
+            lambda ns: setattr(
+                ns.ppage.main_frame.elements["iframe#card"][0], "owner", Frame(SHOP)
+            ),
+            "frame_not_found:number",
+        ),
+        (lambda ns: setattr(ns.els["email"], "owner", Frame(SHOP)), "extra_field_not_found"),
+        # A host that is itself a public suffix: its "site" would take every tenant's storage.
+        (
+            lambda ns: setattr(ns.main_page, "url", "https://github.io/pay"),
+            "checkout_on_public_suffix",
+        ),
     ],
 )
 async def test_a_failed_check_before_the_tap_requests_nothing(vault, setup, code):
@@ -1101,8 +1258,16 @@ async def test_abort_ends_the_flow_with_a_result_and_cancels(vault):
     ("hook", "change", "code"),
     [
         ("on_status", lambda ns: ns.els["pay"].pay.update(label="Pay $99.99"), "page_changed"),
-        ("on_status", lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "page_changed"),
-        ("on_claim", lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "claimed_not_filled"),
+        (
+            "on_status",
+            lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"),
+            "page_changed",
+        ),
+        (
+            "on_claim",
+            lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"),
+            "claimed_not_filled",
+        ),
         # A child frame whose mask cannot be put back.
         (
             "on_claim",
@@ -1141,6 +1306,33 @@ async def test_a_child_frame_the_init_script_missed_is_masked_and_rechecked(vaul
     out, _ = await _run(ns)
     assert out["code"] == "submitted_unverified"
     assert helper.injected >= 1 and helper.masked is True
+
+
+async def test_a_frame_still_navigating_at_load_is_asked_again(vault):
+    # A new iframe leaving about:blank cannot answer for a moment: the check
+    # asks again instead of refusing the checkout (measured: 16% of loads).
+    ns = checkout()
+    ns.ppage.extra[0].mask_raises = 2
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+
+
+async def test_a_frame_that_never_answers_fails_the_check(monkeypatch):
+    monkeypatch.setattr(pc, "MASK_SETTLE_S", 0.05)
+    page = Page(SHOP, frames=[Frame(CARDS)])
+    page.extra[0].mask_raises = 10**6
+    assert await pc._mask_ok(page) is False
+
+
+async def test_a_frame_that_answers_unmasked_fails_at_once(monkeypatch):
+    # Only an unanswerable frame is asked again; an unmasked answer is final.
+    monkeypatch.setattr(pc, "MASK_SETTLE_S", 30.0)
+    page = Page(SHOP)
+    page.main_frame.masked = False
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    assert await pc._mask_ok(page) is False
+    assert loop.time() - t0 < 5.0
 
 
 async def test_the_top_document_is_never_repaired(vault):
@@ -1214,6 +1406,184 @@ async def test_a_challenge_like_frame_present_before_pay_is_ignored(vault):
     ns.ppage.extra.append(Frame("https://hooks.stripe.com/widget"))
     out, _ = await _run(ns)
     assert out["code"] == "submitted_unverified"
+
+
+async def test_a_preloaded_bank_frame_revealed_after_pay_is_a_challenge(vault):
+    # Loaded hidden before Pay, shown after it, while the checkout moved on in
+    # place: its URL was already seen, so only its visibility tells.
+    ns = checkout()
+    bank = Frame("https://hooks.stripe.com/3d_secure_2/x")
+    bank.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(bank)
+
+    def reveal():
+        bank.visible = True
+        ns.ppage.navigate("https://shop.example.com/processing")
+
+    ns.els["pay"].on_click = reveal
+    out, _ = await _run(ns)
+    assert out["code"] == "challenge"
+
+
+async def test_a_flag_set_by_the_last_read_back_stops_before_pay(vault, logs):
+    # The route sees the number while the very last field is read back, after
+    # every earlier flag check: Pay must not be clicked.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    real = Handle.input_value
+
+    async def input_value(self, timeout=None):
+        flow = pc._flow
+        if self.el is ns.els["name"] and flow is not None and len(flow.typed) == len(ns.fields):
+            await ns.pctx.route_handler(Route(f"https://t.example.org/c?n={PAN}"))
+        return await real(self, timeout)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "input_value", input_value)
+        out, _ = await _run(ns)
+    assert out["code"] == "card_url_before_pay" and clicked == []
+    _sweep(out, logs)
+
+
+@pytest.mark.parametrize("how", ["navigate", "navigate_away", "popup"])
+async def test_a_checkout_that_moves_on_while_typing_is_an_unknown_outcome(vault, logs, how):
+    # The last field's input handler submits the checkout itself: Pay is not
+    # clicked, and the result must not say nothing was paid. Landing on another
+    # origin fails an earlier check first; that stop is reported as the move too.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+
+    def submit():
+        if how == "navigate":
+            ns.ppage.navigate("https://shop.example.com/done")
+        elif how == "navigate_away":
+            ns.ppage.navigate("https://pay.provider.example/done")
+        else:
+            for fn in ns.pctx.handlers["page"]:
+                fn(Page("about:blank"))
+
+    out = await _filling(ns, "name", submit)
+    assert out["code"] == "moved_while_filling" and clicked == []
+    assert "do NOT retry" in out["status"] and "NOT clicked" in out["status"]
+    _sweep(out, logs)
+
+
+@pytest.mark.parametrize("path", ["#card", "/step-2"])
+async def test_a_same_document_url_change_while_typing_is_not_a_move(vault, path):
+    # A page marking its step (a fragment, pushState) sends no request: it pays.
+    ns = checkout()
+    out = await _filling(ns, "number", lambda: ns.ppage.same_document(SHOP + path))
+    assert out["code"] == "submitted_unverified"
+
+
+async def test_a_submit_still_in_flight_while_typing_is_an_unknown_outcome(vault, logs):
+    # The input handler posts the form and disables Pay; nothing has committed.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+
+    def submit():
+        ns.ppage.request_navigation("https://shop.example.com/pay")
+        ns.els["pay"].pay.update(live=False)
+
+    out = await _filling(ns, "name", submit)
+    assert out["code"] == "moved_while_filling" and clicked == []
+    _sweep(out, logs)
+
+
+async def test_a_card_url_while_moving_on_is_still_reported_as_exposure(vault, logs):
+    # Both at once: the exposure is never hidden behind the move.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    real = Handle.fill
+
+    async def fill(self, value, timeout=None):
+        await real(self, value, timeout)
+        if self.el is ns.els["name"]:
+            await ns.pctx.route_handler(Route(f"https://t.example.org/c?n={PAN}"))
+            ns.ppage.navigate("https://pay.provider.example/done")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "fill", fill)
+        out, _ = await _run(ns)
+    assert out["code"] == "card_url_before_pay" and clicked == []
+    assert "exposed" in out["status"] and "do NOT retry" in out["status"]
+    _sweep(out, logs)
+
+
+async def test_a_flow_ended_while_typing_after_a_move_is_an_unknown_outcome(vault):
+    # The browser goes away right after the checkout moved on mid-typing.
+    ns = checkout()
+    typing = asyncio.Event()
+    real = Handle.fill
+
+    async def fill(self, value, timeout=None):
+        await real(self, value, timeout)
+        if self.el is ns.els["number"]:
+            ns.ppage.navigate("https://shop.example.com/done")
+            typing.set()
+            await asyncio.sleep(3600)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "fill", fill)
+        task = asyncio.ensure_future(_run(ns))
+        await asyncio.wait_for(typing.wait(), 30)
+        await pc.abort("mcp_exit")
+        out, _ = await task
+    assert out["code"] == "moved_while_filling"
+
+
+async def test_a_second_popup_while_typing_is_a_move(vault):
+    # One popup opened during the claim, before typing: a new one while the
+    # card is typed still counts.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+
+    def popup():
+        for fn in ns.pctx.handlers["page"]:
+            fn(Page("about:blank"))
+
+    vault.on_claim = popup
+    out = await _filling(ns, "name", popup)
+    assert out["code"] == "moved_while_filling" and clicked == []
+
+
+async def test_a_select_matched_by_its_label_reads_back_as_landed(vault):
+    # Options whose values are not the month or year itself: chosen by label,
+    # so the read-back must accept the selected option's label.
+    ns = checkout(select_expiry=True)
+    for kind, shown in (
+        ("exp_month", [str(m) for m in range(1, 13)]),
+        ("exp_year", [str(YEAR + i) for i in range(5)]),
+    ):
+        el = ns.els[kind]
+        el.options = [f"opt-{v}" for v in shown]
+        el.labels = {f"opt-{v}": v for v in shown}
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+    assert ns.els["exp_month"].value == "opt-12" and ns.els["exp_year"].value == f"opt-{YEAR}"
+
+
+async def test_a_select_whose_label_is_wrong_does_not_land(vault):
+    ns = checkout(select_expiry=True)
+    el = ns.els["exp_month"]
+    el.options = [f"opt-{m}" for m in range(1, 13)]
+    el.labels = {f"opt-{m}": str(m) for m in range(1, 13)}
+    real = Handle.select_option
+
+    async def select_option(self, timeout=None, value=None, label=None):
+        await real(self, timeout, value, label)
+        if self.el is el:
+            self.el.value = "opt-3"  # the page picks another month
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "select_option", select_option)
+        out, _ = await _run(ns)
+    assert out["code"] == "failed_before_pay" and out["field"] == "exp_month"
 
 
 async def _filling(ns, last_kind, change):
@@ -1406,7 +1776,10 @@ async def test_two_extra_names_on_one_element_are_refused(vault):
     ("setup", "code"),
     [
         (lambda ns: setattr(ns.ppage, "goto_to", "http://shop.example.com/checkout"), "not_https"),
-        (lambda ns: setattr(ns.ppage.extra[0], "url", "http://js.cards.example.net/f"), "field_origin:number"),
+        (
+            lambda ns: setattr(ns.ppage.extra[0], "url", "http://js.cards.example.net/f"),
+            "field_origin:number",
+        ),
         (lambda ns: setattr(ns.main, "browser", None), "checkout_load_failed"),
     ],
 )

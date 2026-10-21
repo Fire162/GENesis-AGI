@@ -55,6 +55,10 @@ def test_validate_keeps_kinds_and_extras_in_their_fixed_order():
         ({"card_ref": "card_xyz"}, "bad_card_ref"),
         ({"amount": ""}, "bad_amount"),
         ({"amount": "order 123456789012"}, "bad_amount"),
+        # No number at all: generic page text would pass as "the total".
+        ({"amount": "Total"}, "bad_amount"),
+        ({"amount": "USD"}, "bad_amount"),
+        ({"amount": "$"}, "bad_amount"),
         ({"expiry_format": "YY/MM"}, "bad_expiry_format"),
         ({"fields": {"cvc": "#c"}}, "bad_fields"),
         ({"fields": {"number": "#n", "exp_month": "#m"}}, "bad_fields"),
@@ -92,6 +96,72 @@ def test_validate_refuses_with_a_fixed_code(over, code):
         _v(**over)
     assert e.value.code == code
     assert PAN not in str(e.value)
+
+
+# Playwright selector syntax that can step into another frame, or into any
+# engine other than plain CSS, is refused wherever a selector is taken: a
+# field, a frame in a chain, Pay, an extra field. Plain CSS stays accepted.
+_ENTER_FRAME = "iframe#x >> internal:control=enter-frame >> #num"
+
+
+@pytest.mark.parametrize(
+    "sel",
+    [
+        _ENTER_FRAME,
+        "#a >> #b",
+        "internal:control=enter-frame",
+        "frame=card >> #num",
+        "css=#num",
+        "xpath=//input",
+        "text=Pay",
+        " internal:role=button",
+        # Playwright's own part grammar: spaces around "=", a capture "*",
+        # implicit XPath, and implicit (quoted) text.
+        "xpath =//iframe",
+        "internal:chain =x",
+        "*css=#num",
+        "//input",
+        "(//input)[1]",
+        "..",
+        '"Pay"',
+        "'Pay'",
+        # JS trim() strips a BOM that Python's strip() keeps.
+        "\ufeffxpath=//input",
+        "\ufeff//input",
+    ],
+)
+@pytest.mark.parametrize("where", ["field", "frame", "pay", "extra"])
+def test_a_selector_that_is_not_plain_css_is_refused(sel, where):
+    over, code = {
+        "field": ({"fields": {"number": sel}}, "bad_fields"),
+        "frame": ({"fields": {"number": {"selector": "#n", "frames": [sel]}}}, "bad_fields"),
+        "pay": ({"pay": sel}, "bad_pay"),
+        "extra": (
+            {"extra_fields": {"email": {"selector": sel, "value": "a@b.c"}}},
+            "bad_extra_fields",
+        ),
+    }[where]
+    with pytest.raises(cf.Refused) as e:
+        _v(**over)
+    assert e.value.code == code
+
+
+@pytest.mark.parametrize(
+    "sel",
+    [
+        "#cardNumber",
+        "iframe[src*='checkout-inner']",
+        "[data-frame=card]",
+        "input[name=x]",
+        "a > b",
+        "x:has(> y)",
+        "*",
+        "* > input",
+    ],
+)
+def test_plain_css_selectors_are_accepted(sel):
+    a = _v(fields={"number": sel, "expiry": "#e", "cvc": "#c"})
+    assert a.fields["number"] == ((), sel)
 
 
 @pytest.mark.parametrize(
@@ -253,10 +323,18 @@ def test_card_fill_is_off_unless_exactly_true(repo, text):
         ({"DEBUG": "?w:api"}, True),
         ({"DEBUG": "app,other"}, False),
         ({"PWDEBUG": "0"}, True),
+        # Firefox's own logging: HTTP modules record what a page sends.
+        ({"MOZ_LOG": "nsHttp:5"}, True),
+        ({"MOZ_LOG_FILE": "/x/log"}, True),
+        ({"MOZ_LOG": ""}, True),
+        # The older names Firefox still reads when the current ones are unset.
+        ({"MOZ_LOG_MODULES": "nsHttp:5"}, True),
+        ({"NSPR_LOG_MODULES": "nsHttp:5"}, True),
+        ({"NSPR_LOG_FILE": "/x/log"}, True),
     ],
 )
 def test_playwright_debug_on(monkeypatch, env, on):
-    for v in ("DEBUG", "DEBUGP", "PWDEBUG", "DEBUG_FILE"):
+    for v in ("DEBUG", "DEBUGP", "PWDEBUG", "DEBUG_FILE", *cf._FIREFOX_LOG_VARS):
         monkeypatch.delenv(v, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -412,3 +490,9 @@ async def test_a_claim_waits_past_the_ordinary_op_timeout(tmp_path, monkeypatch)
             await rc.release_status("n")
     finally:
         server.close()
+
+
+def test_card_fill_prefs_turn_the_accessibility_tree_off():
+    # Owner ruling Q14: a same-user AT-SPI client read the typed card number
+    # through the accessibility tree; the pref stops Camoufox exposing it.
+    assert cf.CARD_FILL_PREFS["accessibility.force_disabled"] == 1

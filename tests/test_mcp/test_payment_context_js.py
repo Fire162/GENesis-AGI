@@ -71,6 +71,14 @@ def test_card_field_js(page, html, kind, tag):
         ("<form method=GTE><button id=x>Pay $5</button></form>", True, True),
         ("<form method=get><button id=x formmethod=post>Pay $5</button></form>", True, False),
         ("<form><button id=x formmethod=bogus>Pay $5</button></form>", True, True),
+        # A form control named after a form property shadows it (legacy named
+        # access): the method must still be read off the form itself.
+        ("<form method=get><input name=method><button id=x>Pay $5</button></form>", True, True),
+        (
+            "<form method=get><input name=hasAttribute><button id=x>Pay $5</button></form>",
+            True,
+            True,
+        ),
     ],
 )
 def test_pay_js(page, html, button, get):

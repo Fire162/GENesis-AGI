@@ -40,7 +40,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from urllib.parse import unquote_plus, urlsplit
 
-from genesis.browser.profile import domain_matches, registrable_domain
+from genesis.browser.profile import _is_public_suffix, domain_matches, registrable_domain
 from genesis.payments import card_fill as cf
 from genesis.payments import release_client as rc
 
@@ -65,6 +65,11 @@ SETTLE_S = 60.0  # after the Pay click, for a navigation or a challenge
 # load (up to 10 s) plus 3 s, and an in-page URL change gets the same wait.
 NAV_GRACE_S = 13.0
 TICK_S = 0.25
+# How long the mask check keeps asking a frame that cannot answer (its context
+# destroyed by a navigation, as a new iframe leaves about:blank). Such a frame
+# was measured to wrongly refuse 16% of checkout loads when asked only once;
+# it settles within a navigation, and it never counts as masked.
+MASK_SETTLE_S = 5.0
 CLOSE_S = 10.0
 # The fallback close waits for the browser lock: a tool call holds it at most
 # 300 s (_with_tool_timeout), then Camoufox's close steps take up to 10 s each.
@@ -220,9 +225,13 @@ PAY_JS = r"""(e) => {
   const type = (e.getAttribute('type') || '').toLowerCase();
   const button = tag === 'button' ? type !== 'reset' : tag === 'input' && type === 'submit';
   const f = e.form;
-  const m = !f ? '' : e.hasAttribute('formmethod') ? e.formMethod
-    : f.hasAttribute('method') ? f.method : '';
-  const dget = !!f && !e.hasAttribute('formmethod') && !f.hasAttribute('method');
+  // Through the prototypes: a form control named "method" or "hasAttribute"
+  // shadows the form's own property of that name (legacy named access).
+  const has = (x, a) => Element.prototype.hasAttribute.call(x, a);
+  const formMethod = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'method').get;
+  const m = !f ? '' : has(e, 'formmethod') ? e.formMethod
+    : has(f, 'method') ? formMethod.call(f) : '';
+  const dget = !!f && !has(e, 'formmethod') && !has(f, 'method');
   const label = tag === 'input' ? (e.value || '') : (e.innerText || e.textContent || '');
   return {button, get: String(m).toLowerCase() === 'get', dget,
           live: e.isConnected && !e.disabled, label: label.slice(0, 200)};
@@ -285,7 +294,10 @@ class _Flow:
     typed: list[str] = field(default_factory=list)
     paid: bool = False
     popup: bool = False
-    navs: int = 0
+    popups: int = 0
+    navs: int = 0  # top-document commits, counted from the Pay click
+    nav_requests: int = 0  # top-document navigation requests, sent or not yet committed
+    typing_marks: tuple[int, int] | None = None  # (nav_requests, popups) as typing began
     url_blocked: bool = False  # the network guard aborted a request carrying the card number
     url_leaked: bool = False  # a redirect hop carried the card number (a route cannot stop it)
     abort_reason: str | None = None
@@ -339,6 +351,7 @@ class _UrlGuard:
 
     def __init__(self, flow: _Flow) -> None:
         self._flow = flow
+        self.main_frame = None  # the payment page's, once it exists
         self._key = b""
         self._len = 0
         self._tag: bytes | None = None
@@ -388,7 +401,16 @@ class _UrlGuard:
             logger.warning("payment url guard could not pass a request on (%s)", type(e).__name__)
 
     def on_request(self, request) -> None:
-        """The context's request event: a redirect hop that carries the number."""
+        """The context's request event: a top-level navigation request (counted:
+        a checkout can submit itself while the card is typed, and a request
+        exists before its document commits; a fragment or history change sends
+        none), and a redirect hop that carries the number."""
+        if self.main_frame is not None:
+            try:
+                if request.is_navigation_request() and request.frame is self.main_frame:
+                    self._flow.nav_requests += 1
+            except Exception:  # noqa: BLE001 - a request with no frame (a worker's)
+                pass
         if getattr(request, "redirected_from", None) is None:
             return
         try:
@@ -399,6 +421,10 @@ class _UrlGuard:
             leaked = self._tag is not None
         if leaked:
             self._flow.url_leaked = True
+
+
+# _outcome's "the checkout did not move on within the bound" (mapped in _run).
+_NO_SETTLE = "no_settle"
 
 
 class _Stop(Exception):
@@ -506,6 +532,12 @@ async def fill_card(args: cf.CardArgs, main_ctx, main_page, hooks: Hooks, report
             return cf.result(s.code, flow.host, **s.extra)
         except asyncio.CancelledError:
             if flow.abort_reason is None:
+                if flow.claimed:  # the card is spent, and Pay may have landed: say so
+                    logger.error(
+                        "payment cancelled by its caller after the claim (paid=%s, typed=%d)",
+                        flow.paid,
+                        len(flow.typed),
+                    )
                 raise
             asyncio.current_task().uncancel()
             return _ended(flow, "browser_closed")
@@ -523,7 +555,7 @@ def _ended(flow: _Flow, before_claim: str) -> dict:
     if flow.paid:
         return cf.result("outcome_unknown", flow.host)
     if flow.typing:
-        return cf.result("failed_before_pay", flow.host, filled=flow.typed)
+        return cf.result(_typing_outcome(flow) or "failed_before_pay", flow.host, filled=flow.typed)
     return cf.result("claimed_not_filled" if flow.claimed else before_claim, flow.host)
 
 
@@ -581,6 +613,13 @@ async def _teardown(flow: _Flow, hooks: Hooks) -> None:
         flow.done.set()
 
 
+async def _owned_by(handle, frame) -> bool:
+    """The element lives in ``frame`` itself. A locator can step into a child
+    frame (selector grammar ``card_fill`` refuses, checked here again on the
+    element), and an origin read off ``frame`` would then not be the element's."""
+    return await _step(handle.owner_frame()) is frame
+
+
 async def _walk(frame, frames: tuple[str, ...], through: list | None = None, wait=False):
     """The frame a chain of iframe selectors leads to, or None; ``through``
     collects every frame entered on the way, the last one included."""
@@ -591,6 +630,8 @@ async def _walk(frame, frames: tuple[str, ...], through: list | None = None, wai
             return None
         handle = await _step(loc.element_handle(timeout=5000))
         try:
+            if not await _owned_by(handle, frame):
+                return None
             frame = await _step(handle.content_frame())
         finally:
             with contextlib.suppress(Exception):
@@ -619,7 +660,10 @@ async def _resolve_one(page, spec: cf.Spec, kind: str, wait=False) -> tuple[obje
     origin = cf.origin_of(frame.url)
     if not cf.secure_origin(origin):  # about:blank, srcdoc, data: or plain http: never
         raise _Stop(f"field_origin:{kind}")
-    return frame, await _step(loc.element_handle(timeout=5000)), origin
+    handle = await _step(loc.element_handle(timeout=5000))
+    if not await _owned_by(handle, frame):
+        raise _Stop(f"field_origin:{kind}")
+    return frame, handle, origin
 
 
 async def _resolve(page, args: cf.CardArgs, wait=False) -> tuple[dict[str, _Field], _Field, str]:
@@ -666,24 +710,32 @@ async def _mask_ok(page) -> bool:
     opacity applies to a whole subtree, iframes included; a frame in the top
     layer does not, which is why the mask covers the top layer itself. A mask
     that is present but defeated is never repaired, and neither is the top
-    document: either fails the check."""
-    try:
-        frames = list(page.frames)
-        for frame in frames:
-            if await _step(frame.evaluate(_MASK_CHECK_JS)) is True:
-                continue
-            if (
-                frame.parent_frame is None
-                or await _step(frame.evaluate(_MASK_ABSENT_JS)) is not True
-            ):
+    document: either fails the check.
+
+    A frame that cannot answer is asked again, the whole pass from the start,
+    for up to MASK_SETTLE_S; a frame that answers "not masked" fails at once."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + MASK_SETTLE_S
+    while True:
+        try:
+            frames = list(page.frames)
+            for frame in frames:
+                if await _step(frame.evaluate(_MASK_CHECK_JS)) is True:
+                    continue
+                if (
+                    frame.parent_frame is None
+                    or await _step(frame.evaluate(_MASK_ABSENT_JS)) is not True
+                ):
+                    return False
+                await _step(frame.evaluate(MASK_INIT_JS))
+                if await _step(frame.evaluate(_MASK_CHECK_JS)) is not True:
+                    return False
+            return bool(frames)
+        except Exception as e:  # noqa: BLE001
+            if loop.time() >= deadline:
+                logger.warning("payment mask check failed (%s)", type(e).__name__)
                 return False
-            await _step(frame.evaluate(MASK_INIT_JS))
-            if await _step(frame.evaluate(_MASK_CHECK_JS)) is not True:
-                return False
-        return bool(frames)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("payment mask check failed (%s)", type(e).__name__)
-        return False
+        await asyncio.sleep(TICK_S)
 
 
 async def _amount_ok(page, amount: str) -> bool:
@@ -730,6 +782,8 @@ async def _extras(ppage, args: cf.CardArgs, fields: dict[str, _Field], fill: boo
         if await _step(loc.count()) != 1:
             raise _Stop("extra_field_not_found")
         handle = await _step(loc.element_handle(timeout=5000))
+        if not await _owned_by(handle, ppage.main_frame):
+            raise _Stop("extra_field_not_found")
         tag = await _step(handle.evaluate(EXTRA_FIELD_JS))
         if tag == "card":
             raise _Stop("extra_field_is_card_field")
@@ -801,7 +855,12 @@ def _pay_ok(info, label: str, clicking: bool) -> bool:
 
 
 async def _holds(f: _Field, kind: str, value: str) -> bool:
-    """The field shows the value typed into it (read back here and dropped)."""
+    """The field shows the value typed into it (read back here and dropped). A
+    select may have been matched by an option's label (``_select``), so its
+    value or its selected label may show it."""
+    if f.tag == "select":
+        got = await _step(f.handle.evaluate(EXTRA_VALUE_JS))
+        return isinstance(got, list) and any(cf.value_landed(kind, value, g) for g in got)
     return cf.value_landed(kind, value, await _step(f.handle.input_value(timeout=5000)))
 
 
@@ -875,8 +934,8 @@ def _is_challenge(url) -> bool:
 
 async def _outcome(flow: _Flow, ppage, start: str, before: set, site: str, hooks: Hooks) -> str:
     """What followed the Pay click (``start``: the URL before it; ``before``: the
-    frame URLs then), from navigation and new frame URLs only. A request the
-    network guard saw carrying the card number outranks them all: a redirect hop
+    frame URLs then), from navigation, new frame URLs and a bank frame shown. A
+    request the network guard saw carrying the card number outranks them all: a redirect hop
     it could only see (leaked) before a request it stopped (blocked)."""
     loop = asyncio.get_running_loop()
     deadline, moved = loop.time() + SETTLE_S, False
@@ -903,9 +962,42 @@ async def _outcome(flow: _Flow, ppage, start: str, before: set, site: str, hooks
     if flow.url_blocked:
         return "card_url_blocked"
     if not moved:
-        return "challenge"  # no settle within the bound: a bank check, a decline, or stuck
+        return _NO_SETTLE  # no settle within the bound: a bank check, a decline, or stuck
     host = urlsplit(ppage.url).hostname
-    return "submitted_unverified" if host and domain_matches(host.lower(), site) else "challenge"
+    if not (host and domain_matches(host.lower(), site)):
+        return "challenge"
+    return "challenge" if await _bank_frame_shown(ppage) else "submitted_unverified"
+
+
+def _popped(flow: _Flow) -> None:
+    flow.popup = True
+    flow.popups += 1
+
+
+def _typing_outcome(flow: _Flow) -> str | None:
+    """What happened while the card was typed that outranks a plain stop: the
+    card number sent in a URL (the exposure is never hidden behind a move), or
+    the checkout moving on by itself (a navigation request or a new window)."""
+    if flow.url_blocked or flow.url_leaked:
+        return "card_url_before_pay"
+    if flow.typing_marks is not None and (flow.nav_requests, flow.popups) != flow.typing_marks:
+        return "moved_while_filling"
+    return None
+
+
+async def _bank_frame_shown(ppage) -> bool:
+    """A bank-check frame loaded before Pay (its URL already seen, so not new)
+    that is showing now: a checkout may preload one hidden and reveal it. One
+    that cannot be asked is not ruled out."""
+    for f in list(ppage.frames):
+        if f is ppage.main_frame or not _is_challenge(f.url):
+            continue
+        try:
+            if await _step((await _step(f.frame_element())).is_visible()):
+                return True
+        except Exception:  # noqa: BLE001
+            return True
+    return False
 
 
 async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks, report) -> dict:
@@ -913,8 +1005,12 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     main_host = urlsplit(url).hostname
     if cf.origin_of(url) is None or not main_host:
         raise _Stop("not_http")
-    site = registrable_domain(main_host)
     flow.host = main_host
+    # A host that is itself a public suffix (github.io) is no one site: its
+    # "site" would hand over every tenant's cookies and storage.
+    if _is_public_suffix(main_host):
+        raise _Stop("checkout_on_public_suffix")
+    site = registrable_domain(main_host)
 
     # Handover. Frame chains resolve read-only in the main page first (the origins
     # of every frame on each chain choose the storage handed over: a wrapper frame
@@ -972,8 +1068,9 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             )
         del session
         ppage = await _step(pctx.new_page())
+        guard.main_frame = ppage.main_frame
         # The context's "page" event fires for new_page() too: only another page is a popup.
-        pctx.on("page", lambda p: p is not ppage and setattr(flow, "popup", True))
+        pctx.on("page", lambda p: p is not ppage and _popped(flow))
         await asyncio.wait_for(
             ppage.goto(url, wait_until="domcontentloaded", timeout=GOTO_MS), GOTO_MS / 1000 + 5
         )
@@ -1005,6 +1102,11 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         if asyncio.get_running_loop().time() >= until:
             raise _Stop("amount_not_on_page")
         await asyncio.sleep(POLL_S)
+    # What the tap shows is read again now: filling the extras can re-render the
+    # checkout (an address re-pricing it), and the owner approves what it shows.
+    fields, pay, label = await _resolve(ppage, args)
+    origins = {k: f.origin for k, f in fields.items()}
+    seen = {**origins, "pay": pay.origin}
 
     # The tap.
     title = ""
@@ -1066,6 +1168,9 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     ):
         values.clear()
         raise _Stop("claimed_not_filled")
+    # From the first keystroke: a field's input handler can submit the checkout
+    # itself, and that is no "nothing paid" stop.
+    flow.typing_marks = (flow.nav_requests, flow.popups)
     try:
         flow.typing = True
         for kind, f in fields.items():
@@ -1089,8 +1194,6 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             ppage, args, top, seen, label, title, fields, pay, hooks, clicking=True
         ):
             raise _Stop("failed_before_pay", filled=flow.typed)
-        if flow.url_blocked or flow.url_leaked:
-            raise _Stop("card_url_before_pay", filled=flow.typed)
         if _moved(ppage, top, fields, pay, seen) or not _pay_ok(
             await _step(pay.handle.evaluate(PAY_JS)), label, clicking=True
         ):
@@ -1100,6 +1203,14 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
                 f, kind, values[kind]
             ):
                 raise _Stop("failed_before_pay", field=kind, filled=flow.typed)
+        # After the last await: nothing below lets a route or page event be handled
+        # before the click, so these are final for all the browser has reported.
+        if code := _typing_outcome(flow):
+            raise _Stop(code, filled=flow.typed)
+    except Exception:
+        if code := _typing_outcome(flow):  # whatever stopped it, this says more
+            raise _Stop(code, filled=flow.typed) from None
+        raise
     finally:
         values.clear()
     ppage.on(
@@ -1107,9 +1218,17 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     )
     start, before = ppage.url, {f.url for f in list(ppage.frames)}
     flow.paid = True  # set before the click: a click that raised may still have landed
-    with contextlib.suppress(Exception):
+    click_raised = False
+    try:
         await _step(pay.handle.click(timeout=CLICK_MS))
+    except Exception as e:  # noqa: BLE001 - never the exception's text
+        click_raised = True
+        logger.warning("payment Pay click raised (%s)", type(e).__name__)
     code = await _outcome(flow, ppage, start, before, site, hooks)
+    if code == _NO_SETTLE:
+        # Nothing moved on. After a clean click that is a bank check or a stuck
+        # checkout; after a click that raised, not even the click is known.
+        code = "pay_click_unknown" if click_raised else "challenge"
     # A flag set after _outcome's last look still outranks what it saw.
     if flow.url_leaked:
         code = "card_url_leaked"
