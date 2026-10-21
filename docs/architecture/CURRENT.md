@@ -31,7 +31,8 @@ grown to 16 with 6 unnamed here, and nothing marked the list partial.)
 
 **Absence from this file is never absence in Genesis.** The map is deliberately
 incomplete. Verify by enumeration before any "Genesis lacks X" claim — the
-audit-by-enumeration protocol in the genesis-development skill.
+audit-by-enumeration protocol in the spec-session skill ("Auditing Existing
+Capabilities").
 
 **How this file stays honest.** Every entry claims its top-level
 `src/genesis` modules in a fenced `yaml subsystem-map` block and carries a
@@ -3940,6 +3941,22 @@ tool-disabled CC probe without changing its schedule or routing authority.
   before tier 1 and never escalates while it stands. `update.sh` prints what bootstrap changed
   outside the checkout at the end of every run, a failed one included. A
   symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
+  `--take-templates`. The root-owned files the deploy writes under `/etc`
+  (bootstrap's journald and sshd drop-ins, and the memory and network resilience
+  drop-ins and watchdog units) carry the same stamp through
+  `scripts/lib/managed_etc.sh`: one edited by hand (or a symlink) is KEPT and
+  named in the run summary as `kept-etc <path>` (so is one sudo could not
+  inspect or read, which is never written), a file from before stamps is
+  stamped once without restarting anything (the networkd keep-config drop-in
+  and journald: nothing else runs; the memory-resilience drop-ins, oomd's
+  config included, and the network watchdog units: a `systemctl daemon-reload`
+  only; sshd: `sshd -t` only), and `--take-template <full path>` (or `etc:*`,
+  never a bare `*`) replaces one after copying it, mode 0600, to the same path
+  under the run's `~/.genesis/deploy-backups/<time>/`. A taken sshd drop-in that
+  `sshd -t` rejects is put back from that copy. Unlike units, an edited `/etc`
+  file does not make the update refuse yet: each has had one Genesis content
+  version, so keeping it loses nothing; the refusal comes with the first content
+  change (#3282).
   `--take-templates`.
 - **Deployment status** (`scripts/lib/deploy_status.sh`): status captures the
   MainPID, invocation, runtime edits and runtime overrides once for its printed
@@ -4062,7 +4079,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 4ab8bf71c 2026-10-10
+verified: f9a1d4cb 2026-10-18
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4118,9 +4135,12 @@ verified: 4ab8bf71c 2026-10-10
   The separately launched validator can admit one canonical invocation of
   `scripts/codex_validator_request.py` through its native shell hook. Its
   bounded, private UUID request files use strict JSON and a closed operation
-  schema; only `protocol_probe` exists. Request creation and retirement use
-  the admitted workspace patch path. Serving probes, verification recording
-  and publication operations remain GROUNDWORK, and this boundary has no
+  schema. `serving_status` and `serving_verify` project one invocation of the
+  existing deployment status tripwire, with bounded collection and scoped SIGTERM
+  cancellation through owned-child cleanup. The request CLI sanitizes cancellation;
+  these observations are not functional verdicts. Request creation and retirement
+  use the admitted workspace patch path. Verification recording and publication
+  remain GROUNDWORK, and this boundary has no
   activation wiring in the ordinary project configuration. Its dedicated
   launcher must establish private workspace modes and umask before activation.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
