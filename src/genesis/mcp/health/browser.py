@@ -5091,45 +5091,27 @@ async def browser_fill_card(
     extra_fields: dict | None = None,
     ctx: Context | None = None,
 ) -> dict:
-    """Pay with a vault card on the Camoufox checkout page now open, after the
-    owner approves this payment with a Telegram tap. Card values never reach you.
+    """Pay with a vault card on the open Camoufox checkout after the owner's
+    Telegram tap; fills in a separate blank window and clicks Pay itself. Card
+    values never reach you. Full usage: the browser-automation skill, "Money".
 
-    The checkout is reopened in a separate, short-lived browser context that no
-    other browser tool can reach and the display shows blank; this tool fills
-    the card there, clicks Pay itself, and closes it before returning.
-
-    card_ref: the vault card (card_ + 12 hex). amount: the total exactly as the
-    page states it, digits included (it must appear on the page; the owner sees it). fields: kind
-    -> CSS selector, or {"selector": ..., "frames": [iframe selector, ...]} for
-    a field inside (nested) iframes. Kinds: number (required), expiry, or
-    exp_month and exp_year, cvc, name, postal_code; each must match one element
-    whose autocomplete names its kind (cc-number, cc-exp, cc-csc, cc-name,
-    postal-code), or a labelled tel input or select. pay: the Pay button, same
-    shape (a button or input type=submit; its label is shown to the owner).
-    browser_snapshot and browser_run_js see only the top document, not inside
-    a cross-origin checkout frame: there, use the provider's standard ids.
-    Every selector is printable plain CSS: a ``>>`` chain, an ``engine=`` prefix
-    (internal:, frame=, xpath=, text=), a quoted text or an XPath (``//``,
-    ``..``) is refused, and each element must live in the frame its chain names.
+    card_ref: card_ + 12 hex. amount: the total exactly as the page shows it,
+    digits included. fields: kind -> CSS selector, or {"selector", "frames":
+    [iframe selector, ...]}; kinds number (required), expiry or exp_month +
+    exp_year, cvc, name, postal_code. pay: the Pay button, same shape.
+    Selectors are printable plain CSS (no ``>>``, engine= prefix, quoted text
+    or XPath); each element must be in the frame its chain names. Snapshots
+    cannot see inside a cross-origin frame: use the provider's standard ids.
     expiry_format: MM/YY, MM / YY, MM-YY, MMYY, MM/YYYY or MMYYYY.
-    extra_fields: other checkout fields to fill first, name -> {"selector",
-    "value"}, names from email, name, phone, address_line1, address_line2, city,
-    region, postal_code, country, company (top document only; the owner sees
-    the names, never the values).
+    extra_fields: name -> {"selector", "value"} (email, name, phone,
+    address_line1, address_line2, city, region, postal_code, country, company;
+    top document only), filled before the tap.
 
-    Waits for the tap (up to about 12 minutes). Returns {code, status, host}
-    and, where they apply, filled (field kinds typed), field, reason. After Pay
-    the code is submitted_unverified, challenge, card_url_blocked (a request
-    carrying the card number in its URL was blocked), card_url_leaked (a
-    redirect carried it), pay_click_unknown (the click raised and nothing
-    moved) or outcome_unknown; for all but the first, do NOT
-    retry: tell the owner. moved_while_filling (Pay was not clicked, but the
-    checkout sent a top-level navigation or opened a window while the card was
-    typed) and card_url_before_pay (the card number went out in a URL while
-    typing) are do-NOT-retry too: the checkout may have submitted itself. The main browser does not get the
-    payment context's cookies back, so it may not show the order.
-
-    Refused while card fill is off (config/payments.yaml) or another payment runs.
+    Returns {code, status, host} (+ filled, field, reason where they apply).
+    submitted_unverified: check the order. challenge, card_url_blocked,
+    card_url_leaked, pay_click_unknown, outcome_unknown, moved_while_filling,
+    card_url_before_pay: do NOT retry; tell the owner. Refused while card fill
+    is off or another payment runs.
     """
     last_sent, sent = 0.0, 0
 
