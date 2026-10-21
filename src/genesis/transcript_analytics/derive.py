@@ -26,21 +26,49 @@ def is_current(data: Path) -> bool:
     return query.derived_current(data)
 
 
+def _sweep(root: Path, keep: frozenset[str] = frozenset()) -> None:
+    """Remove interrupted artifacts and obsolete snapshot directories.
+
+    Drops everything outside ``keep``: ``.staging`` trees, ``.current.*``
+    links, a real-directory ``current`` selector (malformed disposable
+    layout) and orphan snapshot directories.
+    """
+    staging_root = root / ".staging"
+    if staging_root.exists():
+        shutil.rmtree(staging_root)
+    for link in root.glob(".current.*"):
+        link.unlink()
+    current = root / "current"
+    if current.is_dir() and not current.is_symlink():
+        shutil.rmtree(current)
+    for directory in root.iterdir():
+        if (
+            directory.is_dir() and not directory.is_symlink()
+            and not directory.name.startswith(".") and directory.name not in keep
+        ):
+            shutil.rmtree(directory)
+
+
 def build(data: Path, *, lock_path: Path | None = None, if_stale: bool = False) -> dict:
     started = time.monotonic()
     root = data / "derived"
     with locks.writer(lock_path or store.DEFAULT_LOCK):
+        # Discard malformed disposable layouts and interrupted artifacts
+        # before deciding there is nothing to do: an if_stale no-op must
+        # not leave a crash's leftovers behind.
+        if root.is_symlink():
+            root.unlink()
+        if root.is_dir():
+            current = root / "current"
+            keep = frozenset({os.readlink(current)}) if current.is_symlink() else frozenset()
+            _sweep(root, keep)
         selection = store.select_sources(data)
         if if_stale and query.derived_current(data, selection=selection):
             return {"derived": "current; nothing to do"}
         store._make_directory(data)
         store._make_directory(root)
         staging_root = root / ".staging"
-        if staging_root.exists():
-            shutil.rmtree(staging_root)
-        staging_root.mkdir()
-        for link in root.glob(".current.*"):
-            link.unlink()
+        staging_root.mkdir(exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
         staging = staging_root / stamp
         staging.mkdir()
@@ -93,12 +121,7 @@ def build(data: Path, *, lock_path: Path | None = None, if_stale: bool = False) 
             shutil.rmtree(staging, ignore_errors=True)
             temporary.unlink(missing_ok=True)
             raise
-        for directory in root.iterdir():
-            if (
-                directory.is_dir() and not directory.is_symlink()
-                and not directory.name.startswith(".") and directory.name not in {stamp, previous}
-            ):
-                shutil.rmtree(directory)
+        _sweep(root, frozenset({stamp, previous}) - {None})
     return {
         "dir": str(final), "views": sorted(DERIVED_VIEWS),
         "seconds": round(time.monotonic() - started, 2),

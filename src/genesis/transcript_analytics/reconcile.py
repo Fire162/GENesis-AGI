@@ -232,7 +232,7 @@ def _spawn_associations(con):
 
       CREATE TEMP TABLE producers AS
       SELECT c.*,o.executor_id,o.attribution_status FROM raw_tool_calls c
-      JOIN tool_ownership o USING(tool_use_id)
+      JOIN tool_ownership o ON o.tool_use_id=c.tool_use_id AND o.source_file=c.source_file
       WHERE c.line_no_call IS NOT NULL AND c.tool IN ('Agent','Task');
 
       CREATE TEMP TABLE companion_assertions AS
@@ -300,7 +300,7 @@ def install(con):
     # Tool/result assertions are interpreted only for an observed Agent/Task call.
     con.execute("""
       CREATE TEMP TABLE tool_ownership AS
-      SELECT c.tool_use_id,
+      SELECT c.source_file,c.tool_use_id,
        CASE WHEN count(DISTINCT c.call_hash)=1 AND count(DISTINCT o.executor_id)=1
        AND count(*) FILTER(WHERE o.executor_id IS NULL)=0 THEN any_value(o.executor_id) END AS executor_id,
        CASE WHEN count(DISTINCT c.call_hash)>1 OR bool_or(o.attribution_status='conflicting') THEN 'conflicting'
@@ -309,7 +309,7 @@ def install(con):
        'reconciled call observations' AS attribution_reason,
        list_sort(list_distinct(flatten(list(o.context_sessions ORDER BY c.source_file,c.line_no_call)))) AS context_sessions
       FROM raw_tool_calls c LEFT JOIN event_ownership o ON o.event_key=coalesce('uuid:' || c.call_uuid,'local:' || c.source_file || ':' || c.line_no_call)
-      WHERE c.line_no_call IS NOT NULL GROUP BY c.tool_use_id
+      WHERE c.line_no_call IS NOT NULL GROUP BY c.source_file,c.tool_use_id
     """)
     _spawn_associations(con)
     rows = con.execute("""

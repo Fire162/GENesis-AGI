@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -22,7 +23,7 @@ import duckdb
 from genesis.transcript_analytics import history, store
 from genesis.transcript_analytics.extract import TABLES
 
-VIEWS_VERSION = "19"
+VIEWS_VERSION = "20"
 _READS = weakref.WeakKeyDictionary()
 _DERIVED = (
     "tool_calls",
@@ -61,8 +62,17 @@ _DERIVED = (
 
 
 def _snapshot(data, selection):
-    root = (data / "derived").resolve()
-    directory = (root / "current").resolve(strict=True)
+    # The disposable layout is a real derived/ directory whose current
+    # selector is a symlink into it; anything else is malformed cache and
+    # the reader falls back to the live views.
+    raw_root = data / "derived"
+    if raw_root.is_symlink() or not raw_root.is_dir():
+        raise ValueError("invalid snapshot root")
+    root = raw_root.resolve()
+    selector = root / "current"
+    if not selector.is_symlink():
+        raise ValueError("invalid snapshot selector")
+    directory = selector.resolve(strict=True)
     if directory.parent != root or not directory.is_dir():
         raise ValueError("invalid snapshot selector")
     manifest = json.loads((directory / "MANIFEST.json").read_text())
@@ -127,6 +137,8 @@ def _spill_directory():
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid()):
         raise ValueError("DuckDB temporary root is not an owned directory")
+    if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+        raise ValueError("DuckDB temporary root is writable without the sticky bit")
     # Each connection gets an atomically created 0700 child, independently of
     # umask and any permissive pre-existing root on trusted local storage.
     temporary = tempfile.TemporaryDirectory(prefix="private-", dir=root)
@@ -321,10 +333,14 @@ def run_query(
             ),
             file=sys.stderr,
         )
+        # live=False forbids raw access even when a failed snapshot load
+        # fell back to the live graph and raw_* views therefore exist.
+        if not live and re.search(r"\braw_[A-Za-z0-9_]*", sql):
+            raise ValueError("raw_* views require --live")
         try:
             rel = con.sql(sql, params=params)
         except duckdb.CatalogException as exc:
-            if snapshot is not None and "raw_" in str(exc):
+            if "raw_" in str(exc):
                 raise ValueError("raw_* views require --live") from exc
             raise
         result = (rel.columns, rel.fetchall()) if rel is not None else ([], [])
@@ -338,6 +354,7 @@ def run_query(
                     "snapshot_current": snapshot is not None,
                     "live": live,
                     "inventory": inventory,
+                    "inputs_signature": _READS[con]["inputs_signature"],
                     "versions": {k.decode(): v.decode() for k, v in store.semantics().items()},
                     "coverage": coverage,
                     "denominators": {
@@ -362,24 +379,64 @@ def run_query(
 
 _TOOL_VIEWS = """
 CREATE OR REPLACE VIEW tool_calls AS
+-- tool_use_id is only local to a transcript: copies of one call share its
+-- call observation key (uuid or source+line), while unrelated calls may
+-- reuse the id. Dedup on the observation key, then pair each result row to
+-- its best call on same-source/session evidence.
 WITH calls AS (
-  SELECT c.* FROM raw_tool_calls c
-  LEFT JOIN message_copy m ON m.turn_key = 'provider:' || c.message_id
-
-  WHERE c.line_no_call IS NOT NULL
-  QUALIFY row_number() OVER (PARTITION BY c.tool_use_id
-                             ORDER BY (c.source_file = m.source_file) DESC NULLS LAST,
-                                      c.source_file,
-                                      c.line_no_call) = 1),
+  SELECT * EXCLUDE (pick) FROM (
+    SELECT c.*, coalesce('uuid:' || c.call_uuid,
+                         'local:' || c.source_file || ':' || c.line_no_call) AS call_key,
+      count(DISTINCT c.call_hash) OVER (PARTITION BY coalesce('uuid:' || c.call_uuid,
+        'local:' || c.source_file || ':' || c.line_no_call)) AS call_variants,
+      bool_or(c.scrub_failed) OVER (PARTITION BY coalesce('uuid:' || c.call_uuid,
+        'local:' || c.source_file || ':' || c.line_no_call)) AS call_scrub_failed,
+      list(DISTINCT struct_pack(source_file:=c.source_file,line_no_call:=c.line_no_call,
+        line_no_result:=c.line_no_result)
+        ORDER BY struct_pack(source_file:=c.source_file,line_no_call:=c.line_no_call,
+        line_no_result:=c.line_no_result)) OVER (PARTITION BY coalesce('uuid:' || c.call_uuid,
+        'local:' || c.source_file || ':' || c.line_no_call)) AS call_references,
+      row_number() OVER (PARTITION BY coalesce('uuid:' || c.call_uuid,
+        'local:' || c.source_file || ':' || c.line_no_call)
+                         ORDER BY (c.source_file = m.source_file) DESC NULLS LAST,
+                                  c.source_file,
+                                  c.line_no_call) AS pick
+    FROM raw_tool_calls c
+    LEFT JOIN message_copy m ON m.turn_key = 'provider:' || c.message_id
+    WHERE c.line_no_call IS NOT NULL
+  ) WHERE pick = 1
+),
+paired AS (
+  SELECT * EXCLUDE (pick) FROM (
+    SELECT r.*, coalesce('uuid:' || k.call_uuid,
+                         'local:' || k.source_file || ':' || k.line_no_call) AS call_key,
+      coalesce('uuid:' || r.call_uuid,
+               'orphan:' || r.source_file || ':' || r.line_no_result) AS result_key,
+      row_number() OVER (PARTITION BY r.source_file, r.line_no_result
+                         ORDER BY (r.source_file = k.source_file) DESC NULLS LAST,
+                                  (r.session_id = k.session_id) DESC NULLS LAST,
+                                  k.source_file,
+                                  k.line_no_call) AS pick
+    FROM raw_tool_calls r
+    LEFT JOIN calls k ON k.tool_use_id = r.tool_use_id
+    WHERE r.has_result
+  ) WHERE pick = 1
+),
 results AS (
-  SELECT r.* FROM raw_tool_calls r
-  LEFT JOIN calls k ON k.tool_use_id = r.tool_use_id
-
-  WHERE r.has_result
-  QUALIFY row_number() OVER (PARTITION BY r.tool_use_id
-                             ORDER BY (r.source_file = k.source_file) DESC NULLS LAST,
-                                      r.source_file,
-                                      r.line_no_result) = 1)
+  SELECT * EXCLUDE (result_key) FROM paired
+  QUALIFY row_number() OVER (
+    PARTITION BY coalesce(call_key, result_key)
+    ORDER BY source_file, line_no_result) = 1
+),
+envelopes AS (
+  SELECT call_key, count(DISTINCT result_hash) AS result_variants,
+    bool_or(scrub_failed) AS result_scrub_failed,
+    list(DISTINCT struct_pack(source_file:=source_file,line_no_call:=line_no_call,
+      line_no_result:=line_no_result)
+      ORDER BY struct_pack(source_file:=source_file,line_no_call:=line_no_call,
+      line_no_result:=line_no_result)) AS result_references
+  FROM paired WHERE call_key IS NOT NULL GROUP BY call_key
+)
 SELECT
   coalesce(k.source_file, r.source_file) AS source_file,
  CASE WHEN len(own.context_sessions)=1 THEN own.context_sessions[1]
@@ -398,27 +455,20 @@ SELECT
   coalesce(r.has_result, false) AS has_result, r.is_error, r.error_source, r.error_class, r.error_text,
   r.tool_use_result_text, r.result_len, r.exit_code, r.interrupted, r.denial_kind,
   r.hook_event, r.hook_tool, r.hook_command, r.hook_script,
-  coalesce(scrubs.scrub_failed, k.scrub_failed, r.scrub_failed) AS scrub_failed,
+  coalesce(k.call_scrub_failed, env.result_scrub_failed, r.scrub_failed, k.scrub_failed) AS scrub_failed,
   r.source_file AS result_source_file, k.call_uuid,
   own.executor_id, own.attribution_status, own.attribution_reason, own.context_sessions,
   lineage.parent_actor_id AS delegator_id, lineage.lineage_status,
- coalesce(counts.call_variants=1 AND NOT states.content_conflict,false) AS call_valid,
- coalesce(counts.result_variants=1,false) AS result_valid,
-  counts.call_variants > 1 AS content_conflict, counts.result_variants > 1 AS result_conflict,
-  counts.source_references
-FROM calls k FULL OUTER JOIN results r ON r.tool_use_id = k.tool_use_id
-LEFT JOIN tool_ownership own ON own.tool_use_id=k.tool_use_id
+  coalesce(k.call_variants=1 AND NOT states.content_conflict,false) AS call_valid,
+  coalesce(env.result_variants=1, r.has_result, false) AS result_valid,
+  coalesce(k.call_variants > 1, false) AS content_conflict,
+  coalesce(env.result_variants > 1, false) AS result_conflict,
+  list_sort(list_distinct(list_concat(coalesce(k.call_references, []), coalesce(env.result_references, [])))) AS source_references
+FROM calls k FULL OUTER JOIN results r ON r.call_key = k.call_key
+LEFT JOIN envelopes env ON env.call_key = coalesce(k.call_key, r.call_key)
+LEFT JOIN tool_ownership own ON own.tool_use_id=k.tool_use_id AND own.source_file=k.source_file
 LEFT JOIN event_states states ON states.event_key=coalesce('uuid:' || k.call_uuid,'local:' || k.source_file || ':' || k.line_no_call)
-LEFT JOIN actor_lineage lineage ON lineage.actor_id=own.executor_id
-LEFT JOIN (SELECT tool_use_id,bool_or(scrub_failed) AS scrub_failed
- FROM raw_tool_calls GROUP BY tool_use_id) scrubs
- ON scrubs.tool_use_id=coalesce(k.tool_use_id,r.tool_use_id)
-LEFT JOIN (SELECT tool_use_id, count(DISTINCT call_hash) AS call_variants,
- count(DISTINCT result_hash) AS result_variants,
- list(DISTINCT struct_pack(source_file:=source_file,line_no_call:=line_no_call,line_no_result:=line_no_result)
- ORDER BY struct_pack(source_file:=source_file,line_no_call:=line_no_call,line_no_result:=line_no_result)) AS source_references
- FROM raw_tool_calls GROUP BY tool_use_id) counts
- ON counts.tool_use_id=coalesce(k.tool_use_id,r.tool_use_id);
+LEFT JOIN actor_lineage lineage ON lineage.actor_id=own.executor_id;
 
 """
 
@@ -490,7 +540,8 @@ WITH keyed AS (
  SELECT *,coalesce('uuid:' || uuid,'local:' || source_file || ':' || line_no) AS event_key
  FROM raw_hooks
 ), states AS (
- SELECT event_key,count(DISTINCT record_hash)>1 AS content_conflict,
+ SELECT event_key,CASE WHEN count(*) FILTER (WHERE record_hash IS NULL)>0 THEN NULL
+ ELSE count(DISTINCT record_hash)>1 END AS content_conflict,
  CASE WHEN count(DISTINCT actor_id)=1 AND NOT bool_or(context_conflict)
  THEN any_value(actor_id ORDER BY actor_id) END AS executor_id,
  list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions,
@@ -515,7 +566,8 @@ WITH keyed AS (
  SELECT *,coalesce('uuid:' || uuid,'local:' || source_file || ':' || line_no) AS event_key
  FROM raw_events
 ), states AS (
- SELECT event_key,count(DISTINCT record_hash)>1 AS content_conflict,
+ SELECT event_key,CASE WHEN count(*) FILTER (WHERE record_hash IS NULL)>0 THEN NULL
+ ELSE count(DISTINCT record_hash)>1 END AS content_conflict,
  CASE WHEN count(DISTINCT actor_id)=1 AND NOT bool_or(context_conflict)
  THEN any_value(actor_id ORDER BY actor_id) END AS executor_id,
  list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions,
@@ -540,14 +592,36 @@ SELECT session_id, kind, value, pr_repository, arg_max(ts,try_cast(ts AS TIMESTA
 FROM raw_session_meta GROUP BY session_id, kind, value, pr_repository;
 
 CREATE OR REPLACE VIEW agents AS
-SELECT a.* EXCLUDE (rn,scrub_failed),s.scrub_failed FROM (
-  SELECT *, row_number() OVER (PARTITION BY actor_id ORDER BY source_file) AS rn FROM raw_agents) a
-LEFT JOIN (SELECT actor_id,bool_or(scrub_failed) AS scrub_failed FROM raw_agents GROUP BY actor_id) s
-ON s.actor_id IS NOT DISTINCT FROM a.actor_id
+-- Historical adapters leave actor_id unknown; unknown actors must not be
+-- merged into one row, so unknown identities partition on a source-local key.
+SELECT a.* EXCLUDE (rn,dedup_key,scrub_failed),s.scrub_failed FROM (
+  SELECT *, coalesce(actor_id,
+      'unknown:' || source_file || ':' || coalesce(agent_id,'') || ':' ||
+      coalesce(tool_use_id,'') || ':' || coalesce(agent_type,'') || ':' ||
+      coalesce(description,'')) AS dedup_key,
+    row_number() OVER (
+    PARTITION BY coalesce(actor_id,
+      'unknown:' || source_file || ':' || coalesce(agent_id,'') || ':' ||
+      coalesce(tool_use_id,'') || ':' || coalesce(agent_type,'') || ':' ||
+      coalesce(description,''))
+    ORDER BY source_file) AS rn FROM raw_agents) a
+LEFT JOIN (SELECT coalesce(actor_id,
+      'unknown:' || source_file || ':' || coalesce(agent_id,'') || ':' ||
+      coalesce(tool_use_id,'') || ':' || coalesce(agent_type,'') || ':' ||
+      coalesce(description,'')) AS dedup_key,bool_or(scrub_failed) AS scrub_failed
+ FROM raw_agents GROUP BY 1) s
+ON s.dedup_key = a.dedup_key
 WHERE rn = 1;
 
 CREATE OR REPLACE VIEW sessions AS
-WITH t AS (
+WITH keys AS (
+  SELECT session_id FROM turns UNION
+  SELECT session_id FROM tool_calls UNION
+  SELECT session_id FROM hooks UNION
+  SELECT session_id FROM events UNION
+  SELECT session_id FROM session_meta UNION
+  SELECT session_id FROM agents
+), t AS (
   SELECT session_id, arg_min(ts,try_cast(ts AS TIMESTAMPTZ)) AS first_ts, arg_max(ts_last,try_cast(ts_last AS TIMESTAMPTZ)) AS last_ts, count(*) AS n_turns,
  count(*) FILTER(WHERE count_uncertain) AS n_turns_count_uncertain,
          count(*) FILTER (WHERE executor_id IS NOT NULL AND agent_id IS NULL) AS n_main_turns,
@@ -580,12 +654,19 @@ s AS (SELECT session_id, bool_or(scrub_failed) AS scrub_failed FROM (
  UNION ALL SELECT session_id,scrub_failed FROM hooks UNION ALL SELECT session_id,scrub_failed FROM events
  UNION ALL SELECT session_id,scrub_failed FROM session_meta UNION ALL SELECT session_id,scrub_failed FROM agents
 ) GROUP BY session_id)
-SELECT t.*, coalesce(c.n_tool_calls, 0) AS n_tool_calls, coalesce(c.n_tool_calls_excluded,0) AS n_tool_calls_excluded, coalesce(c.n_errors_flagged, 0) AS n_errors_flagged,
+SELECT k.session_id, t.first_ts, t.last_ts,
+       coalesce(t.n_turns,0) AS n_turns, coalesce(t.n_turns_count_uncertain,0) AS n_turns_count_uncertain,
+       coalesce(t.n_main_turns,0) AS n_main_turns, coalesce(t.n_unattributed_turns,0) AS n_unattributed_turns,
+       coalesce(t.n_subagents,0) AS n_subagents, t.output_tokens, t.input_tokens, t.cache_read, t.cache_create,
+       coalesce(t.n_turns_no_usage,0) AS n_turns_no_usage, t.models, t.cwd, t.git_branch,
+       coalesce(c.n_tool_calls, 0) AS n_tool_calls, coalesce(c.n_tool_calls_excluded,0) AS n_tool_calls_excluded,
+       coalesce(c.n_errors_flagged, 0) AS n_errors_flagged,
        coalesce(c.n_errors_text, 0) AS n_errors_text, coalesce(c.n_hook_blocks, 0) AS n_hook_blocks,
        m.ai_title, m.custom_title, m.pr_numbers, m.pr_links, s.scrub_failed
-FROM t LEFT JOIN c ON c.session_id IS NOT DISTINCT FROM t.session_id
-LEFT JOIN m ON m.session_id IS NOT DISTINCT FROM t.session_id
-LEFT JOIN s ON s.session_id IS NOT DISTINCT FROM t.session_id;
+FROM keys k LEFT JOIN t ON t.session_id IS NOT DISTINCT FROM k.session_id
+LEFT JOIN c ON c.session_id IS NOT DISTINCT FROM k.session_id
+LEFT JOIN m ON m.session_id IS NOT DISTINCT FROM k.session_id
+LEFT JOIN s ON s.session_id IS NOT DISTINCT FROM k.session_id;
 
 """
 

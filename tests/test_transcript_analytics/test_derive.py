@@ -159,11 +159,12 @@ def test_build_failure_keeps_old_snapshot_but_queries_use_fresh_live(built, monk
 def test_build_sweeps_killed_staging_and_temporary_links(built):
     _projects, data, _path = built
     root = data / "derived"
-    (root / ".staging/dead").mkdir()
+    (root / ".staging/dead").mkdir(parents=True)
     (root / ".staging/dead/body").write_bytes(b"incomplete")
     (root / ".current.424242").symlink_to("absent")
     derive.build(data)
-    assert not list((root / ".staging").iterdir())
+    staging = root / ".staging"
+    assert not staging.exists() or not list(staging.iterdir())
     assert not (root / ".current.424242").is_symlink()
 
 
@@ -231,3 +232,74 @@ def test_snapshot_preserves_reconciliation_query_surface(tmp_path):
     with query.read_connection(data) as con:
         assert query._READS[con]["snapshot"] is not None
         assert con.sql("SELECT count(*) FROM fragments").fetchone() == (1,)
+
+
+def test_if_stale_noop_still_sweeps_interrupted_artifacts(built):
+    """Codex: sweep interrupted artifacts before the early return."""
+    _projects, data, _path = built
+    root = data / "derived"
+    (root / ".staging" / "torn").mkdir(parents=True)
+    (root / ".current.999").symlink_to("torn")
+    (root / "orphaned-snapshot").mkdir()
+    assert derive.is_current(data)
+    assert derive.build(data, if_stale=True) == {"derived": "current; nothing to do"}
+    remaining = {entry.name for entry in root.iterdir()}
+    assert ".staging" not in remaining
+    assert not list(root.glob(".current.*"))
+    assert "orphaned-snapshot" not in remaining
+
+
+def test_non_symlink_snapshot_selector_is_rejected_and_falls_back(built):
+    """Codex: reject non-symlink snapshot selectors."""
+    _projects, data, _path = built
+    root = data / "derived"
+    selector = root / "current"
+    target = selector.resolve()
+    selector.unlink()
+    target.rename(selector)
+    assert selector.is_dir() and not selector.is_symlink()
+    assert not derive.is_current(data)
+    with query.read_connection(data) as con:
+        assert query._READS[con].get("snapshot") is None
+        assert con.sql("SELECT count(*) FROM tool_calls").fetchall()
+
+
+def test_symlink_derived_root_is_discarded_on_build(built):
+    """Codex: a symlinked derived root is malformed and must not be used."""
+    _projects, data, _path = built
+    root = data / "derived"
+    moved = data / "moved-derived"
+    root.rename(moved)
+    root.symlink_to(moved.name)
+    assert not derive.is_current(data)
+    derive.build(data)
+    assert root.is_dir() and not root.is_symlink()
+    assert derive.is_current(data)
+
+
+def test_raw_views_stay_forbidden_when_fallback_serves_live_graph(built):
+    """Codex: enforce live mode for raw views after snapshot fallback."""
+    _projects, data, _path = built
+    shutil.rmtree(data / "derived")
+    with pytest.raises(ValueError, match="require --live"):
+        query.run_query(data, "SELECT count(*) FROM raw_tool_calls", live=False)
+    columns, rows = query.run_query(data, "SELECT count(*) FROM raw_tool_calls", live=True)
+    assert rows
+
+
+def test_malformed_layout_is_swept_before_rebuild(built):
+    """Codex: discard invalid disposable layouts before rebuilding."""
+    _projects, data, _path = built
+    root = data / "derived"
+    selector = root / "current"
+    target = selector.resolve()
+    selector.unlink()
+    target.rename(selector)
+    (root / ".staging" / "torn").mkdir(parents=True)
+    (root / "orphaned").mkdir()
+    result = derive.build(data, if_stale=True)
+    assert result["dir"].endswith((root / "current").resolve().name)
+    names = {entry.name for entry in root.iterdir()}
+    assert ".staging" not in names and "orphaned" not in names
+    assert (root / "current").is_symlink()
+    assert derive.is_current(data)
