@@ -23,6 +23,11 @@ by an hourly refresh. Disk usage therefore grows with refreshes. **Pruning is
 maintenance: stop readers first.** `prune` removes the complete retained history
 of expired sources whose original transcript is gone, after checking the bound
 projects root. Ordinary ingestion never retires accepted history automatically.
+Pruning validates every retained directory revision and any shadowed flat
+record. Every record must have a known timestamp before the cutoff; unreadable,
+incompatible, incomplete or escaping records are retained. Symlinked source
+directories are never traversed for deletion. A present but invalid `current`
+selector excludes the source rather than resurrecting its shadowed flat data.
 
 ## Historical records
 

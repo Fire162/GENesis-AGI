@@ -13,17 +13,17 @@ from .schema import SCHEMAS
 _FORMATS = {
     (
         b"1",
-        b"a61bb523389105b68dd9a7a29f461f0633b9572d66460de79e8f8bc4d0232a31",
+        b"a61bb523389105b68dd9a7a29f461f0633b9572d66460de79e8f8bc4d0232a31",  # pragma: allowlist secret — historical extraction fingerprint
         b"b1501d5b2d7a",
     ): "flat-v1",
     (
         b"5",
-        b"5c864e56212e8cd3970105505fc5fc4de7299558b4764f7b0edda5cfef1ce376",
+        b"5c864e56212e8cd3970105505fc5fc4de7299558b4764f7b0edda5cfef1ce376",  # pragma: allowlist secret — historical extraction fingerprint
         b"8d476988235f:scoped-json-4",
     ): "record-v5",
     (
         b"5",
-        b"8a232bd90fbc6680f2c726c6ec048e47ab1866492ccd47acabed02c8c75aef8d",
+        b"8a232bd90fbc6680f2c726c6ec048e47ab1866492ccd47acabed02c8c75aef8d",  # pragma: allowlist secret — historical extraction fingerprint
         b"8d476988235f:scoped-json-4",
     ): "record-v5",
 }

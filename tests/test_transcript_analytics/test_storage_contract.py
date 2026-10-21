@@ -102,6 +102,44 @@ def test_audited_history_preserves_original_stamps_flags_and_unknowns(tmp_path, 
         assert history.unknown_facts(label)["missing_columns"]["fragments"]
 
 
+def _historical_catalog(data, selection, projects_root="/tmp"):
+    (data / "source-catalog.json").write_text(json.dumps({
+        "format": "ta-source-catalog-v1",
+        "revision": "a" * 32,
+        "population_revision": "b" * 32,
+        "projects_root": projects_root,
+        "sources": selection,
+        "collection": {},
+    }))
+
+
+def test_audited_catalog_selects_record_v5_without_current(tmp_path):
+    data = tmp_path / "data"
+    shutil.copytree(FIXTURES / "record-v5", data, symlinks=True)
+    key = "654b8297f331da22"
+    generation = "4562a1dd28154d94aa214d66bdeb2b6f"
+    (data / "sources" / key / "current").unlink()
+    _historical_catalog(data, {key: generation})
+    selected, excluded = store.select_sources(data)
+    assert not excluded and len(selected) == 1
+    assert selected[0].adapter == "record-v5"
+    assert selected[0].directory == data / "sources" / key / generation
+
+
+@pytest.mark.parametrize("catalog", ["missing-key", "malformed"])
+def test_invalid_catalog_never_falls_back_to_flat_or_glob(tmp_path, catalog):
+    data = tmp_path / "data"
+    shutil.copytree(FIXTURES / "flat-v1", data)
+    if catalog == "malformed":
+        (data / "source-catalog.json").write_text("{")
+    else:
+        _historical_catalog(data, {})
+    selected, excluded = store.select_sources(data)
+    assert not selected
+    assert excluded[0]["reason"] == "invalid source selector"
+    assert len(list(data.glob("*__*.parquet"))) == len(TABLES)
+
+
 def test_unknown_historical_signature_is_excluded_not_current(tmp_path):
     data = tmp_path / "data"
     shutil.copytree(FIXTURES / "record-v5", data, symlinks=True)

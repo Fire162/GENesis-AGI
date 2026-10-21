@@ -180,16 +180,90 @@ def _flat_sources(data: Path) -> set[str]:
     return keys
 
 
+_CATALOG_FIELDS = {
+    "format",
+    "revision",
+    "population_revision",
+    "projects_root",
+    "sources",
+    "collection",
+}
+
+
+def _no_duplicate_catalog_keys(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError("invalid source selector")
+        result[key] = value
+    return result
+
+
+def _historical_catalog(data: Path) -> dict[str, str] | None:
+    """Read the audited #3002 selector; never choose a generation without it."""
+    try:
+        raw = (data / "source-catalog.json").read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("invalid source selector") from exc
+    try:
+        value = json.loads(raw, object_pairs_hook=_no_duplicate_catalog_keys)
+        if (
+            not isinstance(value, dict)
+            or set(value) != _CATALOG_FIELDS
+            or value["format"] != "ta-source-catalog-v1"
+            or not _RECORD.fullmatch(value["revision"])
+            or not _RECORD.fullmatch(value["population_revision"])
+            or not isinstance(value["projects_root"], str)
+            or not value["projects_root"].startswith("/")
+            or os.path.normpath(value["projects_root"]) != value["projects_root"]
+            or not isinstance(value["sources"], dict)
+            or not isinstance(value["collection"], dict)
+        ):
+            raise ValueError("invalid source selector")
+        selection = {}
+        for source_key, generation in value["sources"].items():
+            if not _KEY.fullmatch(source_key) or not (
+                generation == "legacy" or _RECORD.fullmatch(generation)
+            ):
+                raise ValueError("invalid source selector")
+            selection[source_key] = generation
+        return selection
+    except (TypeError, AttributeError, UnicodeError, RecursionError, ValueError) as exc:
+        raise ValueError("invalid source selector") from exc
+
+
 def _records(data: Path, key: str) -> list[Path]:
-    """Record directories for a key, current first."""
+    """Resolve one selector; absent per-source selectors may use audited history."""
     base = data / "sources" / key
     current = base / "current"
-    if not current.is_symlink():
-        return []
-    resolved = (base / os.readlink(current)).resolve()
-    if resolved.parent != base.resolve() or not resolved.is_dir():
-        return []
-    return [resolved]
+    try:
+        if base.is_symlink() or base.parent.is_symlink():
+            raise ValueError("invalid source selector")
+        current.lstat()
+    except FileNotFoundError:
+        selection = _historical_catalog(data)
+        if selection is None:
+            return []
+        generation = selection.get(key)
+        if generation == "legacy":
+            return []
+        if generation is None:
+            raise ValueError("invalid source selector") from None
+        directory = base / generation
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ValueError("invalid source selector") from None
+        return [directory]
+    except OSError as exc:
+        raise ValueError("invalid source selector") from exc
+    try:
+        resolved = current.resolve(strict=True)
+        if not current.is_symlink() or resolved.parent != base.resolve() or not resolved.is_dir():
+            raise ValueError("invalid source selector")
+        return [resolved]
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("invalid source selector") from exc
 
 
 def source_keys(data: Path) -> list[str]:
@@ -197,7 +271,7 @@ def source_keys(data: Path) -> list[str]:
     root = data / "sources"
     if root.is_dir():
         for entry in root.iterdir():
-            if _KEY.fullmatch(entry.name) and (entry / "current").is_symlink():
+            if _KEY.fullmatch(entry.name):
                 keys.add(entry.name)
     return sorted(keys)
 
@@ -231,8 +305,15 @@ class SourceRecord:
 
 def capture_source(data: Path, key: str):
     """Resolve once, then validate all six tables against that same selection."""
-    directories = _records(data, key)
+    try:
+        directories = _records(data, key)
+    except ValueError:
+        return SourceRecord(key, data, None, {}), "invalid source selector"
     record = SourceRecord(key, data, directories[0] if directories else None, {})
+    return _capture_record(record)
+
+
+def _capture_record(record):
     try:
         marker = pq.read_metadata(record.path(MARKER)).metadata or {}
     except (OSError, ValueError, KeyError):
@@ -272,8 +353,13 @@ def capture_source(data: Path, key: str):
         for md in records
     ):
         return record, "inconsistent record"
-    if srckey(os.fsdecode(first.get(b"ta.source", b""))) != key:
+    if srckey(os.fsdecode(first.get(b"ta.source", b""))) != record.key:
         return record, "source identity conflict"
+    if record.directory and (
+        not re.fullmatch(r"[0-9a-f]{32}", record.directory.name)
+        or _record_id(first) != os.fsencode(record.directory.name)
+    ):
+        return record, "record directory identity conflict"
     return record, None
 
 
@@ -406,9 +492,20 @@ def _publish_record(data: Path, key: str, meta: dict, table_reader) -> str:
         _fsync_directory(staging.parent)
         link_tmp = key_base / f".current.{os.getpid()}"
         link_tmp.unlink(missing_ok=True)  # crashed swap may leave a same-pid temp link
+        current = key_base / "current"
+        previous = os.readlink(current) if current.is_symlink() else None
         os.symlink(record, link_tmp)
-        os.replace(link_tmp, key_base / "current")
-        _fsync_directory(key_base)
+        os.replace(link_tmp, current)
+        try:
+            _fsync_directory(key_base)
+        except BaseException:
+            if previous is None:
+                current.unlink()
+            else:
+                link_tmp.symlink_to(previous)
+                os.replace(link_tmp, current)
+            _fsync_directory(key_base)
+            raise
         _prune_staging_parents(staging)
         return record
     except BaseException:
@@ -534,9 +631,9 @@ def ingest(
         _make_directory(data)
         os.chmod(data, 0o700)
         root = _projects_root(data, projects, adopt=adopt_projects_root)
+        sources = discover(projects)
         _atomic_write(data / "projects-root.json", json.dumps({"projects_root": root}))
         _sweep_staging(data)
-        sources = discover(projects)
         keys = set(source_keys(data))
         unbuilt = {source_identity(rel) for _, rel in sources if srckey(rel) not in keys}
         for path, rel in sources:
@@ -595,7 +692,13 @@ def _prunable_key(marker, projects, cutoff, key=None):
         md = pq.read_metadata(marker).metadata or {}
         rel = os.fsdecode(md.get(b"ta.source", b""))
         last = _utc_timestamp(md.get(b"ta.last_ts", b"").decode())
-    except (OSError, ValueError):
+        relative = Path(rel)
+        if (
+            not relative.parts or relative.is_absolute() or ".." in relative.parts
+            or not (projects / relative).resolve().is_relative_to(projects.resolve())
+        ):
+            return None
+    except (OSError, ValueError, RuntimeError):
         print(f"prune: unreadable marker retained: {marker.name}", file=sys.stderr)
         return None
     if not rel or (key is not None and srckey(rel) != key) or (projects / rel).exists():
@@ -610,6 +713,8 @@ def _prunable_key(marker, projects, cutoff, key=None):
 
 def _remove_record(data: Path, key: str):
     base = data / "sources" / key
+    if base.is_symlink() or base.parent.is_symlink():
+        raise ValueError("refusing symlinked source directory")
     if base.is_dir() or base.is_symlink():
         for entry in list(base.iterdir()):
             if entry.is_dir() and not entry.is_symlink():
@@ -623,9 +728,47 @@ def _remove_record(data: Path, key: str):
     _fsync_directory(data)
 
 
+def _retained_records(data, key):
+    selected, reason = capture_source(data, key)
+    if reason:
+        return []
+    records = [selected]
+    base = data / "sources" / key
+    try:
+        if base.exists():
+            for entry in base.iterdir():
+                if entry.name == "current" or entry == selected.directory:
+                    continue
+                if entry.is_symlink() or not entry.is_dir():
+                    return []
+                record, reason = _capture_record(SourceRecord(key, data, entry, {}))
+                if reason:
+                    return []
+                records.append(record)
+        if selected.directory and any(
+            os.path.lexists(data / f"{table}__{key}.parquet") for table in TABLES
+        ):
+            flat, reason = _capture_record(SourceRecord(key, data, None, {}))
+            if reason:
+                return []
+            records.append(flat)
+    except (OSError, ValueError, RuntimeError):
+        return []
+    return records
+
+
+def _prunable_record(record: SourceRecord, projects: Path, cutoff: datetime, key: str):
+    # flat-v1 stamps the newest persisted row, not the source chronology. When
+    # the original is gone there is no trustworthy bound proving later source
+    # events were never extracted, so retirement must retain it.
+    if record.adapter == "flat-v1":
+        return None
+    return _prunable_key(record.path(MARKER), projects, cutoff, key)
+
+
 def prune(data: Path, *, before: str, projects: Path, lock_path: Path | None = None) -> int:
     """Delete the files of sources whose transcript is GONE and whose last
-    record is older than ``before`` (ISO date). A source whose transcript
+    validated retained records are all older than ``before`` (ISO date). A source whose transcript
     still exists is kept: the next ingest would only rebuild it.
 
     Maintenance only: stop readers first. Refuses (ValueError) a malformed date, and a projects directory that is
@@ -646,11 +789,12 @@ def prune(data: Path, *, before: str, projects: Path, lock_path: Path | None = N
             raise ValueError("projects root differs from the store")
         retired = []
         for key in source_keys(data):
-            marker = _table_path(data, MARKER, key)
-            key = _prunable_key(marker, projects, cutoff, key)
-            if key is None:
-                continue
-            retired.append(key)
+            records = _retained_records(data, key)
+            if records and all(
+                _prunable_record(record, projects, cutoff, key) == key
+                for record in records
+            ):
+                retired.append(key)
         for key in retired:
             _remove_record(data, key)
         removed = len(retired)
