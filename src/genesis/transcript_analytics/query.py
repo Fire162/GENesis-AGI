@@ -154,11 +154,31 @@ def read_connection(data):
         yield con
 
 
+def _scrub_manifest_json(value, key=None):
+    from . import scrub
+
+    source_keys = {"source", "source_file", "ta.source", "failed_sources", "unbuilt", "source_references"}
+    if isinstance(value, dict):
+        return {k: _scrub_manifest_json(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_manifest_json(v, key) for v in value]
+    if key == "projects_root":
+        return "[redacted]"
+    if key in source_keys and isinstance(value, str):
+        try:
+            return store.srckey(store.source_path(value))
+        except (TypeError, ValueError):
+            return "[redacted]"
+    if isinstance(value, str):
+        return scrub.scrub_text(value)[0]
+    return value
+
+
 def _write_manifest(path, value: dict):
     """Private atomic evidence manifest publication; no outcome database."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    value = {"generated_at": datetime.now(UTC).isoformat(), **value}
+    value = {"generated_at": datetime.now(UTC).isoformat(), **_scrub_manifest_json(value)}
     fd, temporary = tempfile.mkstemp(prefix=".evidence-", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as stream:
@@ -202,9 +222,11 @@ def run_query(
     ``live`` is retained for callers shared with the snapshot path; the
     derived-cache PR gives ``live=False`` its meaning. All reads are live here.
     """
-    inventory = store.inventory(data)
     with contextlib.closing(connect(data)) as con:
         coverage = _READS[con]["coverage"]
+        # The inventory is diagnostic and read only after the immutable source
+        # selection has been captured; manifest consumers should use coverage.
+        inventory = store.inventory(data)
         print(
             json.dumps(
                 {
@@ -284,7 +306,7 @@ SELECT
   coalesce(r.has_result, false) AS has_result, r.is_error, r.error_source, r.error_class, r.error_text,
   r.tool_use_result_text, r.result_len, r.exit_code, r.interrupted, r.denial_kind,
   r.hook_event, r.hook_tool, r.hook_command, r.hook_script,
-  coalesce(k.scrub_failed, false) OR coalesce(r.scrub_failed, false) AS scrub_failed,
+  coalesce(scrubs.scrub_failed, k.scrub_failed, r.scrub_failed) AS scrub_failed,
   r.source_file AS result_source_file, k.call_uuid,
   own.executor_id, own.attribution_status, own.attribution_reason, own.context_sessions,
   lineage.parent_actor_id AS delegator_id, lineage.lineage_status,
@@ -296,6 +318,9 @@ FROM calls k FULL OUTER JOIN results r ON r.tool_use_id = k.tool_use_id
 LEFT JOIN tool_ownership own ON own.tool_use_id=k.tool_use_id
 LEFT JOIN event_states states ON states.event_key=coalesce('uuid:' || k.call_uuid,'local:' || k.source_file || ':' || k.line_no_call)
 LEFT JOIN actor_lineage lineage ON lineage.actor_id=own.executor_id
+LEFT JOIN (SELECT tool_use_id,bool_or(scrub_failed) AS scrub_failed
+ FROM raw_tool_calls GROUP BY tool_use_id) scrubs
+ ON scrubs.tool_use_id=coalesce(k.tool_use_id,r.tool_use_id)
 LEFT JOIN (SELECT tool_use_id, count(DISTINCT call_hash) AS call_variants,
  count(DISTINCT result_hash) AS result_variants,
  list(DISTINCT struct_pack(source_file:=source_file,line_no_call:=line_no_call,line_no_result:=line_no_result)
@@ -423,8 +448,11 @@ SELECT session_id, kind, value, pr_repository, arg_max(ts,try_cast(ts AS TIMESTA
 FROM raw_session_meta GROUP BY session_id, kind, value, pr_repository;
 
 CREATE OR REPLACE VIEW agents AS
-SELECT * EXCLUDE (rn) FROM (
-  SELECT *, row_number() OVER (PARTITION BY actor_id ORDER BY source_file) AS rn FROM raw_agents) WHERE rn = 1;
+SELECT a.* EXCLUDE (rn,scrub_failed),s.scrub_failed FROM (
+  SELECT *, row_number() OVER (PARTITION BY actor_id ORDER BY source_file) AS rn FROM raw_agents) a
+LEFT JOIN (SELECT actor_id,bool_or(scrub_failed) AS scrub_failed FROM raw_agents GROUP BY actor_id) s
+ON s.actor_id IS NOT DISTINCT FROM a.actor_id
+WHERE rn = 1;
 
 CREATE OR REPLACE VIEW sessions AS
 WITH t AS (
@@ -462,7 +490,7 @@ s AS (SELECT session_id, bool_or(scrub_failed) AS scrub_failed FROM (
 ) GROUP BY session_id)
 SELECT t.*, coalesce(c.n_tool_calls, 0) AS n_tool_calls, coalesce(c.n_tool_calls_excluded,0) AS n_tool_calls_excluded, coalesce(c.n_errors_flagged, 0) AS n_errors_flagged,
        coalesce(c.n_errors_text, 0) AS n_errors_text, coalesce(c.n_hook_blocks, 0) AS n_hook_blocks,
-       m.ai_title, m.custom_title, m.pr_numbers, m.pr_links, coalesce(s.scrub_failed, false) AS scrub_failed
+       m.ai_title, m.custom_title, m.pr_numbers, m.pr_links, s.scrub_failed
 FROM t LEFT JOIN c ON c.session_id IS NOT DISTINCT FROM t.session_id
 LEFT JOIN m ON m.session_id IS NOT DISTINCT FROM t.session_id
 LEFT JOIN s ON s.session_id IS NOT DISTINCT FROM t.session_id;

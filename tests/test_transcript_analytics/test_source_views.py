@@ -130,4 +130,4 @@ def test_query_metadata_does_not_reresolve_source_selection(tmp_path, monkeypatc
     assert query.run_query(
         data, "select count(*) from tool_calls", live=True, manifest_path=manifest
     )[1] == [(1,)]
-    assert json.loads(manifest.read_text())["source_references"] == ["source.jsonl"]
+    assert json.loads(manifest.read_text())["source_references"] == [store.srckey("source.jsonl")]
