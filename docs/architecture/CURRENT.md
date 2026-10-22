@@ -2861,6 +2861,12 @@ verified: 672c01e41 2026-10-22
   ambiguous reused IDs without choosing an owner. Scheduling arrives in a
   dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
+  Unknown historical content is excluded from content metrics; query manifests
+  identify the views version. Historical actors without identities cannot form
+  lineage nodes. Paired-result IDs remain searchable raw evidence but do not
+  prove or contradict lineage: their independent result context was not retained.
+  Independent companion evidence and scoped unpaired results remain eligible;
+  paired-only associations stay unresolved and excluded from confirmed coverage.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
   interpreter operands; ambiguous commands report `<unknown>` while preserving
