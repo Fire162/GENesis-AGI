@@ -90,6 +90,8 @@ It fsyncs every Parquet file, the manifest and the directory, publishes the
 complete `derived/<stamp>/`, then atomically replaces `derived/current`.
 The immediately previous snapshot is retained; older cache directories and
 interrupted staging are disposable. No durable source is removed by a build.
+Rebuilding removes malformed staging and selector entries by their actual type;
+cache symlinks are unlinked without inspecting or deleting their targets.
 
 `query.connect(data)` and `run_query` prefer a snapshot whose manifest matches
 both the current views version and the captured inputs signature. Every table
@@ -113,7 +115,7 @@ apply to snapshot materialization. `derive.is_current` checks the complete
 cache, not just file existence.
 
 After backup restore, call `derive.discard_after_restore(data)`: it deletes
-only `derived/`, without changing source records, original stamps, root binding
+only `derived/` and syncs its parent directory before returning, without changing source records, original stamps, root binding
 or inventory. Live queries work immediately and snapshots rebuild from durable
 records even when their original transcripts are permanently gone. Additional backup and restore command wiring is deferred; it does not gate
 collection, live search or opportunity scanning.
