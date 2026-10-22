@@ -120,3 +120,18 @@ that response finishes; the captured metadata remains internally consistent.
 forced live reader, one connection at a time. It compares schema, row counts and
 row digests for every shared relation. Missing, stale or unreadable caches report
 unavailable rather than passing a comparison of live views with themselves.
+
+## Source evidence
+
+`evidence --tool-use-id ID` uses the live query reader's accepted source references
+to find call and result observations separately. It verifies each original block's
+ID and content hash before returning scrubbed context. Changed or missing originals
+remain unavailable; the existing authenticated local archive fallback is optional.
+The default is five surrounding records and 64 KiB total JSON output.
+
+A reused tool ID can identify several logical calls or orphan results. In that
+case the command reports `unavailable` and `candidate_count`, with no arbitrarily
+selected owner or context. Inspect `tool_calls.source_references` through live SQL
+to distinguish candidates. Physical copies of one logical call retain all their
+references and do not by themselves create ambiguity. Evidence preserves the
+query's confirmed/inferred/unresolved/conflicting attribution fields.

@@ -2789,7 +2789,9 @@ verified: 0866a0f6545b 2026-10-22
   tool blocks remain distinct, and uncertain result or delegation matches stay
   unresolved. This CLI candidate exposes opt-in capped collection, status, live
   SQL, disposable cache building and independent live/cache verification. The
-  installed default remains off; scheduling arrives in a dependent change. Additional backup
+  installed default remains off; source evidence validates the selected original
+  block's ID/hash and reports ambiguous reused IDs without choosing an owner.
+  Scheduling arrives in a dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
