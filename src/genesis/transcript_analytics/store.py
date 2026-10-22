@@ -544,7 +544,7 @@ def _build_source(
     # Fingerprint the descriptor actually read (review #23): a path re-stat can
     # describe a different inode than the one extraction consumed, and comparing
     # only ``meta`` missed body churn. Compare the whole fingerprint afterwards.
-    with open(path, "rb") as handle:
+    with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW)) as handle:
         res = extract_source(path, rel, stop_at=st.st_size, fh=handle)
         observed = source_fingerprint(path, os.fstat(handle.fileno()))
     if observed != fp:
@@ -737,7 +737,10 @@ def _retained_records(data, key):
     try:
         if base.exists():
             for entry in base.iterdir():
-                if entry.name == "current" or entry == selected.directory:
+                if (
+                    entry.name == "current" or entry == selected.directory
+                    or (entry.is_symlink() and re.fullmatch(r"\.current\.[0-9]+", entry.name))
+                ):
                     continue
                 if entry.is_symlink() or not entry.is_dir():
                     return []

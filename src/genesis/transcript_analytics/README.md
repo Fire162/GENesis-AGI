@@ -7,6 +7,11 @@ under `sources/<key>/<record>/`, then atomically replaces that source's `current
 symlink. Files and containing directories are fsync'd before the selector is
 published. An interrupted refresh never overwrites the accepted record.
 `build_source`, ingest and prune use the same exclusive writer flock.
+Collection opens the source leaf without following symlinks, including a leaf
+replaced after discovery. Directory durability fencing currently opens every
+ancestor of the data directory; execute-only ancestors are unsupported.
+During first publication, a concurrent reader may briefly report the new source
+as excluded until its selector exists. It never admits an incomplete record.
 
 This **directory/current-link layout is an owner-approved deviation** from the
 original per-file replacement spec in #3425. Six independent replacements are
@@ -28,6 +33,8 @@ record. Every record must have a known timestamp before the cutoff; unreadable,
 incompatible, incomplete or escaping records are retained. Symlinked source
 directories are never traversed for deletion. A present but invalid `current`
 selector excludes the source rather than resurrecting its shadowed flat data.
+Reserved `.current.<decimal-pid>` symlinks left by interrupted swaps do not block
+maintenance eligibility; their targets are never followed during deletion.
 
 ## Historical records
 
