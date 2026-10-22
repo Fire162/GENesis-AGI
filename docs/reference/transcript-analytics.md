@@ -51,5 +51,9 @@ unattended hourly collection; this CLI does not activate scheduling.
 
 Accepted revisions remain until explicit maintenance. Stop readers before pruning.
 Historical adapters retain original provenance and mark unavailable facts unknown.
+Paired tool results keep their raw child IDs searchable, but those IDs alone cannot
+establish or contradict an agent relationship because their independent result
+context was not retained. Independent companion and scoped unpaired-result proof
+remain eligible; unsupported relationships stay unknown.
 See the [store and reader contract](../../src/genesis/transcript_analytics/README.md)
 for source selection, retention, reconciliation and snapshot details.
