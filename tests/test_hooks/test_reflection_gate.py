@@ -31,7 +31,12 @@ _spec.loader.exec_module(_gate)
 
 CODEX = "chatgpt-codex-connector[bot]"
 P2 = "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow)</sub></sub>  Off by one**"
-REVIEWED = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+
+
+def _reviewed() -> str:
+    """Two hours ago, read when a round is built (never at import): the round is
+    then settled, and its reflection is later than its review."""
+    return (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -81,7 +86,7 @@ def _open_round(monkeypatch, repo: Path, *, gate: bool = False) -> str:
         "login": CODEX,
         "commit_id": head,
         "state": "COMMENTED",
-        "submitted_at": REVIEWED,
+        "submitted_at": _reviewed(),
         "body": "",
         "top_level": [P2],
         "top_level_ids": [11],
@@ -300,16 +305,21 @@ def test_a_near_miss_reflection_is_denied_with_its_exit(
 
 
 def _past_the_budget(monkeypatch, repo: Path) -> str:
-    """Four rounds (three earlier heads plus the repo's head): the ordinary lane's
-    standing budget is spent, so every commit would get the round-approval ask."""
-    head = _open_round(monkeypatch, repo)
-    fakes = [f"{d}" * 40 for d in "def"]
-    rows = [{"sha": fakes[0], "parents": []}]
-    rows += [{"sha": fakes[i], "parents": [fakes[i - 1]]} for i in (1, 2)]
-    rows.append({"sha": head, "parents": [fakes[2]]})
+    """Four rounds on four REAL commits (so their ancestry is readable whatever the
+    clock says relative to the cutover): the ordinary lane's standing budget is
+    spent, so every commit would get the round-approval ask."""
+    _open_round(monkeypatch, repo)
+    for n in (1, 2, 3):
+        (repo / "f.py").write_text(f"value = {10 + n}\n")
+        _git(repo, "commit", "-qam", f"fix {n}")
+    shas = _git(repo, "rev-list", "--reverse", "HEAD").split()
+    head = shas[-1]
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_HEAD", head)
+    rows = [{"sha": shas[0], "parents": []}]
+    rows += [{"sha": shas[i], "parents": [shas[i - 1]]} for i in range(1, len(shas))]
     monkeypatch.setenv("_TEST_REVIEW_BUDGET_COMMITS", "\n".join(json.dumps(r) for r in rows))
     reviews = []
-    for i, sha in enumerate([*fakes, head]):
+    for i, sha in enumerate(shas[-4:]):
         when = (datetime.now(UTC) - timedelta(hours=5 - i)).isoformat().replace("+00:00", "Z")
         reviews.append(
             {
