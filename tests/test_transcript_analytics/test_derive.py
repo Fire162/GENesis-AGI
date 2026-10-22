@@ -303,3 +303,99 @@ def test_malformed_layout_is_swept_before_rebuild(built):
     assert ".staging" not in names and "orphaned" not in names
     assert (root / "current").is_symlink()
     assert derive.is_current(data)
+
+
+@pytest.mark.parametrize("entry,kind", [
+    (".staging", "file"), (".staging", "link"), (".staging", "dangling"),
+    (".current.424242", "directory"), (".current.424242", "file"),
+    (".current.424242", "link"), (".", "file"),
+])
+def test_rebuild_recovers_malformed_cache_entry_types(built, tmp_path, entry, kind):
+    _projects, data, _path = built
+    root = data / "derived"
+    target = root if entry == "." else root / entry
+    if target.is_dir():
+        shutil.rmtree(target)
+    outside = tmp_path / "outside-cache"
+    outside.mkdir()
+    sentinel = outside / "retained"
+    sentinel.write_text("keep")
+    if kind == "directory":
+        target.mkdir()
+        (target / "partial").write_text("interrupted")
+    elif kind in {"link", "dangling"}:
+        target.symlink_to(outside if kind == "link" else outside / "absent")
+    else:
+        target.write_text("malformed")
+    derive.build(data, if_stale=True)
+    assert derive.is_current(data)
+    assert sentinel.read_text() == "keep"
+    assert not (root / ".staging").exists()
+    assert not (root / ".staging").is_symlink()
+    assert not (root / ".current.424242").exists()
+    with query.read_connection(data) as con:
+        assert con.sql("SELECT output_tokens FROM turns").fetchall() == [(1,)]
+
+
+@pytest.mark.parametrize("kind", ["directory", "file", "link", "dangling"])
+def test_restore_cache_discard_syncs_parent_after_removal(tmp_path, monkeypatch, kind):
+    data = tmp_path / "data"
+    data.mkdir()
+    root = data / "derived"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "retained").write_text("keep")
+    if kind == "directory":
+        root.mkdir()
+    elif kind in {"link", "dangling"}:
+        root.symlink_to(outside if kind == "link" else outside / "absent")
+    else:
+        root.write_text("malformed")
+    synced = []
+    fsync = store._fsync_directory
+
+    def record_sync(path):
+        assert not root.exists() and not root.is_symlink()
+        synced.append(path)
+        fsync(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", record_sync)
+    derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+    assert synced == [data]
+    assert (outside / "retained").read_text() == "keep"
+
+
+def test_restore_cache_discard_reports_failed_parent_sync(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    (data / "derived").mkdir(parents=True)
+
+    def fail_sync(_path):
+        raise OSError("synthetic directory sync failure")
+
+    monkeypatch.setattr(store, "_fsync_directory", fail_sync)
+    with pytest.raises(OSError, match="synthetic directory sync failure"):
+        derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+
+
+@pytest.mark.parametrize("entry", [".staging", ".current.424242", "current", "."])
+def test_rebuild_unlinks_cache_links_without_searching_their_targets(built, tmp_path, entry):
+    _projects, data, _path = built
+    root = data / "derived"
+    target = root if entry == "." else root / entry
+    if target.is_symlink():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    outside = tmp_path / "outside-cache"
+    nested = outside / "nested"
+    nested.mkdir(parents=True)
+    sentinel = nested / "retained"
+    sentinel.write_text("keep")
+    target.symlink_to(nested)
+    outside.chmod(0)
+    try:
+        derive.build(data, if_stale=True)
+    finally:
+        outside.chmod(0o700)
+    assert sentinel.read_text() == "keep"
+    assert derive.is_current(data)

@@ -26,6 +26,13 @@ def is_current(data: Path) -> bool:
     return query.derived_current(data)
 
 
+def _remove_cache_entry(path: Path) -> None:
+    if not path.is_symlink() and path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
 def _sweep(root: Path, keep: frozenset[str] = frozenset()) -> None:
     """Remove interrupted artifacts and obsolete snapshot directories.
 
@@ -33,17 +40,15 @@ def _sweep(root: Path, keep: frozenset[str] = frozenset()) -> None:
     links, a real-directory ``current`` selector (malformed disposable
     layout) and orphan snapshot directories.
     """
-    staging_root = root / ".staging"
-    if staging_root.exists():
-        shutil.rmtree(staging_root)
+    _remove_cache_entry(root / ".staging")
     for link in root.glob(".current.*"):
-        link.unlink()
+        _remove_cache_entry(link)
     current = root / "current"
-    if current.is_dir() and not current.is_symlink():
+    if not current.is_symlink() and current.is_dir():
         shutil.rmtree(current)
     for directory in root.iterdir():
         if (
-            directory.is_dir() and not directory.is_symlink()
+            not directory.is_symlink() and directory.is_dir()
             and not directory.name.startswith(".") and directory.name not in keep
         ):
             shutil.rmtree(directory)
@@ -56,8 +61,8 @@ def build(data: Path, *, lock_path: Path | None = None, if_stale: bool = False) 
         # Discard malformed disposable layouts and interrupted artifacts
         # before deciding there is nothing to do: an if_stale no-op must
         # not leave a crash's leftovers behind.
-        if root.is_symlink():
-            root.unlink()
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            _remove_cache_entry(root)
         if root.is_dir():
             current = root / "current"
             keep = frozenset({os.readlink(current)}) if current.is_symlink() else frozenset()
@@ -132,7 +137,6 @@ def discard_after_restore(data: Path, *, lock_path: Path | None = None):
     """Drop only the disposable cache; leave every source and stamp untouched."""
     with locks.writer(lock_path or store.DEFAULT_LOCK):
         root = data / "derived"
-        if root.is_symlink():
-            root.unlink()
-        elif root.exists():
-            shutil.rmtree(root)
+        if root.is_symlink() or root.exists():
+            _remove_cache_entry(root)
+            store._fsync_directory(data)

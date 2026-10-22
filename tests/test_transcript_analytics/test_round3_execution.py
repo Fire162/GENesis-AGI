@@ -55,21 +55,28 @@ def test_handler_restored_after_spawn_failure():
 
 def test_if_stale_checks_under_writer_lock(tmp_path, monkeypatch):
     lock = tmp_path / "writer.lock"
+    data = tmp_path / "data"
+    derive.build(data, lock_path=lock)
+    original_signature = store.inputs_signature
+    selections = []
 
-    def signature(data):
+    def signature(data, *, selection=None):
         # The staleness predicate must only be reached after exclusive writer admission.
         with lock.open("a") as probe, pytest.raises(BlockingIOError):
             fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return "sig"
+        selections.append(selection)
+        return original_signature(data, selection=selection)
 
     monkeypatch.setattr(store, "inputs_signature", signature)
     with lock.open("a") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         with pytest.raises(store.Busy):
-            derive.build(tmp_path / "data", lock_path=lock, if_stale=True)
-    assert derive.build(tmp_path / "data", lock_path=lock, if_stale=True) == {
+            derive.build(data, lock_path=lock, if_stale=True)
+    assert selections == []
+    assert derive.build(data, lock_path=lock, if_stale=True) == {
         "derived": "current; nothing to do"
     }
+    assert selections and all(selection is not None for selection in selections)
 
 
 def test_private_opt_in_cannot_resurrect_missing_install(tmp_path, monkeypatch):
