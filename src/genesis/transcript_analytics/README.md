@@ -71,7 +71,7 @@ The independent storage tests require no query/reconciliation modules.
 ## Disposable snapshots
 
 `derive.build(data)` holds the same writer flock while capturing the sources
-and writing all twelve derived views into `derived/.staging/<stamp>/`.
+and writing all thirty shared derived and reconciliation views into `derived/.staging/<stamp>/`.
 It fsyncs every Parquet file, the manifest and the directory, publishes the
 complete `derived/<stamp>/`, then atomically replaces `derived/current`.
 The immediately previous snapshot is retained; older cache directories and
@@ -88,13 +88,18 @@ no longer depends on disposable files, so cache cleanup cannot break later
 queries. Full reads trade connection-start work and private spill for catching
 all snapshot read errors before results reach the caller.
 
-Use `run_query(..., live=True)` for raw views; snapshots contain derived views
-only. The private spill rules also
+Use `run_query(..., live=True)` (CLI `sql --live`) for raw views; snapshots
+contain derived views only. The first release also requires `--live` for harmless
+raw-looking SQL text, including `SELECT 'raw_tool_calls'`, comments and search
+patterns such as `LIKE '%raw_%'`. Its text check is case sensitive, so uppercase
+raw relation queries can behave differently after cache fallback. Use `--live`
+consistently for these queries. This is a deferred SQL usability limitation, not
+a security boundary. The private spill rules also
 apply to snapshot materialization. `derive.is_current` checks the complete
 cache, not just file existence.
 
 After backup restore, call `derive.discard_after_restore(data)`: it deletes
 only `derived/`, without changing source records, original stamps, root binding
 or inventory. Live queries work immediately and snapshots rebuild from durable
-records even when their original transcripts are permanently gone. Backup and
-restore command wiring belongs to the dependent CLI work, not this store API.
+records even when their original transcripts are permanently gone. Additional backup and restore command wiring is deferred; it does not gate
+collection, live search or opportunity scanning.
