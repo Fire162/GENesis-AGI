@@ -200,6 +200,35 @@ def test_a_content_commit_is_denied_while_the_round_owes_a_reflection(
     assert "--allow-empty --cleanup=verbatim -F" in res.stderr
 
 
+def test_the_deny_names_the_second_reflection_route_before_a_push(repo, home, monkeypatch):
+    """A committed reflection usually credits nothing because it failed its full
+    check; a corrected second one clears it. Pushing is the exit only when a fix
+    already sits after the head, so the deny must not prescribe it alone."""
+    _open_round(monkeypatch, repo)
+    _stage_fix(repo)
+    res = _run('git commit -m "fix"', repo, home)
+    assert "commit a second reflection" in res.stderr
+    assert res.stderr.index("second reflection") < res.stderr.index("then push")
+
+
+def test_a_refused_kill_switch_explains_itself_on_the_deny(repo, home, monkeypatch):
+    """The operator who wrote advisory mode but a duplicate key must see why the
+    gate still enforces, on the deny that the refusal caused."""
+    _open_round(monkeypatch, repo)
+    cfg = home / ".genesis" / "config" / "genesis.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("hooks:\n  reflection_gate: advisory\nhooks:\n  reflection_gate: advisory\n")
+    _stage_fix(repo)
+    env_mode = os.environ.pop("_TEST_REFLECTION_GATE", None)
+    try:
+        res = _run('git commit -m "fix"', repo, home)
+    finally:
+        if env_mode is not None:
+            os.environ["_TEST_REFLECTION_GATE"] = env_mode
+    assert res.returncode == 2 and "owes a round reflection" in res.stderr
+    assert "declares hooks more than once" in res.stderr and "ENFORCES" in res.stderr
+
+
 def test_a_docs_only_fix_is_denied_too(repo, home, monkeypatch):
     """Rule R sits before the docs/config skip, as the streak tiers did."""
     _open_round(monkeypatch, repo)
@@ -399,6 +428,7 @@ def test_an_unknown_budget_is_not_rule_rs_to_judge(quiet):
         ("open", "2026-10-01T00:00:00+00:00", True),  # opened before the cutover
         ("open", "2026-10-30T00:00:00+00:00", False),  # opened after it: always owes
         ("open", None, False),  # an unreadable start proves nothing
+        ("open", "not a time", False),  # nor does an unparseable one
         ("complete", None, False),  # late keys only: owed from the cutover on
     ],
 )

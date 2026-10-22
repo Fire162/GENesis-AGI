@@ -1099,10 +1099,13 @@ def _owed_message(state: dict, budget: dict, rr) -> str:
         "3. Commit it alone: `git commit --allow-empty --cleanup=verbatim -F <file>`.",
         "Then commit the fix. Reflect first, fix second: the reflection reads the round "
         "as a class before any instance is patched.",
-        "If a committed reflection still leaves a key owed, a fix of that key already "
-        "sits between the round head and the reflection, so no reflection at this head "
-        "can clear it: `status` shows it. Push what is committed; the next review opens "
-        "a new round. If this verdict looks wrong, stop and ask the owner; do not work "
+        "If a committed reflection still leaves a key owed, `status` and `validate` say "
+        "why. Usually the reflection failed its full check (`Escalate: yes`, an evidence "
+        "file written before this round started, an acceptance point with no `Scope: "
+        "covered:` line): correct it and commit a second reflection. Only when a fix of "
+        "that key already sits between the round head and every reflection can none at "
+        "this head clear it; then push what is committed, and the next review opens a "
+        "new round. If this verdict looks wrong, stop and ask the owner; do not work "
         "around it.",
     ]
     return "\n".join(lines)
@@ -1185,7 +1188,7 @@ def _opened_before_cutover(state: dict, cutover: str | None) -> bool:
     try:
         return datetime.fromisoformat(started) < datetime.fromisoformat(cutover)
     except ValueError:
-        return True
+        return False  # unparseable proves nothing, as an absent start does
 
 
 #: Rule R's kill switch: ``hooks.reflection_gate: enforce | advisory`` in the
@@ -2297,6 +2300,10 @@ def _deny(message: str) -> None:
     in prose — the load-bearing claim is "sole chokepoint", and that is checked:
     this file has exactly one ``sys.exit(2)``, the one below.)
     """
+    # Advisories queued before the deny (e.g. why the reflection kill switch was
+    # refused) belong with it: a deny is the one exit whose stderr is delivered.
+    if _ADVISORIES:
+        message = message + "\n\n" + "\n".join(_ADVISORIES)
     print(message, file=sys.stderr)
     if discarded_write is not None:
         discarded_write.warn()
