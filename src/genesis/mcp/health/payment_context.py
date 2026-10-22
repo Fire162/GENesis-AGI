@@ -687,19 +687,28 @@ async def _resolve(page, args: cf.CardArgs, wait=False) -> tuple[dict[str, _Fiel
         raise _Stop("pay_not_button")
     if info.get("get") is not False:
         raise _Stop("pay_get_form")
-    if info.get("dget") is True:
-        # GET only by default: the network guard blocks any URL holding the
-        # number, so this is safe while a native submit would carry the number
-        # too. Card fields it would send WITHOUT the number (the number in a
-        # provider frame, or unnamed) would reach a URL the guard cannot see.
-        sent = set()
-        for kind, f in fields.items():
-            if f.frame is frame and await _step(f.handle.evaluate(SENT_WITH_PAY_JS, handle)):
-                sent.add(kind)
-        if sent and "number" not in sent:
-            raise _Stop("pay_get_form")
+    if await _dget_unguarded(info, fields, frame, handle):
+        raise _Stop("pay_get_form")
     label = info.get("label")
     return fields, _Field(frame, handle, "pay", origin), label if isinstance(label, str) else ""
+
+
+async def _dget_unguarded(info, fields: dict, frame, handle) -> bool:
+    """Pay submits its form with GET only by default, and that form would send
+    card fields WITHOUT the number (the number in a provider frame, or unnamed).
+
+    The network guard blocks any URL holding the number, so a default-GET form
+    that sends the number too is safe; card fields sent without it would reach a
+    URL the guard cannot see. Membership is read live: an input handler can
+    rename or unname a field after it was filled, so this runs before the tap
+    and again just before the click."""
+    if not isinstance(info, dict) or info.get("dget") is not True:
+        return False
+    sent = set()
+    for kind, f in fields.items():
+        if f.frame is frame and await _step(f.handle.evaluate(SENT_WITH_PAY_JS, handle)):
+            sent.add(kind)
+    return bool(sent) and "number" not in sent
 
 
 async def _mask_ok(page) -> bool:
@@ -932,9 +941,11 @@ def _is_challenge(url) -> bool:
     )
 
 
-async def _outcome(flow: _Flow, ppage, start: str, before: set, site: str, hooks: Hooks) -> str:
+async def _outcome(
+    flow: _Flow, ppage, start: str, before: set, popups: int, site: str, hooks: Hooks
+) -> str:
     """What followed the Pay click (``start``: the URL before it; ``before``: the
-    frame URLs then), from navigation, new frame URLs and a bank frame shown. A
+    frame URLs then; ``popups``: the windows opened before it), from navigation, new frame URLs and a bank frame shown. A
     request the network guard saw carrying the card number outranks them all: a redirect hop
     it could only see (leaked) before a request it stopped (blocked)."""
     loop = asyncio.get_running_loop()
@@ -948,7 +959,7 @@ async def _outcome(flow: _Flow, ppage, start: str, before: set, site: str, hooks
             return "outcome_unknown"
         # ppage.frames includes the main frame: a top-level move to a challenge
         # page (a merchant-hosted /3ds included) is a new URL here too.
-        if flow.popup or any(
+        if flow.popups != popups or any(
             _is_challenge(f.url) for f in list(ppage.frames) if f.url not in before
         ):
             return "challenge"
@@ -1113,8 +1124,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     with contextlib.suppress(Exception):
         title = await _title(ppage)
     secret = secrets.token_hex(32)
-    try:
-        reply = await rc.request_release(
+    request = asyncio.ensure_future(
+        rc.request_release(
             args.card_ref,
             host,
             title,
@@ -1124,8 +1135,23 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             label,
             list(args.extra),
         )
+    )
+    try:
+        reply = await asyncio.shield(request)
     except rc.ReleaseClientError as e:
         raise _Stop(e.code) from None
+    except asyncio.CancelledError:
+        # The vault may have made the release before the cancel landed. Wait
+        # briefly for its reply so teardown can cancel the pending tap (and free
+        # the vault's one release slot) instead of leaving it to expire.
+        with contextlib.suppress(BaseException):
+            late = await asyncio.wait_for(asyncio.shield(request), timeout=CANCEL_S)
+            nonce = late.get("nonce") if isinstance(late, dict) else None
+            if isinstance(nonce, str) and _NONCE.fullmatch(nonce):
+                flow.nonce = nonce
+        if not request.done():
+            request.cancel()
+        raise
     if reply.get("ok") is not True:
         if reply.get("error") == "the approval text was refused":
             raise _Stop("approval_text_refused")
@@ -1194,8 +1220,11 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             ppage, args, top, seen, label, title, fields, pay, hooks, clicking=True
         ):
             raise _Stop("failed_before_pay", filled=flow.typed)
-        if _moved(ppage, top, fields, pay, seen) or not _pay_ok(
-            await _step(pay.handle.evaluate(PAY_JS)), label, clicking=True
+        info = await _step(pay.handle.evaluate(PAY_JS))
+        if (
+            _moved(ppage, top, fields, pay, seen)
+            or not _pay_ok(info, label, clicking=True)
+            or await _dget_unguarded(info, fields, pay.frame, pay.handle)
         ):
             raise _Stop("failed_before_pay", filled=flow.typed)
         for kind, f in fields.items():
@@ -1216,7 +1245,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     ppage.on(
         "framenavigated", lambda fr: fr is ppage.main_frame and setattr(flow, "navs", flow.navs + 1)
     )
-    start, before = ppage.url, {f.url for f in list(ppage.frames)}
+    start, before, popups = ppage.url, {f.url for f in list(ppage.frames)}, flow.popups
     flow.paid = True  # set before the click: a click that raised may still have landed
     click_raised = False
     try:
@@ -1224,7 +1253,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     except Exception as e:  # noqa: BLE001 - never the exception's text
         click_raised = True
         logger.warning("payment Pay click raised (%s)", type(e).__name__)
-    code = await _outcome(flow, ppage, start, before, site, hooks)
+    code = await _outcome(flow, ppage, start, before, popups, site, hooks)
     if code == _NO_SETTLE:
         # Nothing moved on. After a clean click that is a bank check or a stuck
         # checkout; after a click that raised, not even the click is known.

@@ -406,6 +406,8 @@ class Vault:
         self.half_closed: list[str] = []
         self.on_status = None
         self.on_claim = None
+        self.hold_request: asyncio.Event | None = None  # delays the request reply
+        self.request_seen = asyncio.Event()
         self.server = None
 
     def ops(self, op):
@@ -434,6 +436,9 @@ class Vault:
             self.half_closed.append(req.get("op"))
         op = req.get("op")
         if op == "release_request":
+            self.request_seen.set()
+            if self.hold_request is not None:
+                await self.hold_request.wait()
             reply = self.request_reply
         elif op == "release_status":
             if self.on_status is not None:
@@ -839,7 +844,7 @@ async def test_the_outcome_ends_at_once_on_a_guard_flag(monkeypatch, blocked, le
     page = Page(SHOP)
     loop = asyncio.get_running_loop()
     t0 = loop.time()
-    got = await pc._outcome(flow, page, SHOP, {SHOP}, "example.com", Hooks().make())
+    got = await pc._outcome(flow, page, SHOP, {SHOP}, 0, "example.com", Hooks().make())
     assert got == code and loop.time() - t0 < 5.0
 
 
@@ -2152,3 +2157,50 @@ def test_the_contract_test_catches_a_reach():
         ("contexts", "_stealth_browser"),
         ("browser", "_stealth_browser"),
     }
+
+
+
+# ── round 7 ─────────────────────────────────────────────────────────────────
+async def test_a_default_get_form_that_stops_sending_the_number_is_refused_at_the_click(vault):
+    # Pre-tap the form sends the number, so a default GET is allowed; an input
+    # handler then unnames the number field. The check repeats before the click.
+    ns = checkout()
+    ns.ppage.main_frame.elements["#num2"] = ns.ppage.extra[0].elements["#num"]
+    ns.main_page.main_frame.elements["#num2"] = ns.main_page.extra[0].elements["#num"]
+    ns.fields["number"] = "#num2"
+    ns.els["pay"].pay.update(dget=True)
+    for kind in ("number", "name"):
+        ns.els[kind].sent = True
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    out = await _filling(ns, "number", lambda: setattr(ns.els["number"], "sent", False))
+    assert out["code"] == "failed_before_pay" and clicked == []
+
+
+async def test_a_popup_before_pay_does_not_make_a_clean_pay_a_challenge(vault):
+    # A window opened during the claim (before typing) is not something Pay did.
+    ns = checkout()
+
+    def popup():
+        for fn in ns.pctx.handlers["page"]:
+            fn(Page("about:blank"))
+
+    vault.on_claim = popup
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+
+
+async def test_a_cancel_while_the_release_is_requested_still_cancels_it(vault):
+    # The vault makes the release, then the call is cancelled before the reply:
+    # the nonce is still learned, so teardown cancels the pending tap.
+    ns = checkout()
+    vault.hold_request = asyncio.Event()
+    task = asyncio.ensure_future(_run(ns))
+    await vault.request_seen.wait()
+    task.cancel()
+    await asyncio.sleep(0.05)
+    vault.hold_request.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [r.get("nonce") for r in vault.ops("release_cancel")] == ["nonce-1"]
+    assert ns.pctx.closed
