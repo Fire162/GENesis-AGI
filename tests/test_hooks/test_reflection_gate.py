@@ -449,10 +449,114 @@ def test_an_exempt_pr_owes_nothing_for_a_round_opened_before_the_cutover(
     monkeypatch.setattr(rr, "REFLECTION_CUTOVER_ISO", "2026-10-22T00:00:00+00:00")
     state = {"owed": ["c1"], "round_started": started, "round_state": round_state}
     monkeypatch.setattr(rr, "owed_from_budget", lambda *a, **k: state)
-    verdict, message = _rule(_budget())
+    verdict, message = _rule(_budget(repo="WingedGuardian/GENesis-AGI"))
     assert verdict == ("continue" if exempt else "deny"), message
     if not exempt:
         assert "Owed: c1." in message
+
+
+@pytest.mark.parametrize(
+    "owed,late_keys,want",
+    [
+        (["c1", "c2"], ["c2"], "deny"),
+        (["c2"], ["c2"], "deny"),  # open debt was credited; late debt was not
+        (["c1"], ["c2"], "continue"),  # late debt was already credited
+        (["c1"], [], "continue"),
+    ],
+)
+def test_snapshot_exemption_preserves_only_remaining_late_debt(
+    quiet, monkeypatch, owed, late_keys, want,
+):
+    monkeypatch.setattr(_gate, "_reflection_gate_mode", lambda: "enforce")
+    state = {
+        "owed": owed, "open_keys": ["c1"], "late_keys": late_keys,
+        "round_state": "open", "round_started": "2026-10-01T00:00:00+00:00",
+    }
+    original_state = json.loads(json.dumps(state))
+    monkeypatch.setattr(rr, "REFLECTION_CUTOVER_ISO", "2026-10-22T00:00:00+00:00")
+    monkeypatch.setattr(rr, "owed_from_budget", lambda *a, **k: state)
+    verdict, message = _rule(_budget(pr=3535, repo="WingedGuardian/GENesis-AGI"))
+    assert verdict == want, message
+    if want == "deny":
+        assert "Owed: c2." in message
+        assert "c1" not in message
+    assert state == original_state  # exemption must not mutate reader evidence
+
+
+@pytest.mark.parametrize(
+    "repo,want",
+    [
+        ("WingedGuardian/GENesis-AGI", "continue"),
+        ("wingedguardian/genesis-agi", "continue"),
+        ("AnotherOwner/GENesis-AGI", "deny"),
+        ("WingedGuardian/OtherRepository", "deny"),
+    ],
+)
+def test_snapshot_exemption_is_bound_to_the_measured_repository(
+    quiet, monkeypatch, repo, want,
+):
+    monkeypatch.setattr(_gate, "_reflection_gate_mode", lambda: "enforce")
+    state = {
+        "owed": ["c1"], "open_keys": ["c1"], "late_keys": [],
+        "round_state": "open", "round_started": "2026-10-01T00:00:00+00:00",
+    }
+    monkeypatch.setattr(rr, "REFLECTION_CUTOVER_ISO", "2026-10-22T00:00:00+00:00")
+    monkeypatch.setattr(rr, "owed_from_budget", lambda *a, **k: state)
+    monkeypatch.setattr(_gate, "_canonical_public_repo", lambda: "AnotherOwner/GENesis-AGI")
+    verdict, message = _rule(_budget(pr=3535, repo=repo))
+    assert verdict == want, message
+    if want == "deny":
+        assert "Owed: c1." in message
+
+
+def test_snapshot_exemption_keeps_real_reader_late_debt(repo, quiet, monkeypatch):
+    """The real git-backed reader combines old open debt with a new late key."""
+    import time
+
+    head = _head(repo)
+    base = _git(repo, "rev-parse", "HEAD~1").strip()
+    now = datetime.now(UTC)
+    opened = (now - timedelta(hours=2)).isoformat()
+    cutover = (now - timedelta(hours=1)).isoformat()
+    late_at = (now - timedelta(minutes=30)).isoformat()
+    budget = _budget(
+        pr=3535,
+        repo="WingedGuardian/GENesis-AGI",
+        current_head=head,
+        round_state="open",
+        reflection_keys="ok",
+        open_keys=["c11"],
+        body="",
+        rounds=[{
+            "head": head,
+            "opened_at": opened,
+            "reviews": [{"submitted_at": opened, "finding_keys": ["c11"]}],
+        }],
+        commits=[{"sha": base, "parents": []}, {"sha": head, "parents": [base]}],
+        findings=[{
+            "head": base,
+            "submitted_at": late_at,
+            "late": True,
+            "keys": ["c12"],
+            "round_head": None,
+        }],
+    )
+    monkeypatch.setattr(rr, "REFLECTION_CUTOVER_ISO", cutover)
+    monkeypatch.setattr(_gate, "_reflection_gate_mode", lambda: "enforce")
+    state = rr.owed_from_budget(
+        str(repo), budget, budget["repo"], budget["pr"], now=now, cutover=cutover,
+    )
+    assert state["open_keys"] == ["c11"]
+    assert state["late_keys"] == ["c12"]
+    assert state["owed"] == ["c11", "c12"]
+    verdict, message = _gate._reflection_rule(
+        [], [], "git commit -m fix", str(repo), budget,
+        hook_deadline=time.monotonic() + 9,
+    )
+    assert verdict == "deny", message
+    assert "Owed: c12." in message
+    assert "c11" not in message
+    assert quiet == []
 
 
 @pytest.mark.parametrize(

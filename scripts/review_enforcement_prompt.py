@@ -67,7 +67,7 @@ def main() -> None:
         "is NARROWER than it sounds and this reminder cannot tell (it hashes the staged "
         "diff without classifying it). It does NOT apply when: the commit command itself "
         "stages (`git add …&& git commit`, `git commit -am`, a pathspec, `-a/-i/-o/-p`); "
-        "you are at review round 2 or 3, where the round caps are evaluated FIRST; the "
+        "the open round owes a reflection, which is checked FIRST; the "
         "set touches anything under a `.github/` directory (workflows are executable CI "
         "config with repo secrets); or it touches a prompt / agent / skill SURFACE under "
         "`.claude/{agents,commands,skills}/` or `src/genesis/{skills,identity,**/prompts}/` "

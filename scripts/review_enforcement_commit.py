@@ -955,6 +955,7 @@ def _merge_note(
 #: all 68 open PRs (`gh pr list --limit 500`, a complete read), ignoring only the
 #: scheduled-review row; 1 of 68 passed every other gate.
 REFLECTION_EXEMPT_PRS: frozenset[int] = frozenset({3535})
+REFLECTION_EXEMPT_REPO = "WingedGuardian/GENesis-AGI"
 
 #: Rule R's share of the hook budget: at most this, and never so much that the
 #: rest of the gate is left less than the reserve after it.
@@ -1155,8 +1156,18 @@ def _reflection_rule(
         return "continue", None
     if not owed:
         return "continue", None
-    if pr in REFLECTION_EXEMPT_PRS and _opened_before_cutover(state, rr.REFLECTION_CUTOVER_ISO):
-        return "continue", None
+    if (
+        repo.casefold() == REFLECTION_EXEMPT_REPO.casefold()
+        and pr in REFLECTION_EXEMPT_PRS
+        and _opened_before_cutover(state, rr.REFLECTION_CUTOVER_ISO)
+    ):
+        # The snapshot exempts the old open contribution, never new late debt.
+        # Intersect with remaining debt so credited late keys stay credited.
+        late_keys = set(state.get("late_keys") or [])
+        owed = [key for key in owed if key in late_keys]
+        if not owed:
+            return "continue", None
+        state = {**state, "owed": owed}
     mode = _reflection_gate_mode()
     if len(commit_segs) == 1 and _looks_like_reflection(commit_segs[0], cwd, rr):
         try:
