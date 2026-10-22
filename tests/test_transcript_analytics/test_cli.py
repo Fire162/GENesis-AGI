@@ -8,6 +8,17 @@ import pytest
 from genesis.transcript_analytics import cli, config
 
 
+def test_shipped_configuration_defaults_off_and_accepts_private_optin(tmp_path, monkeypatch):
+    from genesis import _config_overlay
+
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(Path(__file__).resolve().parents[2]))
+    monkeypatch.delenv("GENESIS_TRANSCRIPT_ANALYTICS_DISABLED", raising=False)
+    monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: tmp_path)
+    assert config.load().enabled is False
+    (tmp_path / "transcript_analytics.local.yaml").write_text("enabled: true\n")
+    assert config.load().enabled is True
+
+
 @pytest.mark.parametrize('option', ['--max-rows', '--cell-width'])
 @pytest.mark.parametrize('value', ['-1', '-100', '1.5', 'nan'])
 def test_sql_display_limits_reject_invalid_input_before_admission(monkeypatch, option, value):
