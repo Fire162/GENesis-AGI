@@ -22,7 +22,7 @@ import duckdb
 from genesis.transcript_analytics import history, store
 from genesis.transcript_analytics.extract import TABLES
 
-VIEWS_VERSION = "20"
+VIEWS_VERSION = "21"
 _READS = weakref.WeakKeyDictionary()
 _DERIVED = (
     "tool_calls",
@@ -277,59 +277,61 @@ CREATE OR REPLACE VIEW tool_calls AS
 -- call observation key (uuid or source+line), while unrelated calls may
 -- reuse the id. Dedup on the observation key, then pair each result row to
 -- its best call on same-source/session evidence.
-WITH calls AS (
+WITH call_observations AS (
+  SELECT c.*, to_json([coalesce('uuid:' || c.call_uuid,
+    'local:' || c.source_file || ':' || c.line_no_call), c.tool_use_id]) AS call_key
+  FROM raw_tool_calls c WHERE c.line_no_call IS NOT NULL
+), calls AS (
   SELECT * EXCLUDE (pick) FROM (
-    SELECT c.*, coalesce('uuid:' || c.call_uuid,
-                         'local:' || c.source_file || ':' || c.line_no_call) AS call_key,
-      count(DISTINCT c.call_hash) OVER (PARTITION BY coalesce('uuid:' || c.call_uuid,
-        'local:' || c.source_file || ':' || c.line_no_call)) AS call_variants,
-      bool_or(c.scrub_failed) OVER (PARTITION BY coalesce('uuid:' || c.call_uuid,
-        'local:' || c.source_file || ':' || c.line_no_call)) AS call_scrub_failed,
+    SELECT c.*,
+      count(DISTINCT c.call_hash) OVER (PARTITION BY c.call_key) AS call_variants,
+      bool_or(c.scrub_failed) OVER (PARTITION BY c.call_key) AS call_scrub_failed,
       list(DISTINCT struct_pack(source_file:=c.source_file,line_no_call:=c.line_no_call,
         line_no_result:=c.line_no_result)
         ORDER BY struct_pack(source_file:=c.source_file,line_no_call:=c.line_no_call,
-        line_no_result:=c.line_no_result)) OVER (PARTITION BY coalesce('uuid:' || c.call_uuid,
-        'local:' || c.source_file || ':' || c.line_no_call)) AS call_references,
-      row_number() OVER (PARTITION BY coalesce('uuid:' || c.call_uuid,
-        'local:' || c.source_file || ':' || c.line_no_call)
+        line_no_result:=c.line_no_result)) OVER (PARTITION BY c.call_key) AS call_references,
+      row_number() OVER (PARTITION BY c.call_key
                          ORDER BY (c.source_file = m.source_file) DESC NULLS LAST,
                                   c.source_file,
                                   c.line_no_call) AS pick
-    FROM raw_tool_calls c
+    FROM call_observations c
     LEFT JOIN message_copy m ON m.turn_key = 'provider:' || c.message_id
     WHERE c.line_no_call IS NOT NULL
   ) WHERE pick = 1
 ),
 paired AS (
   SELECT * EXCLUDE (pick) FROM (
-    SELECT r.*, coalesce('uuid:' || k.call_uuid,
-                         'local:' || k.source_file || ':' || k.line_no_call) AS call_key,
-      coalesce('uuid:' || r.call_uuid,
-               'orphan:' || r.source_file || ':' || r.line_no_result) AS result_key,
-      row_number() OVER (PARTITION BY r.source_file, r.line_no_result
+    SELECT r.*, CASE WHEN count(DISTINCT k.call_key) OVER (
+        PARTITION BY r.source_file, r.line_no_result, r.tool_use_id, r.result_hash
+      ) = 1 THEN k.call_key END AS call_key,
+      to_json([r.source_file, CAST(r.line_no_result AS VARCHAR), r.tool_use_id]) AS result_key,
+      row_number() OVER (PARTITION BY r.source_file, r.line_no_result, r.tool_use_id, r.result_hash
                          ORDER BY (r.source_file = k.source_file) DESC NULLS LAST,
                                   (r.session_id = k.session_id) DESC NULLS LAST,
                                   k.source_file,
                                   k.line_no_call) AS pick
     FROM raw_tool_calls r
-    LEFT JOIN calls k ON k.tool_use_id = r.tool_use_id
+    LEFT JOIN calls k ON k.tool_use_id = r.tool_use_id AND (
+      (r.call_uuid IS NOT NULL AND r.call_uuid = k.call_uuid) OR
+      (r.call_uuid IS NULL AND (r.source_file = k.source_file OR
+        (r.context_session_id IS NOT NULL AND r.context_session_id = k.context_session_id))))
     WHERE r.has_result
   ) WHERE pick = 1
 ),
 results AS (
-  SELECT * EXCLUDE (result_key) FROM paired
+  SELECT * FROM paired
   QUALIFY row_number() OVER (
     PARTITION BY coalesce(call_key, result_key)
     ORDER BY source_file, line_no_result) = 1
 ),
 envelopes AS (
-  SELECT call_key, count(DISTINCT result_hash) AS result_variants,
+  SELECT coalesce(call_key, result_key) AS envelope_key, count(DISTINCT result_hash) AS result_variants,
     bool_or(scrub_failed) AS result_scrub_failed,
     list(DISTINCT struct_pack(source_file:=source_file,line_no_call:=line_no_call,
       line_no_result:=line_no_result)
       ORDER BY struct_pack(source_file:=source_file,line_no_call:=line_no_call,
       line_no_result:=line_no_result)) AS result_references
-  FROM paired WHERE call_key IS NOT NULL GROUP BY call_key
+  FROM paired GROUP BY coalesce(call_key, result_key)
 )
 SELECT
   coalesce(k.source_file, r.source_file) AS source_file,
@@ -349,7 +351,7 @@ SELECT
   coalesce(r.has_result, false) AS has_result, r.is_error, r.error_source, r.error_class, r.error_text,
   r.tool_use_result_text, r.result_len, r.exit_code, r.interrupted, r.denial_kind,
   r.hook_event, r.hook_tool, r.hook_command, r.hook_script,
-  coalesce(k.call_scrub_failed, env.result_scrub_failed, r.scrub_failed, k.scrub_failed) AS scrub_failed,
+  list_bool_or([k.call_scrub_failed, env.result_scrub_failed, r.scrub_failed, k.scrub_failed]) AS scrub_failed,
   r.source_file AS result_source_file, k.call_uuid,
   own.executor_id, own.attribution_status, own.attribution_reason, own.context_sessions,
   lineage.parent_actor_id AS delegator_id, lineage.lineage_status,
@@ -359,7 +361,7 @@ SELECT
   coalesce(env.result_variants > 1, false) AS result_conflict,
   list_sort(list_distinct(list_concat(coalesce(k.call_references, []), coalesce(env.result_references, [])))) AS source_references
 FROM calls k FULL OUTER JOIN results r ON r.call_key = k.call_key
-LEFT JOIN envelopes env ON env.call_key = coalesce(k.call_key, r.call_key)
+LEFT JOIN envelopes env ON env.envelope_key = coalesce(k.call_key, r.call_key, r.result_key)
 LEFT JOIN tool_ownership own ON own.tool_use_id=k.tool_use_id AND own.source_file=k.source_file
 LEFT JOIN event_states states ON states.event_key=coalesce('uuid:' || k.call_uuid,'local:' || k.source_file || ':' || k.line_no_call)
 LEFT JOIN actor_lineage lineage ON lineage.actor_id=own.executor_id;

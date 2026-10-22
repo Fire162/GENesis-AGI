@@ -59,6 +59,13 @@ metadata. Live and deduplicated views retain the existing reconciliation rules;
 hooks/events aggregate scrub failures over every copy. Recomputed tool latency
 and fallback latency are nonnegative or unknown.
 
+Tool observations are identified by their enclosing event and tool-use ID, so
+multiple tool blocks on one JSON record remain separate. Cross-file results
+require a matching call observation or a shared known context; ambiguous results
+remain orphaned. Delegation evidence is scoped to its context and requires one
+distinct spawning observation before confirming a parent. Scrub failures are
+retained when any call copy or linked result reports one.
+
 `source_coverage` exposes original per-source provenance and unavailable
 historical facts. `run_query(..., manifest_path=...)` records the same captured
 coverage alongside result denominators and scrubbed query labels. Missing
