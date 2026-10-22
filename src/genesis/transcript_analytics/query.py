@@ -23,7 +23,7 @@ import duckdb
 from genesis.transcript_analytics import history, store
 from genesis.transcript_analytics.extract import TABLES
 
-VIEWS_VERSION = "21"
+VIEWS_VERSION = "23"
 _READS = weakref.WeakKeyDictionary()
 _DERIVED = (
     "tool_calls",
@@ -355,7 +355,10 @@ def run_query(
                     "live": live,
                     "inventory": inventory,
                     "inputs_signature": _READS[con]["inputs_signature"],
-                    "versions": {k.decode(): v.decode() for k, v in store.semantics().items()},
+                    "versions": {
+                        **{k.decode(): v.decode() for k, v in store.semantics().items()},
+                        "views_version": VIEWS_VERSION,
+                    },
                     "coverage": coverage,
                     "denominators": {
                         v: con.execute(f"SELECT count(*) FROM {v}").fetchone()[0]  # noqa: S608 — fixed view names
@@ -399,7 +402,7 @@ WITH call_observations AS (
       row_number() OVER (PARTITION BY c.call_key
                          ORDER BY (c.source_file = m.source_file) DESC NULLS LAST,
                                   c.source_file,
-                                  c.line_no_call) AS pick
+                                  c.line_no_call, c.call_hash) AS pick
     FROM call_observations c
     LEFT JOIN message_copy m ON m.turn_key = 'provider:' || c.message_id
     WHERE c.line_no_call IS NOT NULL
@@ -428,7 +431,7 @@ results AS (
   SELECT * FROM paired
   QUALIFY row_number() OVER (
     PARTITION BY coalesce(call_key, result_key)
-    ORDER BY source_file, line_no_result) = 1
+    ORDER BY source_file, line_no_result, result_hash) = 1
 ),
 envelopes AS (
   SELECT coalesce(call_key, result_key) AS envelope_key, count(DISTINCT result_hash) AS result_variants,
@@ -491,7 +494,7 @@ WITH grouped AS (
  list(DISTINCT attribution_reason ORDER BY attribution_reason) AS attribution_reasons,
  flatten(list(source_references ORDER BY sequence_line)) AS source_references,
  list_sort(list_distinct(flatten(list(context_sessions ORDER BY sequence_line)))) AS context_sessions,
- CASE WHEN NOT bool_or(content_conflict) AND NOT bool_or(identity_conflict) AND bool_and(assembly_complete) THEN CAST(sum(n_tool_use) AS DECIMAL(38,0)) END AS n_tool_use,bool_or(is_sidechain) AS is_sidechain,
+ CASE WHEN bool_and(content_conflict IS FALSE) AND NOT bool_or(identity_conflict) AND bool_and(assembly_complete) THEN CAST(sum(n_tool_use) AS DECIMAL(38,0)) END AS n_tool_use,bool_or(is_sidechain) AS is_sidechain,
  any_value(entrypoint ORDER BY sequence_line,source_file) AS entrypoint,
  any_value(attribution_skill ORDER BY sequence_line,source_file) AS attribution_skill,
  any_value(attribution_mcp_server ORDER BY sequence_line,source_file) AS attribution_mcp_server,
@@ -512,7 +515,7 @@ WITH grouped AS (
  e.source_references,e.context_sessions,e.is_api_error,e.scrub_failed,
  e.distinct_event_count,e.physical_observation_count,e.terminal_variants,e.identity_conflict,e.count_uncertain,
  final.stop_reason,final.model,final.request_id,
- (g.assembly_complete AND NOT e.content_conflict AND NOT e.state_conflict
+ (g.assembly_complete AND e.content_conflict IS FALSE AND NOT e.state_conflict
  AND NOT e.identity_conflict AND e.executor_id IS NOT NULL AND e.attribution_status IN ('confirmed','inferred')
  AND e.terminal_variants=1
  AND final.stop_reason IS NOT NULL AND final.has_usage AND NOT final.is_api_error) AS usage_available,
@@ -542,8 +545,8 @@ WITH keyed AS (
  SELECT *,coalesce('uuid:' || uuid,'local:' || source_file || ':' || line_no) AS event_key
  FROM raw_hooks
 ), states AS (
- SELECT event_key,CASE WHEN count(*) FILTER (WHERE record_hash IS NULL)>0 THEN NULL
- ELSE count(DISTINCT record_hash)>1 END AS content_conflict,
+ SELECT event_key,CASE WHEN count(DISTINCT record_hash)>1 THEN TRUE
+ WHEN count(*) FILTER (WHERE record_hash IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
  CASE WHEN count(DISTINCT actor_id)=1 AND NOT bool_or(context_conflict)
  THEN any_value(actor_id ORDER BY actor_id) END AS executor_id,
  list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions,
@@ -568,8 +571,8 @@ WITH keyed AS (
  SELECT *,coalesce('uuid:' || uuid,'local:' || source_file || ':' || line_no) AS event_key
  FROM raw_events
 ), states AS (
- SELECT event_key,CASE WHEN count(*) FILTER (WHERE record_hash IS NULL)>0 THEN NULL
- ELSE count(DISTINCT record_hash)>1 END AS content_conflict,
+ SELECT event_key,CASE WHEN count(DISTINCT record_hash)>1 THEN TRUE
+ WHEN count(*) FILTER (WHERE record_hash IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
  CASE WHEN count(DISTINCT actor_id)=1 AND NOT bool_or(context_conflict)
  THEN any_value(actor_id ORDER BY actor_id) END AS executor_id,
  list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions,
@@ -596,22 +599,14 @@ FROM raw_session_meta GROUP BY session_id, kind, value, pr_repository;
 CREATE OR REPLACE VIEW agents AS
 -- Historical adapters leave actor_id unknown; unknown actors must not be
 -- merged into one row, so unknown identities partition on a source-local key.
+WITH keyed AS (
+ SELECT *,coalesce(actor_id,'unknown:' || to_json(struct_pack(source_file:=source_file,
+   agent_id:=agent_id,tool_use_id:=tool_use_id,agent_type:=agent_type,description:=description))) AS dedup_key
+ FROM raw_agents
+)
 SELECT a.* EXCLUDE (rn,dedup_key,scrub_failed),s.scrub_failed FROM (
-  SELECT *, coalesce(actor_id,
-      'unknown:' || source_file || ':' || coalesce(agent_id,'') || ':' ||
-      coalesce(tool_use_id,'') || ':' || coalesce(agent_type,'') || ':' ||
-      coalesce(description,'')) AS dedup_key,
-    row_number() OVER (
-    PARTITION BY coalesce(actor_id,
-      'unknown:' || source_file || ':' || coalesce(agent_id,'') || ':' ||
-      coalesce(tool_use_id,'') || ':' || coalesce(agent_type,'') || ':' ||
-      coalesce(description,''))
-    ORDER BY source_file) AS rn FROM raw_agents) a
-LEFT JOIN (SELECT coalesce(actor_id,
-      'unknown:' || source_file || ':' || coalesce(agent_id,'') || ':' ||
-      coalesce(tool_use_id,'') || ':' || coalesce(agent_type,'') || ':' ||
-      coalesce(description,'')) AS dedup_key,bool_or(scrub_failed) AS scrub_failed
- FROM raw_agents GROUP BY 1) s
+ SELECT *,row_number() OVER(PARTITION BY dedup_key ORDER BY source_file) AS rn FROM keyed) a
+LEFT JOIN (SELECT dedup_key,bool_or(scrub_failed) AS scrub_failed FROM keyed GROUP BY 1) s
 ON s.dedup_key = a.dedup_key
 WHERE rn = 1;
 
@@ -700,8 +695,8 @@ SELECT context_session_id,count(DISTINCT turn_key) AS n_turns_inclusive,
 FROM turns,unnest(context_sessions) c(context_session_id) GROUP BY context_session_id;
 
 CREATE OR REPLACE VIEW metric_coverage AS
-SELECT 'turn_content' AS metric,count(*) FILTER(WHERE NOT content_conflict) AS included,
- count(*) FILTER(WHERE content_conflict) AS excluded FROM turns
+SELECT 'turn_content' AS metric,count(*) FILTER(WHERE content_conflict IS FALSE) AS included,
+ count(*) FILTER(WHERE content_conflict IS NOT FALSE) AS excluded FROM turns
 UNION ALL SELECT 'turn_identity',count(*) FILTER(WHERE NOT count_uncertain),count(*) FILTER(WHERE count_uncertain) FROM turns
 UNION ALL SELECT 'turn_assembly',count(*) FILTER(WHERE assembly_complete),count(*) FILTER(WHERE NOT assembly_complete) FROM turns
 UNION ALL SELECT 'turn_usage',count(*) FILTER(WHERE usage_available),count(*) FILTER(WHERE NOT usage_available) FROM turns
@@ -714,8 +709,8 @@ UNION ALL SELECT 'turn_cache_create_5m',count(*) FILTER(WHERE cache_create_5m IS
 UNION ALL SELECT 'turn_cache_create_1h',count(*) FILTER(WHERE cache_create_1h IS NOT NULL),count(*) FILTER(WHERE cache_create_1h IS NULL) FROM turns
 UNION ALL SELECT 'turn_thinking_tokens',count(*) FILTER(WHERE thinking_tokens IS NOT NULL),count(*) FILTER(WHERE thinking_tokens IS NULL) FROM turns
 UNION ALL SELECT 'tool_call_content',count(*) FILTER(WHERE call_valid),count(*) FILTER(WHERE NOT call_valid) FROM tool_calls
-UNION ALL SELECT 'hook_content',count(*) FILTER(WHERE NOT content_conflict),count(*) FILTER(WHERE content_conflict) FROM hooks
-UNION ALL SELECT 'event_content',count(*) FILTER(WHERE NOT content_conflict),count(*) FILTER(WHERE content_conflict) FROM events
+UNION ALL SELECT 'hook_content',count(*) FILTER(WHERE content_conflict IS FALSE),count(*) FILTER(WHERE content_conflict IS NOT FALSE) FROM hooks
+UNION ALL SELECT 'event_content',count(*) FILTER(WHERE content_conflict IS FALSE),count(*) FILTER(WHERE content_conflict IS NOT FALSE) FROM events
 UNION ALL SELECT 'tool_result_content',count(*) FILTER(WHERE result_valid),count(*) FILTER(WHERE NOT result_valid) FROM tool_calls
 UNION ALL SELECT 'spawn_association',count(*) FILTER(WHERE association_status IN ('confirmed','inferred')),
  count(*) FILTER(WHERE association_status NOT IN ('confirmed','inferred')) FROM spawn_associations;
