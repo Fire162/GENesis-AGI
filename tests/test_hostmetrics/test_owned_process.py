@@ -155,6 +155,31 @@ def test_first_cancellation_after_reap_remains_cooperative_for_owned_scope(monke
     assert owner.outcome(7) == 130
 
 
+@pytest.mark.parametrize('scope_authorized', [False, True])
+def test_watchdog_after_reap_uses_only_acknowledged_scope(monkeypatch, scope_authorized):
+    sent = []
+    monkeypatch.setattr(run, 'kill_group', lambda *_args: pytest.fail('reaped PID cannot be signalled'))
+    monkeypatch.setattr(run, '_signal_scope', lambda unit, sig: sent.append((unit, sig)) or True)
+    monkeypatch.setattr(run, '_scope_quiescent', lambda _unit: bool(sent and sent[-1][1] == signal.SIGKILL))
+    with run.OwnedProcess() as owner:
+        owner.bind(_child(7), 'synthetic-owned-scope')
+        owner._scope_authorized = scope_authorized
+        assert owner.wait(timeout=5) == 7
+        assert owner.reaped and not owner._numeric_open
+        try:
+            owner.stop(escalate_after=0)
+            assert owner.wait(timeout=5) == 7
+            expected = [('synthetic-owned-scope', signal.SIGTERM),
+                        ('synthetic-owned-scope', signal.SIGKILL)] if scope_authorized else []
+            assert sent == expected
+            assert not owner._scope_authorized
+            assert owner.signals == 0
+        finally:
+            owner.stop(signal.SIGKILL)
+            owner.wait(timeout=5)
+    assert owner.outcome(7) == 7
+
+
 def test_external_reap_is_not_fabricated_success():
     child = None
     with pytest.raises(run.ProbeRefused, match='consumed externally'), run.OwnedProcess() as owner:

@@ -78,6 +78,7 @@ _EVENT_SUBTYPES = frozenset(
         "api_error",
         "compact_boundary",
         "model_refusal_fallback",
+        "model_refusal_no_fallback",
         "informational",
     }
 )
@@ -115,7 +116,8 @@ def _ms_between(a: str | None, b: str | None) -> int | None:
     try:
         da = datetime.fromisoformat(a.replace("Z", "+00:00"))
         db = datetime.fromisoformat(b.replace("Z", "+00:00"))
-        return round((db - da).total_seconds() * 1000)
+        milliseconds = (db - da).total_seconds() * 1000
+        return round(milliseconds) if milliseconds >= 0 else None
     except (ValueError, TypeError):  # TypeError: naive minus aware timestamp
         return None
 
@@ -132,8 +134,11 @@ def _block_text(content) -> str:
     return ""
 
 
-def _result_agent_ids(content, structured) -> list[str]:
-    """Retain every recognized ID before association, preserving text boundaries."""
+def _result_agent_ids(content, structured) -> tuple[list[str], bool]:
+    """Retain every recognized ID before association, preserving text boundaries.
+
+    Returns the kept IDs and whether the scrubber failed on any candidate.
+    """
     candidates = set()
     if isinstance(structured, dict):
         value = _str(structured.get("agentId"))
@@ -154,8 +159,16 @@ def _result_agent_ids(content, structured) -> list[str]:
     # These come from untrusted result payloads and are stored in identity
     # columns, which are never text-scrubbed. Keep only values the scrubber
     # leaves byte-identical; a credential-shaped value (or a scrubber failure)
-    # drops the candidate rather than persisting it.
-    return sorted(value for value in candidates if scrub_text(value) == (value, False))
+    # drops the candidate rather than persisting it. Only a scrubber failure
+    # is reported: a value the scrubber changed was judged, not withheld.
+    kept = []
+    failed = False
+    for value in candidates:
+        scrubbed, value_failed = scrub_text(value)
+        failed = failed or value_failed
+        if scrubbed == value and not value_failed:
+            kept.append(value)
+    return sorted(kept), failed
 
 
 def _complete_lines(path: Path, stop_at: int | None, counter: dict, fh=None):
@@ -166,10 +179,6 @@ def _complete_lines(path: Path, stop_at: int | None, counter: dict, fh=None):
     next read; ``stop_at`` is the size observed BEFORE reading, so bytes appended
     during the read are not half-consumed. ``counter["consumed"]`` ends at the
     byte offset just past the last line yielded.
-
-    ``fh`` is an already-open binary handle for ``path``: callers that must
-    fingerprint the inode actually read pass one in, closing the path-vs-read
-    TOCTOU. The caller keeps ownership; it is not closed here.
     """
     budget = os.path.getsize(path) if stop_at is None else stop_at
     if fh is not None:
@@ -216,7 +225,7 @@ def _status(v) -> int | None:
     return _int(v.get("status")) if isinstance(v, dict) else _int(v)
 
 
-def _token(v) -> int | None:
+def _nonnegative_int(v) -> int | None:
     value = _int(v)
     return value if value is not None and value >= 0 else None
 
@@ -282,14 +291,20 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
     )
 
     first_sid: str | None = None  # from ANY record, even ones no table keeps
+    budget = os.path.getsize(path) if stop_at is None else stop_at
     counter = {"consumed": 0, "digest": hashlib.sha256()}
-    for line_no, raw in enumerate(_complete_lines(path, stop_at, counter, fh), start=1):
+    lines = (
+        _complete_lines(path, budget, counter)
+        if fh is None
+        else _complete_lines(path, budget, counter, fh)
+    )
+    for line_no, raw in enumerate(lines, start=1):
         res.stats["lines"] += 1
         if not raw.strip():
             continue
         try:
             r = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             res.chronology_known = False
             res.stats["malformed"] += 1
             continue
@@ -366,13 +381,13 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
                     # Preserve the producer assertion for whole-terminal agreement;
                     # has_usage and is_api_error independently prohibit its vector.
                     "stop_reason": _str(msg.get("stop_reason")),
-                    "input_tokens": _token(usage.get("input_tokens")),
-                    "output_tokens": _token(usage.get("output_tokens")),
-                    "cache_read": _token(usage.get("cache_read_input_tokens")),
-                    "cache_create": _token(usage.get("cache_creation_input_tokens")),
-                    "cache_create_5m": _token(cc.get("ephemeral_5m_input_tokens")),
-                    "cache_create_1h": _token(cc.get("ephemeral_1h_input_tokens")),
-                    "thinking_tokens": _token(otd.get("thinking_tokens")),
+                    "input_tokens": _nonnegative_int(usage.get("input_tokens")),
+                    "output_tokens": _nonnegative_int(usage.get("output_tokens")),
+                    "cache_read": _nonnegative_int(usage.get("cache_read_input_tokens")),
+                    "cache_create": _nonnegative_int(usage.get("cache_creation_input_tokens")),
+                    "cache_create_5m": _nonnegative_int(cc.get("ephemeral_5m_input_tokens")),
+                    "cache_create_1h": _nonnegative_int(cc.get("ephemeral_1h_input_tokens")),
+                    "thinking_tokens": _nonnegative_int(otd.get("thinking_tokens")),
                     "is_sidechain": _bool(r.get("isSidechain")),
                     "entrypoint": _str(r.get("entrypoint")),
                     "attribution_skill": _str(r.get("attributionSkill")),
@@ -508,7 +523,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
                         exit_code = None
                 hook = parse_hook_block(content) if cls == "hook_block" else None
                 hook_cmd, hook_failed = scrub_text(hook["hook_command"]) if hook else (None, False)
-                result_agent_ids = _result_agent_ids(b.get("content"), tur)
+                result_agent_ids, ids_failed = _result_agent_ids(b.get("content"), tur)
                 if hook:  # name the script from the SCRUBBED command only (review SF-1)
                     hook["hook_script"] = _hook_script(hook_cmd) if hook_cmd else None
                 row.update(
@@ -552,7 +567,10 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
                         "hook_tool": hook["hook_tool"] if hook else None,
                         "hook_command": hook_cmd,
                         "hook_script": hook["hook_script"] if hook else None,
-                        "scrub_failed": bool(row.get("scrub_failed")) or err_failed or hook_failed,
+                        "scrub_failed": bool(row.get("scrub_failed"))
+                        or err_failed
+                        or hook_failed
+                        or ids_failed,
                     }
                 )
                 t["tool_calls"].append(row)
@@ -609,7 +627,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
                     "hook_name": _str(att.get("hookName")),
                     "command": hcmd,
                     "exit_code": _int(att.get("exitCode")),
-                    "duration_ms": _int(att.get("durationMs")),
+                    "duration_ms": _nonnegative_int(att.get("durationMs")),
                     "timed_out": att.get("timedOut")
                     if isinstance(att.get("timedOut"), bool)
                     else None,
@@ -641,6 +659,10 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
                     "error",
                     "level",
                     "status",
+                    "originalModel",
+                    "requestId",
+                    "apiRefusalCategory",
+                    "apiRefusalExplanation",
                 )
                 if r.get(k) is not None
             }
@@ -665,11 +687,11 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
                         }
                     ),
                     "level": _str(r.get("level")),
-                    "duration_ms": _int(r.get("durationMs")),
-                    "message_count": _int(r.get("messageCount")),
+                    "duration_ms": _nonnegative_int(r.get("durationMs")),
+                    "message_count": _nonnegative_int(r.get("messageCount")),
                     "status": _status(r.get("status")),
-                    "pre_tokens": _int(cm.get("preTokens")),
-                    "post_tokens": _int(cm.get("postTokens")),
+                    "pre_tokens": _nonnegative_int(cm.get("preTokens")),
+                    "post_tokens": _nonnegative_int(cm.get("postTokens")),
                     "trigger": _str(cm.get("trigger")),
                     "detail": dtext,
                     "scrub_failed": dfailed,
@@ -708,7 +730,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
 
     res.content_sha256 = counter["digest"].hexdigest()
     res.stats["bytes_read"] = counter["consumed"]
-    if counter["consumed"] != (path.stat().st_size if stop_at is None else stop_at):
+    if counter["consumed"] != budget:
         res.chronology_known = False  # Torn/truncated captured prefix has unknown chronology.
     t["tool_calls"].extend(
         row for calls in pending.values() for row in calls
@@ -718,7 +740,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
         meta_path = path.with_name(f"agent-{agent_id_from_name}.meta.json")
         try:
             meta = json.loads(meta_path.read_text())
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             meta = None
         if isinstance(meta, dict):
             description, desc_failed = scrub_text(_str(meta.get("description")))
@@ -735,7 +757,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None, *, fh=None)
                     "description": description,
                     "scrub_failed": desc_failed,
                     "tool_use_id": _str(meta.get("toolUseId")) or None,
-                    "spawn_depth": _int(meta.get("spawnDepth")),
+                    "spawn_depth": _nonnegative_int(meta.get("spawnDepth")),
                     "request_shape": _str(meta.get("requestShape")),
                     "non_interactive": meta.get("requestNonInteractive")
                     if isinstance(meta.get("requestNonInteractive"), bool)

@@ -170,7 +170,7 @@ def _marker_totals(markers):
     return malformed, marker_errors
 
 
-def _snapshot_state(data):
+def _snapshot_state(data, *, selection):
     """The derived snapshot's manifest and whether it matches the store today.
 
     Returns (manifest|None, current|None): current is True only when the
@@ -187,8 +187,9 @@ def _snapshot_state(data):
     except (OSError, ValueError):
         return None, (False if current.exists() else None)
     current_flag = (
-        manifest.get("views_version") == query.VIEWS_VERSION
-        and manifest.get("inputs_signature") == store.inputs_signature(data)
+        isinstance(manifest, dict)
+        and manifest.get("views_version") == query.VIEWS_VERSION
+        and manifest.get("inputs_signature") == store.inputs_signature(data, selection=selection)
     )
     return manifest, current_flag
 
@@ -212,17 +213,20 @@ def _status(args):
         except (OSError, ValueError) as exc:
             stale += 1
             source_errors.append({"source": store.source_identity(rel), "reason": str(exc)})
-    markers = [
-        store._table_path(args.data, store.MARKER, key)
-        for key in store.source_keys(args.data)
-    ]
+    selection = store.select_sources(args.data)
+    records, excluded = selection
+    markers = [record.path(store.MARKER) for record in records]
     malformed, marker_errors = _marker_totals(markers)
+    marker_errors.extend(
+        {"marker": store.MARKER, "key": source["key"], "reason": source["reason"]}
+        for source in excluded
+    )
     source_size, snapshot_size, size_errors = _parquet_bytes(args.data)
     out = {
         "data": str(args.data),
         "transcripts_now": len(sources),
         "stale_or_unbuilt": stale,
-        "sources_stored": len(markers),
+        "sources_stored": len(records) + len(excluded),
         "store_mb": round((source_size + snapshot_size) / 2**20, 1),
         "source_store_mb": round(source_size / 2**20, 1),
         "snapshot_store_mb": round(snapshot_size / 2**20, 1),
@@ -232,10 +236,9 @@ def _status(args):
         "malformed_lines": malformed,
         "disabled": (args.data / "DISABLED").exists(),
     }
-    keys, excluded = store.compatible_sources(args.data)
-    out["coverage"] = {"included": len(keys), "excluded": excluded}
+    out["coverage"] = {"included": len(records), "excluded": excluded}
     out["inventory"] = store.inventory(args.data)
-    manifest, snapshot_current = _snapshot_state(args.data)
+    manifest, snapshot_current = _snapshot_state(args.data, selection=selection)
     out["snapshot"] = manifest
     out["snapshot_current"] = snapshot_current
     return out
@@ -243,7 +246,7 @@ def _status(args):
 
 def cmd_status(args) -> int:
     # A reader takes no lock: per-source records swap atomically, so status
-    # reports whatever was current when each file was opened.
+    # reports the accepted records captured once for this response.
     print(json.dumps(_status(args), indent=2))
     return 0
 

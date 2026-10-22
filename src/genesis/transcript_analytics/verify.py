@@ -2,15 +2,14 @@
 
 A reader takes no lock: per-source records publish through atomic ``current``
 swaps, and the snapshot's own ``derived/current`` link swaps atomically. The
-snapshot is a disposable cache — a missing, unreadable or stale manifest makes
-verify report against the live views only, and a corrupt snapshot falls back
-to live rather than failing the read.
+snapshot is a disposable cache. Verification requires the configured reader to
+load a current cache, then independently compares its rows with forced live
+views over the same captured source records. Fallback reports unavailable.
 """
 
 import contextlib
 import hashlib
 import json
-import sys
 
 from . import query, store
 
@@ -27,61 +26,29 @@ def _digest(con, view):
     return {"rows": count, "sha256": digest.hexdigest()}
 
 
-def _manifest(data):
-    """The snapshot manifest when it exists and matches the store today, else None."""
-    current = data / "derived" / "current"
-    try:
-        manifest = json.loads((current / "MANIFEST.json").read_text())
-    except (OSError, ValueError):
-        return None
-    if manifest.get("views_version") != query.VIEWS_VERSION:
-        return None
-    if manifest.get("inputs_signature") != store.inputs_signature(data):
-        return None
-    return manifest
-
-
-def _snapshot_connection(data):
-    """DuckDB views bound to the snapshot's per-view parquet files."""
-    import duckdb
-
-    con = duckdb.connect()
-    current = data / "derived" / "current"
-    for view in query._DERIVED:
-        out = str(current / f"{view}.parquet").replace("'", "''")
-        con.execute(
-            f"CREATE VIEW {view} AS SELECT * FROM read_parquet('{out}')"  # noqa: S608 — fixed names, escaped path
-        )
-    return con
-
-
 def verify(data):
-    keys, excluded = store.compatible_sources(data)
-    manifest = _manifest(data)
-    if manifest is None:
-        return {
-            "ok": False,
-            "unavailable": "no current snapshot; run derive",
-            "coverage": {"included": len(keys), "excluded": excluded},
-            "snapshot_current": False,
-        }
-    with contextlib.closing(query.connect(data)) as live:
-        comparisons = {v: {"live": _digest(live, v)} for v in query._DERIVED}
-    snapshot_ok = False
-    try:
-        # DuckDB can bind a read_parquet view without scanning it; damage can
-        # surface at row-read time, so the whole digest pass stays inside try.
-        with contextlib.closing(_snapshot_connection(data)) as snap:
-            for v in query._DERIVED:
-                comparisons[v]["snapshot"] = _digest(snap, v)
-        snapshot_ok = True
-    except Exception as exc:  # noqa: BLE001 — a corrupt snapshot falls back to live
-        print(f"transcript-analytics verify: snapshot unreadable ({exc!r}); live views only", file=sys.stderr)
+    selection = store.select_sources(data)
+    records, excluded = selection
+    coverage = {"included": len(records), "excluded": excluded}
+    # Reuse the configured, eager cache reader. A fallback is unavailable for
+    # verification: comparing two live readers would certify no cached bytes.
+    with contextlib.closing(query.connect(data, selection=selection)) as snap:
+        if query._READS[snap].get("snapshot") is None:
+            return {
+                "ok": False,
+                "unavailable": "no readable current snapshot; run derive",
+                "coverage": coverage,
+                "snapshot_current": False,
+            }
+        comparisons = {v: {"snapshot": _digest(snap, v)} for v in query._DERIVED}
+    # Immutable captured source records remain usable after cache closure. The
+    # connections run sequentially so they do not each retain half the RAM cap.
+    with contextlib.closing(query.connect(data, live=True, selection=selection)) as live:
+        for view in query._DERIVED:
+            comparisons[view]["live"] = _digest(live, view)
     return {
-        "ok": snapshot_ok
-        and all(v["snapshot"] == v["live"] for v in comparisons.values())
-        and not excluded,
-        "coverage": {"included": len(keys), "excluded": excluded},
+        "ok": all(v["snapshot"] == v["live"] for v in comparisons.values()) and not excluded,
+        "coverage": coverage,
         "snapshot_current": True,
         "views": comparisons,
     }

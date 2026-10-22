@@ -288,6 +288,28 @@ process. `graph_traverse_prune` deletes rows, and file lines, older than 30 days
 kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
 The fallback WARNINGs alone could never answer this: MCP servers log to stderr,
 which never reaches the journal.
+A memory server started before that code was deployed traverses without writing
+anything, so genesis-server also runs an **hourly census** (`graph_traverse_census`
+job, `:45`, `memory/graph_census.py`): one `eval_events` row
+(`event_type="graph_traverse_census"`) listing each live
+`genesis_mcp_server.py --server memory` process with its start time, every
+commit the main checkout has held since it started (read by
+`scripts/lib/serving_commit.py`, the reader the deploy scripts use, which refuses
+on a reflog gap, a move in the start second, a clock step back or git's expiry
+cutoff), whether ALL of them contain the telemetry module (a module imported
+after start loads whatever is on disk then), its exec-time kill switch and DB
+path, plus whether HEAD has the module and whether `src/genesis/memory/` is
+dirty. Git runs with `--no-optional-locks`, so the hourly read never takes the
+index lock a deploy needs. The cutover clock can only start at a census with no
+server that could be running older code. Pruned with the telemetry rows.
+**The verdict** is `scripts/graph_cutover_report.py` over the pure
+`memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
+falkordb-served traversals and falkordb traffic on at least 10 UTC days in the
+last 14. Outcomes are an allowlist (`primary` counts, `cancelled` is neutral but
+reported, anything else restarts the clock, as do a non-falkordb `configured` or
+`served`, a dirty census row and a census gap over 2h15m). Lost writes, an
+unreadable row, a stale or missing census, or telemetry switched off make it
+INCONCLUSIVE. Exit 0/1/2 = PASS/NOT_YET/INCONCLUSIVE, 3 = the report failed.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
@@ -1427,7 +1449,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: e943bc114 2026-10-16
+verified: 96e0a4de3 2026-10-18
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1453,6 +1475,10 @@ the shared banner is not an assertion about all concurrent sessions.
   independently of the boot manifest. External health accepts only a sample from
   the active primary server's MainPID observed within 90 seconds. Authenticated
   health probes return 503 with readiness details when enabled but unready.
+  The existing awareness tick records readiness incidents and sends ordered
+  outage/recovery Telegram notices. Unknown readings preserve an open incident;
+  deliberate disablement closes it quietly. Incident/phase delivery history
+  supplies durable retry deduplication without a second queue.
   `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
   existing Flask/runtime loop: it atomically persists native receipts, binds
   contexts and retries to relationship epochs, and admits at most two
@@ -1506,7 +1532,8 @@ the shared banner is not an assertion about all concurrent sessions.
   `per_device` scope; default `global`.
 - **dashboard/**: Flask blueprint at `/genesis` (~53 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
-  thread detects degraded-but-alive Flask; web terminal.
+  thread detects degraded-but-alive Flask; web terminal (its WebSocket accepts
+  same-origin handshakes only: `routes/terminal._refuse_cross_origin_terminal`).
   **Auth posture — API READS ARE OPEN BY DEFAULT, and this is the fact auditors
   keep rediscovering.** Exactly two `before_request` hooks exist, and between
   them they leave a gap: `auth._check_auth` is blueprint-level and gates HTML
@@ -1661,6 +1688,18 @@ the shared banner is not an assertion about all concurrent sessions.
   reclaim); a click that opens a new tab switches the tools to it. `browser_fill` refuses a payment card number
   as the value and `browser_run_js` one in its script (the value check only:
   telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
+  Every `_impl_browser_*` result and error passes `@_redacted` (card numbers in
+  snapshots, script results, urls, titles and exception text become
+  `[card redacted]`; a contract test requires the decorator on each), and the
+  `security/card_redaction` log filter sits on the `mcp_health.log` handler
+  (every propagated `genesis.*` record) and on the browser, FastMCP and MCP
+  SDK lowlevel-server loggers, redacting log lines and tracebacks. The tool
+  timeout text and the CAPTCHA Telegram alert's page URL are redacted too.
+  Results are also checked for a card SPLIT across structure (digit groups on
+  separate snapshot lines, list items or dict values; a container that spells
+  one is withheld whole), and `browser_screenshot` refuses to capture a page
+  whose frames render a card in text, field values, placeholders, labels,
+  titles, alt text, options or CSS-generated content.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
@@ -2738,16 +2777,29 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 788a6d75c178 2026-10-17
+verified: 0866a0f6545b 2026-10-22
 ```
 
-- **transcript_analytics/**: optional local transcript parser library. It
+- **transcript_analytics/**: optional local transcript analytics library. It
   extracts physical records, preserves unresolved identity and usage, and
   applies the shared credential scrubber to structured content. Schema5 records
   distinguish executor identity from delegation evidence. This development
-  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
-  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
+  candidate adds the parser, durable per-source records, audited historical
+  readers and live query views. Readers capture immutable source selections;
+  tool blocks remain distinct, and uncertain result or delegation matches stay
+  unresolved. This CLI candidate exposes opt-in capped collection, status, live
+  SQL, disposable cache building and independent live/cache verification. The
+  installed default remains off; scheduling arrives in a dependent change. Additional backup
+  and recovery integration is deferred independently of collection and search.
   It does not describe a deployed capability.
+  Hook names are limited to literal command targets and option-free supported
+  interpreter operands; ambiguous commands report `<unknown>` while preserving
+  their scrubbed command. Invalid negative durations/counts and reversed call
+  timestamps remain unknown; signed exit codes remain signed. Both model-refusal
+  subtypes retain selected scrubbed diagnostics. Recursive JSON is treated as a
+  malformed record, and chronology is evaluated against the captured byte limit,
+  including an incomplete suffix in its fingerprint. Dependent query views must
+  preserve those unknown-duration semantics when deriving fallback latency.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
@@ -3348,7 +3400,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: da43da6e4f73 2026-10-17
+verified: 96e0a4de31a8 2026-10-18
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3378,8 +3430,28 @@ tool-disabled CC probe without changing its schedule or routing authority.
   short-lived subprocess so the event loop never waits on it (a thread stalled
   the loop for the whole decrypt here). Every unlock, lock,
   refusal and relock lands in `payment_vault_events` with the requesting pid
-  and process names; unlock fails closed without that audit row. Nothing
-  decrypts a card yet, and the vault directory is not backed up.
+  and process names; unlock fails closed without that audit row.
+  `approval.py` `PaymentApprovalRegistry` (created in `serve()`, audited
+  through the vault service's own connection, bot attached after Telegram
+  starts) asks the owner to approve a card release: a code-built,
+  `parse_mode=None` message with one `payapprove:<nonce>` button. A tap
+  grants only from the first `TELEGRAM_ALLOWED_USERS` id, on that exact chat,
+  message id and text, unedited and accessible, once; anything else, a missing
+  bot or audit, or 10 minutes without a tap refuses. Nonces live in memory
+  only; no `approval_requests` row is written, and the type is in the gate's
+  approve-all denylist, `refuse_generic` and both dashboard filters. Nothing
+  calls it or decrypts a card yet.
+  Backup: `scripts/lib/payment_vault_backup.sh` from
+  backup.sh §8 writes the three files as ONE GPG-encrypted tar,
+  `creds/payment_vault.tar.gpg`, renamed into place once (cards.db via SQLite
+  online backup, under the vault's directory lock, only when the set passes the
+  check restore reruns), so no reader can mix files from two backups;
+  `payment_vault` in `backup_status.json` is ok/absent/skipped (not
+  attempted)/failed/missing, and failed or missing fails the run (non_db).
+  restore.sh decrypts it only when it comes from the selected off-site snapshot
+  (or Tier-1 when none was selected), checks member types and the vault, and
+  stages it fresh in `~/.genesis/restore-creds/payment_vault/` (an earlier copy
+  is moved aside); it never places it.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
@@ -3589,7 +3661,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   detector (ASCII digits, alphanumeric boundary, standard groupings, brand
   prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
   by path), used by the browser tool guards, `reference_store`, reference
-  extraction and `output_scanner`; `skill_scan`
+  extraction and `output_scanner`; `card_redaction` = redaction built on it
+  (result walker incl. JSON text, numbers and cards split across lines or
+  values, the `redacted` tool decorator, the `CARD_FILTER` log filter), used by the browser tools; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
   `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
   switch + gate policy**: `gate_mode()` re-reads `config/ws3_immunity.yaml` +
