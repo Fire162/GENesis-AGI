@@ -200,3 +200,27 @@ def test_session_with_only_meta_and_hooks_appears_in_sessions(tmp_path):
         assert con.execute(
             "SELECT session_id,n_turns,ai_title FROM sessions WHERE session_id='ghost'"
         ).fetchall() == [("ghost", 0, "Ghost")]
+
+
+# "Query evidence leaks raw source metadata" ----------------------------------
+def test_manifest_inventory_carries_identities_not_raw_names(tmp_path):
+    projects, data = tmp_path / "projects", tmp_path / "data"
+    projects.mkdir()
+    _write(projects / "source.jsonl", [_asst("m1", "2026-10-01T00:00:00Z", "u1", SID)])
+    store.ingest(projects, data)
+    # Simulate an inventory carrying an absolute root and a raw failed name.
+    inventory = json.loads((data / "inventory.json").read_text())
+    inventory["projects_root"] = str(projects.resolve())
+    inventory["failed_sources"] = ["private-name.jsonl"]
+    (data / "inventory.json").write_text(json.dumps(inventory))
+    manifest = tmp_path / "query.json"
+    query.run_query(data, "SELECT 1", live=True, manifest_path=manifest)
+    body = json.loads(manifest.read_text())
+    # _scrub_manifest_json redacts roots and hashes source names before
+    # publication; the raw name and root must not survive anywhere.
+    assert body["inventory"]["projects_root"] == "[redacted]"
+    assert "private-name.jsonl" not in json.dumps(body)
+    assert str(projects.resolve()) not in json.dumps(body)
+    assert body["inventory"]["failed_sources"] == [
+        store.srckey("private-name.jsonl")
+    ]
