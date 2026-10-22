@@ -21,4 +21,21 @@ Activate the Genesis Python environment first. Both the unique `--basetemp` and 
 
 Hook trust is scoped to the vetted fixture: `hooks/list` supplies its exact key and current hash, which are persisted only in the isolated configuration. No hook-trust bypass flag is used. This confirms trust of the hook definition, not integrity of the referenced script bytes: a separate isolated Codex 0.161.0 probe kept the same current hash and trusted status after adding a harmless script comment. Production readiness must verify guard contents separately. `native-evidence.json` in each pytest temporary directory records binary versions, hook discovery, fixture requests, native events, and stderr. The fake MCP is marked required so startup must succeed before the initial tool catalog is built.
 
-The app-server path drives initialization, an ephemeral thread, and a turn over stdio. It exercises the native backend; it does not certify desktop folder selection, the desktop trust UI, or production validator policy. Those require separate readiness checks. This harness also does not claim coverage of hook crashes, timeouts, later stdin input, or arbitrary indirect execution.
+The app-server path drives initialization, an ephemeral thread, and a turn over stdio. It exercises the native backend; it does not certify desktop folder selection, the desktop trust UI, or production validator policy. Those require separate readiness checks. This baseline file does not cover hook crashes, timeouts, later stdin input, or arbitrary indirect execution.
+
+The separate opt-in `tests/test_hooks/test_codex_validator_adapter_native.py`
+provides the qualification harness for the inactive interactive adapter on
+Codex 0.163.0. It copies the guard
+source and records its hashes, reuses the installed Python interpreter without
+changing it, and exercises actual scratch receipts on both clients. It adds
+child ask, crash, missing-script, malformed-output and timeout cases, advisory
+delivery, relative patches and code-mode MCP admission. Raw direct MCP function
+calls rejected as unsupported before any hook are transport controls, not
+adapter denial evidence. The outer-timeout pair uses the same delayed denial:
+the short deadline must let its harmless receipt execute, while the normal
+deadline must refuse it. It checks hook startup and the effective trusted timeout;
+CLI JSON does not expose the timeout message. This documents the accepted native
+fail-open. These are
+child failures caught by the adapter, not evidence that a failed outer native
+hook is safe. Keep the unique base directory and retention options above when
+running this file too. No production validator profile is activated.

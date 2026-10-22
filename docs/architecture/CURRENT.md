@@ -4095,7 +4095,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: f9a1d4cb 2026-10-18
+verified: 11f366060 2026-10-22
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4153,6 +4153,12 @@ verified: f9a1d4cb 2026-10-18
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
+  validator calls to the existing guards concurrently. It requires an absolute
+  Bash cd anchor, confines patches to validator scratch roots, translates asks
+  to denials and preserves advisories. It has no ordinary configuration wiring
+  or role-specific publishing/store policy yet. See
+  `docs/reference/codex-validator-boundary.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,

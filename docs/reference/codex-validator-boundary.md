@@ -1,5 +1,70 @@
 # Codex validator action boundary
 
+## Interactive guard adapter (inactive)
+
+`scripts/hooks/codex-validator-adapter` is a separate adapter for the planned
+interactive validator profile. It does not replace the sealed request boundary
+below, change ordinary Codex configuration, start a session, or admit new MCP
+writers. Role-specific publishing, service and store policy and launcher trust
+preflight are separate dependencies; this adapter alone is not an activated
+validator.
+
+Every Bash command must begin `cd /absolute/existing/directory && command`.
+Single or double quoting of a literal directory is supported, without expansion
+or a `--` option. Parent (`..`) components are refused because Bash's logical
+parent resolution can differ from filesystem resolution through a symlink;
+use the canonical directory instead. Ordinary symlink anchors remain supported.
+The command is unchanged. Native 0.163.0 omitted an explicit
+shell workdir from its hook input, so the adapter supplies the proven anchor as
+the guards' cwd instead. Reads require this prefix too.
+
+Patches use their native cwd for relative paths; they are never rebased into a
+different scratch directory. Every source and move destination must pass the
+existing patch policy under `~/tmp/validator/`, `~/.genesis/output/prv-*/` or
+`~/.genesis/output/validator-runs/`. Symlinked scratch roots are refused as well
+as the existing symlink, hardlink, special-file, traversal and trusted-config
+checks. One refused target rejects the whole patch. Synthetic file events run
+only the main-checkout file guard and secrets-access guard: there are no Bash
+snapshots to leave unpaired.
+
+The unchanged Bash guards run through `genesis-hook`, plus the unchanged inline
+safety command from Claude settings. The evaluator docstring lists exclusions.
+MCP calls under the two validator prefixes reach the MCP-aware secrets guard;
+tool authorization remains the servers' responsibility. `CLAUDE_PROJECT_DIR`
+comes from the adapter's location, and `GENESIS_CC_SESSION` is removed before
+children start. Native session/call IDs remain available for advisories.
+
+An ask actually emitted by a guard becomes a denial telling the model to raise
+it with the owner. Existing install ask-suppression settings remain authoritative:
+a suppressed ask keeps the existing guard's advisory/no-decision behavior.
+The adapter does not force those asks on or alter other clients' policy. Known
+advisories and successful stderr notes become `additionalContext`. Observable
+child failures, malformed/unknown output, missing programs and child deadlines
+deny. Existing guards' intentional internal fail-open paths remain unchanged.
+The shell wrapper requires an explicit private allow token and forwards only
+the advisory JSON. It signals allow or explained denial on fd 3, with exit 0
+or 2 respectively. `hook_command(runtime)` supplies the shared outer definition:
+it requires those exact status/signal pairs and catches missing, broken or
+silently exiting launchers. fd 4 preserves advisory stdout while the outer
+definition collects the decision. The later profile must use this definition;
+this PR does not install it.
+
+The push guard has a 5-second child budget, others 8 seconds; the whole evaluator
+has 10 seconds. At most 15 children run concurrently, including multi-file
+patches. Cleanup kills and drains owned process groups before returning.
+Descendants escaping an owned group, including one retaining a pipe, are outside
+that cleanup guarantee and can cause the outer deadline to be reached. The
+hook definition needs a 15-second timeout, with cold-path qualification before
+activation. An outer hook that cannot start, is killed or times out can still
+fail open in Codex. This is bounded accident prevention, not OS containment.
+
+Twenty fresh-process plain-shell hook probes on the qualified source measured
+2.04 seconds for the first call, p95 2.05 seconds and maximum 2.12 seconds.
+These are normal-call measurements, not a worst-case guarantee; later policy
+or profile changes require qualification again.
+
+## Sealed request foundation
+
 `scripts/hooks/codex-validator-guard` is the native PreToolUse wrapper for a
 separately configured external validator workspace. This foundation does not
 install a hook or activate a validator session.
