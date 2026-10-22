@@ -1011,6 +1011,9 @@ def test_the_oneshot_timeout_clears_the_worst_run_the_settings_allow():
         + mx["NETWD_TS_RESTART_TIMEOUT_SEC"]
         + mx["NETWD_TS_POLL_SEC"] + call + 1  # the poll, one read past it, a 1s sleep
         + mx["NETWD_TS_VERIFY_SEC"] + call + 2  # the check, one ping past it, a 2s sleep
+        # The home-DERP pin, on its own short timeout: derp-map, the pin before
+        # the heal, the pin after it, and the identity read after it.
+        + 4 * tsw.DERP_CALL_TIMEOUT_SEC
     )
     text = LIB.read_text()
     (minutes,) = re.findall(r"TimeoutStartSec=(\d+)min", text)
