@@ -925,8 +925,9 @@ The bug-first and verify-RED core is in
   file mutated unless it installs handlers that turn those signals into an
   exception (see
   `.claude/skills/genesis-development/references/high-stakes-verification.md`,
-  "Control the instrument"); against SIGKILL only the per-cycle baseline check
-  helps. Nor does unconditional mean the restore always OVERWRITES: what it writes
+  "Control the instrument"). Against SIGKILL nothing in-process helps, and the
+  next run's baseline is taken from the mutated file: mutate a disposable copy,
+  or check against a pristine original kept outside the process. Nor does unconditional mean the restore always OVERWRITES: what it writes
   is still gated on the hash check below. A `trap` that restores blindly is the very thing that destroys a
   concurrent edit. The expected outcome here is a NONZERO exit, and under
   `set -e` a trailing restore is exactly the statement that never runs (the

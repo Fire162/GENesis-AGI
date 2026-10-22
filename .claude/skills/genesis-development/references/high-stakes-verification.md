@@ -203,8 +203,11 @@ A MUTATION harness has two more instrument defects of its own (#2255):
   2026-10-22, Python 3.12; a bash `EXIT` trap did run on both), so a harness
   killed by a timeout leaves the tree MUTATED. Install handlers for SIGTERM, SIGINT
   and SIGHUP, and after the restore re-read the file and compare hashes rather
-  than trusting the copy. Nothing runs on SIGKILL, which is why the check before
-  each cycle (build-session, Test-First Discipline) exists.
+  than trusting the copy. Nothing in-process survives SIGKILL, and the next run's
+  baseline would be taken from the mutated file, so the check before each cycle
+  does not catch it either. Mutate a disposable copy (a scratch worktree), or
+  keep the pristine original outside the process and have every run compare
+  against it (or against `git`) before taking its baseline.
 - **Refuse to mutate on a non-unique anchor.** Assert the anchor matches exactly
   the expected number of times (once, for a single-site mutation) before writing. A harness that edits blind measures the wrong line and
   reports a verdict about a different function.
