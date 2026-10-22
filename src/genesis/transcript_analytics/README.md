@@ -72,10 +72,19 @@ require a matching call observation or a shared known context; ambiguous results
 remain orphaned. Delegation evidence is scoped to its context and requires one
 distinct spawning observation before confirming a parent. Scrub failures are
 retained when any call copy or linked result reports one.
+Paired results retain raw child IDs for search, but cannot prove or contradict
+lineage because extraction did not retain their independent result context.
+Without independent companion evidence their spawn association stays unresolved
+and excluded from confirmed coverage. Unpaired results retain their own context
+and remain eligible for the existing producer checks.
+Unknown historical actors keep distinct structured source-local identities and
+do not create lineage nodes. Missing content hashes remain unknown and count as
+excluded content; observed conflicting hashes remain conflicts. Conflicting
+tool observations retain stable display values without resolving their ownership.
 
 `source_coverage` exposes original per-source provenance and unavailable
 historical facts. `run_query(..., manifest_path=...)` records the same captured
-coverage alongside result denominators and scrubbed query labels. Missing
+coverage alongside result denominators, the query views version and scrubbed query labels. Missing
 historical identity is unresolved, not attributed to a current executor.
 
 Each connection uses its own 0700 spill directory under `TA_DUCKDB_TMP` or
@@ -90,6 +99,8 @@ It fsyncs every Parquet file, the manifest and the directory, publishes the
 complete `derived/<stamp>/`, then atomically replaces `derived/current`.
 The immediately previous snapshot is retained; older cache directories and
 interrupted staging are disposable. No durable source is removed by a build.
+Rebuilding removes malformed staging and selector entries by their actual type;
+cache symlinks are unlinked without inspecting or deleting their targets.
 
 `query.connect(data)` and `run_query` prefer a snapshot whose manifest matches
 both the current views version and the captured inputs signature. Every table
@@ -113,7 +124,7 @@ apply to snapshot materialization. `derive.is_current` checks the complete
 cache, not just file existence.
 
 After backup restore, call `derive.discard_after_restore(data)`: it deletes
-only `derived/`, without changing source records, original stamps, root binding
+only `derived/` and syncs its parent directory before returning, without changing source records, original stamps, root binding
 or inventory. Live queries work immediately and snapshots rebuild from durable
 records even when their original transcripts are permanently gone. Additional backup and restore command wiring is deferred; it does not gate
 collection, live search or opportunity scanning.
