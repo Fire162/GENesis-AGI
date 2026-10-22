@@ -142,28 +142,28 @@ PY
     IFS=$'\x1f' read -r STATE_PHASE STATE_PID ROLLBACK_TAG ORIGINAL_BRANCH OWN_HEAD DEPLOY_HEAD ORIGINAL_BRANCH_PRESENT LIVE_TO \
         <<< "$_state_fields"
 
-    # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
-    # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
-    # zombie or reused pid: the "dead" branch below resets the tree, so here a
-    # stale holder must err toward "still running", never toward the reset. A held
-    # update.lock with the pid gone means an update is still running too
-    # (update.sh SIGKILLed while the live engine it ran holds the lock through the
-    # inherited fd, possibly mid-switch, #3492), and there bootstrap stops: no
-    # update asked for it. (A validation hold, flock -s, reads the same; waiting
-    # for it is the safe side.)
-    if [ "$STATE_PID" -gt 1 ] 2>/dev/null && kill -0 "$STATE_PID" 2>/dev/null; then
-        echo "  Update process (pid $STATE_PID) still running in phase '$STATE_PHASE' — not interfering."
-    elif { _lock_rc=0; _update_lock_held || _lock_rc=$?; [ "$_lock_rc" -ne 1 ]; }; then
-        if [ "$_lock_rc" -eq 2 ]; then
-            echo "  REFUSE: ${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock cannot be opened (check its owner and mode), so whether an update still holds it is unknown: bootstrap does not run." >&2
-            exit 1
-        fi
-        # Unlike the branch above (update.sh running bootstrap itself, alive and
-        # holding the lock: bootstrap is its step and goes on), nobody here
-        # asked for this run: its update died and something it left (an
-        # orphaned live engine, possibly mid-switch) still holds the lock.
-        # Installing or rewriting config under that would race it, so stop.
-        echo "  REFUSE: an update still holds update.lock (phase '$STATE_PHASE'; pid $STATE_PID is gone): bootstrap does not run under it." >&2
+    # Is an update still running? update.sh holds update.lock for its whole run
+    # (and an engine it ran keeps it through the inherited fd, even after
+    # update.sh dies, #3492), so the lock is the answer, not the recorded pid,
+    # which a zombie or a reused pid makes look alive. Held, it is update.sh's
+    # own step only when update.sh said so: it names its pid in
+    # GENESIS_BOOTSTRAP_UPDATE_PID on its bootstrap call, and that must be the
+    # pid the state records. Held otherwise, bootstrap refuses: a hand-run
+    # bootstrap during a live update now refuses too, the safe direction (a
+    # validation hold, flock -s, reads the same). Free, no update is running and
+    # the state is a dead one's.
+    _lock_rc=0
+    _update_lock_held || _lock_rc=$?
+    # The token first: update.sh's own call goes on whether bootstrap can see
+    # the lock as held (0) or cannot open it (2); update.sh holds it either way.
+    if [ "$_lock_rc" -ne 1 ] && [ -n "${GENESIS_BOOTSTRAP_UPDATE_PID:-}" ] \
+        && [ "$GENESIS_BOOTSTRAP_UPDATE_PID" = "$STATE_PID" ]; then
+        echo "  Update process (pid $STATE_PID) is running this bootstrap in phase '$STATE_PHASE' — not interfering."
+    elif [ "$_lock_rc" -eq 2 ]; then
+        echo "  REFUSE: ${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock cannot be opened (check its owner and mode), so whether an update still holds it is unknown: bootstrap does not run." >&2
+        exit 1
+    elif [ "$_lock_rc" -eq 0 ]; then
+        echo "  REFUSE: an update holds update.lock (phase '$STATE_PHASE', recorded pid $STATE_PID) and did not start this bootstrap: it does not run under it." >&2
         echo "  Re-run scripts/bootstrap.sh once it has finished (nothing holds ${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock); a validation hold (flock -s) reads the same." >&2
         exit 1
     elif [ "$STATE_PHASE" = "done" ]; then
@@ -175,7 +175,7 @@ PY
         # --post-merge. It is not a crash, so it is neither recovered nor recorded.
         echo "  An update stopped on merge conflicts (nothing was merged); its state is kept for the resolver."
     else
-        echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
+        echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID; nothing holds update.lock)."
         if [ -z "$ROLLBACK_TAG" ] || ! git -C "$GENESIS_ROOT" check-ref-format "refs/tags/$ROLLBACK_TAG" >/dev/null 2>&1; then
             _crash_recovery_refuse "no valid rollback tag is recorded"
         fi

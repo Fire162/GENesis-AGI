@@ -97,6 +97,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -119,8 +120,10 @@ EXIT_CODES = {GUARDS: 0, SAFE: 10, CONFLICT_PENDING: 3, MIXED_TREE: 4, HOLD: 6}
 #: The engine's move phases, as deploy_candidates_plan.py writes them.
 MOVE_PHASES = ("ref", "moving", "partial", "clean", "done")
 _HEX = frozenset("0123456789abcdef")
-#: Shown as "?" in a residue path (N5): terminal control, tabs, DEL.
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+#: A name holding one of these (a C0 or C1 control character, DEL, a line or
+#: paragraph separator, or a byte that is not UTF-8, carried as a surrogate) is shown in bash's $'...' form, so the
+#: line stays one line and nothing reaches a terminal raw.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\udc80-\udcff]")
 
 _LIB = os.path.dirname(os.path.abspath(__file__))
 
@@ -184,8 +187,10 @@ def _move_record(state: dict) -> tuple[str, str] | None:
     return (to, phase) if phase in MOVE_PHASES else None
 
 
-def _merge_residue(repo: str, rb_commit: str, deploy_head: str, two_dot: bool = False) -> str:
-    """genesis_merge_residue's lines; any failure to run it is residue."""
+def _merge_residue(repo: str, rb_commit: str, deploy_head: str, two_dot: bool = False) -> list[str]:
+    """genesis_merge_residue's records (NUL-separated on the wire, so every
+    legal file name arrives exactly; bytes that are not UTF-8 are kept as
+    surrogates); any failure to run it is residue."""
     proc = subprocess.run(
         [
             "bash",
@@ -200,12 +205,13 @@ def _merge_residue(repo: str, rb_commit: str, deploy_head: str, two_dot: bool = 
         ],
         capture_output=True,
         text=True,
+        errors="surrogateescape",
         env=_env(),
         timeout=_TIMEOUT_S,
     )
     if proc.returncode != 0:
-        return f"(the merge residue check failed: exit {proc.returncode})"
-    return proc.stdout.strip()
+        return [f"(the merge residue check failed: exit {proc.returncode})"]
+    return [rec for rec in proc.stdout.split("\0") if rec]
 
 
 def _conflict_recorded(conflicts_path: str, deploy_head: str) -> bool:
@@ -273,20 +279,53 @@ def _own_head(state: dict) -> str:
     return own if isinstance(own, str) and len(own) in (40, 64) and set(own) <= _HEX else ""
 
 
-def _mixed(tag: str, to: str, residue: str, *, forward: bool = False) -> tuple[str, str]:
+def _shell_token(name: str) -> str:
+    """A raw file name as ONE shell token that pastes back as the same name:
+    shlex.quote, or bash's $'...' when the name holds a control character or a
+    non-UTF-8 byte (shlex would keep those raw, splitting the line or reaching
+    a terminal)."""
+    if not _CONTROL.search(name):
+        return shlex.quote(name)
+    out = []
+    for ch in name:
+        code = ord(ch)
+        if ch in "\\'":
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif 0xDC80 <= code <= 0xDCFF:
+            out.append(f"\\x{code - 0xDC00:02x}")
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\x{code:02x}")
+        elif _CONTROL.match(ch):  # C1, U+2028/9: its UTF-8 bytes, needing no locale
+            out.append("".join(f"\\x{byte:02x}" for byte in ch.encode()))
+        else:
+            out.append(ch)
+    return "$'" + "".join(out) + "'"
+
+
+def _shown(record: str) -> str:
+    """A residue record as one display line: its status, then the path as one
+    shell token ("(...)" notes as they are)."""
+    if record.startswith("("):
+        return record
+    return record[:3] + _shell_token(record[3:])
+
+
+def _mixed(tag: str, to: str, residue: list[str], *, forward: bool = False) -> tuple[str, str]:
     """MIXED_TREE, its reason naming the two commits and listing every path.
     ``forward``: HEAD is at ``to``, not the tag, so the remedy finishes forward."""
-    lines = residue or "(the rebuild recorded that git wrote part of the tree)"
-    # Paths reach terminals and a supervising session's summary verbatim: a
-    # control character in a file name (ESC, a tab) is shown as "?".
-    # Split on "\n" only: str.splitlines also breaks on \x1c-\x1e, \v and \f.
-    lines = "\n".join(_CONTROL.sub("?", ln) for ln in lines.split("\n"))
+    lines = [_shown(r) for r in residue] or [
+        "(the rebuild recorded that git wrote part of the tree)"
+    ]
     where = (
         f"{_FORWARD} ({to[:12]}), half-written back toward {tag[:12]}"
         if forward
         else f"the checkout is half-written between {tag[:12]} and {to[:12] or 'its merge'}"
     )
-    return MIXED_TREE, where + ":\n" + "\n".join("  " + ln for ln in lines.split("\n"))
+    return MIXED_TREE, where + ":\n" + "\n".join("  " + ln for ln in lines)
 
 
 def _forward(repo: str, tag: str, to: str) -> tuple[str, str] | None:

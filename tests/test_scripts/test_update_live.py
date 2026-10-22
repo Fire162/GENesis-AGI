@@ -1531,7 +1531,7 @@ def test_t4g_r1_marks_a_real_diverged_switch_kill_suspect(tmp_path):
     kill_switch_after(d["root"], d["new"], "Z")
     r = _adopt_on(d, tmp_path / "home", live_row(d))
     assert r.returncode == 0, _out(r)
-    assert "SUSPECT=1" in r.stdout and "    F" in r.stdout, _out(r)
+    assert "SUSPECT=1" in r.stdout and "    ?? F" in r.stdout, _out(r)
 
 
 def test_t4g_r1_a_switch_that_wrote_nothing_is_not_suspect(tmp_path):
@@ -1561,3 +1561,38 @@ def test_sf2_r1_an_edit_on_a_switch_path_is_still_suspect(tmp_path):
     r = _adopt_on(d, tmp_path / "home", live_row(d))
     assert r.returncode == 0, _out(r)
     assert "SUSPECT=1" in r.stdout and "M O" in r.stdout, _out(r)
+
+
+def test_review_s2_the_rollback_prints_each_residue_path_as_one_token(tmp_path):
+    """#3532 round-3 review S2: the rollback's own residue printout. A path with
+    a newline is one line, and ESC never reaches the terminal raw."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "live")
+    (root / "a.txt").write_text("a\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "old tip")
+    old = _git(root, "rev-parse", "HEAD")
+    _git(root, "tag", "pre")
+    for name in ("nl\nx", "e\x1bv"):
+        (root / name).write_text("x\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "new tip")
+    new = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", old)
+    for name in ("nl\nx", "e\x1bv"):
+        (root / name).write_text("x\n")
+    state = {
+        "phase": "merging",
+        "rollback_tag": "pre",
+        "original_branch": "live",
+        "own_head": old,
+        "post_merge": False,
+        "live_move": {"to": new, "phase": "moving"},
+    }
+    r = _adopt_on({"root": root, "old": old}, tmp_path / "home", state)
+    assert r.returncode == 0, _out(r)
+    assert "SUSPECT=1" in r.stdout, _out(r)
+    assert "\x1b" not in r.stdout, repr(r.stdout)
+    assert "    ?? $'nl\\nx'" in r.stdout.split("\n"), repr(r.stdout)
+    assert "    ?? $'e\\Ev'" in r.stdout.split("\n"), repr(r.stdout)

@@ -319,9 +319,6 @@ class Engine(Repo):
             raise Refusal(reasons[0])
         plan.refuse_moved_source(self, source, "nothing changed")
         self._retire_harmless_update_state()
-        # Only now: update_state.json is gone or this caller's own row, so the
-        # retired side file is no interrupted update's last record.
-        self._remove_retired_move_record()
         return data
 
     def _expected_source(self, expect: tuple[str, str] | None) -> plan.Source:
@@ -425,25 +422,6 @@ class Engine(Repo):
                 f"  WARNING: the move's record ({phase}, toward {to[:12]}) could not be "
                 f"written to {path}: {exc}"
             )
-
-    def _remove_retired_move_record(self) -> None:
-        """The side file earlier versions recorded the move in, now retired (the
-        record is the row's live_move): a dead run's leftover is removed, under
-        update.lock, before any move, and only once preflight has passed, so
-        update_state.json is absent or the caller's own row. While another
-        update's state still guards, the move refuses before this and the file
-        stays with it. A failure only warns."""
-        path = self.lock_path.parent.parent / "live_move.json"
-        if os.path.lexists(self.update_state) and not self._own_update_state():
-            return
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            out(f"  WARNING: could not remove {path}, a retired move record: {exc}")
-            return
-        out(f"  (removed {path}, a retired move record an earlier update left)")
 
     def _retire_harmless_update_state(self) -> None:
         """Remove an update_state.json that guards nothing, before a move.

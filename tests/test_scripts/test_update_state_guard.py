@@ -450,7 +450,7 @@ def test_t4a_an_added_file_written_by_a_killed_switch_is_a_mixed_tree(guard, liv
     assert verdict == "mixed_tree", reason
     r = _cli(live, live["home"] / "update_state.json")
     assert r.returncode == 4, r.stdout + r.stderr
-    assert "  Z" in r.stdout and "save any you want to keep" in r.stdout, r.stdout
+    assert "  ?? Z" in r.stdout and "save any you want to keep" in r.stdout, r.stdout
 
 
 def test_t4g_a_path_a_dropped_candidate_had_deleted_is_seen(guard, live):
@@ -459,7 +459,7 @@ def test_t4g_a_path_a_dropped_candidate_had_deleted_is_seen(guard, live):
     (live["root"] / "F").write_text("f\n")
     verdict, reason = _live_verdict(guard, live, live_row(live))
     assert verdict == "mixed_tree", reason
-    assert "  F" in reason, reason
+    assert "  ?? F" in reason, reason
 
 
 def test_t4g_a_real_switch_killed_after_its_first_file_is_a_mixed_tree(guard, tmp_path):
@@ -475,7 +475,7 @@ def test_t4g_a_real_switch_killed_after_its_first_file_is_a_mixed_tree(guard, tm
     assert (root / "F").exists() and not (root / "Z").exists(), "the kill did not land after F"
     assert _git(root, "status", "--porcelain", "--untracked-files=no") == "", "not invisible"
     verdict, reason = _live_verdict(guard, live, live_row(live))
-    assert verdict == "mixed_tree" and "  F" in reason, reason
+    assert verdict == "mixed_tree" and "  ?? F" in reason, reason
 
 
 def test_t4b_a_partial_record_over_a_clean_tree_is_a_mixed_tree(guard, live):
@@ -537,7 +537,7 @@ def test_t4i_a_rollback_killed_midway_back_to_the_tag_is_a_mixed_tree(guard, liv
     assert _live_verdict(guard, live, live_row(live, "done"))[0] == "guards", "control"
     (root / "O").write_text("o\n")
     verdict, reason = _live_verdict(guard, live, live_row(live, "done"))
-    assert verdict == "mixed_tree" and "  O" in reason, reason
+    assert verdict == "mixed_tree" and "  ?? O" in reason, reason
 
 
 def test_t4f_main_residue_is_a_mixed_tree_for_every_caller(guard, repo):
@@ -592,7 +592,7 @@ def test_t4g_prime_the_two_dot_residue_names_what_the_switch_writes(live):
             env=_git_env(),
         )
         assert r.returncode == 0, r.stderr
-        return sorted(r.stdout.split())
+        return sorted(rec.removeprefix("?? ") for rec in r.stdout.split("\0") if rec)
 
     assert residue() == ["Z"]
     assert residue("--two-dot") == ["F", "Z"]
@@ -717,7 +717,7 @@ def test_sf4_a_rollback_killed_after_adoption_is_a_mixed_tree(guard, live):
     _git(live["root"], "checkout", "-q", "-B", "live", live["new"])
     (live["root"] / "O").write_text("o\n")
     verdict, reason = _live_verdict(guard, live, _adopted_row(live))
-    assert verdict == "mixed_tree" and "  O" in reason, reason
+    assert verdict == "mixed_tree" and "  ?? O" in reason, reason
     r = _cli(live, live["home"] / "update_state.json")
     assert r.returncode == 4
     forward_message_is_true(r.stdout)
@@ -762,8 +762,8 @@ def test_n5_control_characters_in_a_path_never_reach_the_terminal(guard, repo):
     state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
     verdict, reason = guard.verdict(str(_state(repo, state)), str(root))
     assert verdict == "mixed_tree", reason
-    # Shown in git's own C-style quoting (#3532 round 1): one path, one line.
-    assert '"e\\033vil\\tname.txt"' in reason, reason
+    # One shell token, in bash's $'...' form (#3532 round 3): one path, one line.
+    assert "$'e\\x1bvil\\tname.txt'" in reason, reason
     bad = [c for c in reason if (ord(c) < 0x20 and c != "\n") or ord(c) == 0x7F]
     assert not bad, repr(reason)
 
@@ -879,7 +879,7 @@ def test_r1_a_path_with_a_newline_is_one_quoted_line(guard, repo):
     state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
     verdict, reason = guard.verdict(str(_state(repo, state)), str(root))
     assert verdict == "mixed_tree", reason
-    assert '"m\\nn.txt"' in reason and '"a\\nb.txt"' in reason, reason
+    assert "$'m\\nn.txt'" in reason and "$'a\\nb.txt'" in reason, reason
     lines = [ln.strip() for ln in reason.split("\n")]
     assert "n.txt" not in lines and "b.txt" not in lines and "a" not in lines, reason
 
@@ -1158,3 +1158,67 @@ def test_audit3_any_other_commit_over_the_tag_still_holds(guard, repo):
     state = _landed_before_adoption(repo, "ff")
     _git(repo["root"], "commit", "-q", "--allow-empty", "-m", "someone else's")
     _hold(guard, repo, state)
+
+
+# ── #3532 round 3 ───────────────────────────────────────────────────────────
+
+#: name on disk -> (the added file's token, the tracked "<name>.t" file's token):
+#: every residue path is ONE shell token, rendered from its raw name by one
+#: rule (shlex.quote, or $'...' when it holds a control character, so the line
+#: stays one line and pastes back as the same name).
+DISPLAY = {
+    "trail ": ("'trail '", "'trail .t'"),
+    " lead": ("' lead'", "' lead.t'"),
+    "tab\tx": ("$'tab\\tx'", "$'tab\\tx.t'"),
+    "nl\nx": ("$'nl\\nx'", "$'nl\\nx.t'"),
+    'q"x': ("'q\"x'", "'q\"x.t'"),
+    "\u00fcn": ("'\u00fcn'", "'\u00fcn.t'"),
+    "back\\slash": ("'back\\slash'", "'back\\slash.t'"),
+    "it's": ("'it'\"'\"'s'", "'it'\"'\"'s.t'"),
+    "plain.txt": ("plain.txt", "plain.txt.t"),
+}
+
+
+@pytest.mark.parametrize("name", list(DISPLAY), ids=lambda n: repr(n))
+def test_r3_every_residue_path_is_shown_by_one_quoting_rule(guard, repo, name):
+    """P2 (the second display-quoting finding): git's own listing left a
+    trailing space unquoted, so the shown name was not the name on disk. Every
+    residue path (a tracked change and an added file alike) is now rendered from
+    its raw name, carried NUL-separated from the shell, as one shell token."""
+    root = repo["root"]
+    tracked = name + ".t"
+    (root / tracked).write_text("t\n")
+    _git(root, "add", "--", tracked)
+    _git(root, "commit", "-qm", "a tracked file")
+    _git(root, "tag", "-f", "pre")
+    (root / tracked).write_text("incoming\n")
+    (root / name).write_text("x\n")
+    _git(root, "add", "--", tracked, name)
+    _git(root, "commit", "-qm", "incoming")
+    incoming = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", "pre")
+    (root / tracked).write_text("half\n")
+    (root / name).write_text("x\n")
+    state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
+    verdict, reason = guard.verdict(str(_state(repo, state)), str(root))
+    assert verdict == "mixed_tree", reason
+    lines = reason.split("\n")[1:]
+    want_added, want_tracked = DISPLAY[name]
+    assert f"  ?? {want_added}" in lines, (want_added, lines)
+    assert f"   M {want_tracked}" in lines, (want_tracked, lines)
+    assert len(lines) == 2, lines
+    for token in (want_added, want_tracked):
+        cmd = f"printf %s {token}"
+        got = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout
+        assert got in (name, tracked), (token, got)
+
+
+@pytest.mark.parametrize("name", ["\x9b31m", "a\u2028b", "a\u2029b", "c\x85d"])
+def test_review_n2_c1_controls_and_line_separators_are_escaped(guard, name):
+    """#3532 round-3 review N2: an 8-bit CSI (U+009B) or a line separator in a
+    name never reaches a terminal raw; the token still pastes back exactly
+    (escaped as its UTF-8 bytes, which needs no locale)."""
+    token = guard._shell_token(name)
+    assert all(not (0x80 <= ord(c) <= 0x9F) and c not in "\u2028\u2029" for c in token), token
+    got = subprocess.run(["bash", "-c", f"printf %s {token}"], capture_output=True).stdout
+    assert got == name.encode(), (token, got)

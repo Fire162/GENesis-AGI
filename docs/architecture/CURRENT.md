@@ -4008,8 +4008,12 @@ tool-disabled CC probe without changing its schedule or routing authority.
   that wrote the file deletes it on its exits (never a `--post-merge`, never a
   run that had not written yet), a rollback that left merged code keeps it, and
   bootstrap's crash recovery keeps a pending conflict. Bootstrap's crash
-  recovery treats a held update.lock as a running update (an orphaned engine
-  keeps update.sh's fd) and stops when its pid is gone, and at the tag in "merging" it goes on only on the
+  recovery judges liveness by update.lock alone, never the recorded pid (a
+  zombie or a reused pid looks alive): held, it goes on only when update.sh
+  started it (update.sh names its own pid in `GENESIS_BOOTSTRAP_UPDATE_PID`,
+  which must equal the state's pid) and refuses otherwise, a hand-run bootstrap
+  during a live update or an orphaned engine included; free, the update is dead
+  and recovery runs. At the tag in "merging" it goes on only on the
   guard's exit 10, printing the guard's message otherwise. The dashboard's
   progress poll is read-only: it reports the verdict and offers Dismiss, the
   one retirement by hand. The residue check is `genesis_merge_residue` in
@@ -4054,7 +4058,8 @@ tool-disabled CC probe without changing its schedule or routing authority.
   and only while the row is still that run's own; a record that cannot be
   written before the move refuses it; the row outlives the run, so a crash
   leaves it for every reader; the old `~/.genesis/live_move.json` side file is
-  retired and removed by the next engine run), never inferred from git: a moved checkout is adopted only when HEAD is on
+  no longer written or read: no engine ever moved a checkout before it, as
+  readiness refuses every move until PR C2's marker exists), never inferred from git: a moved checkout is adopted only when HEAD is on
   `live` at exactly the commit the record names, then moved back to the
   rollback tag with its git hooks restored (`restore-hooks`), and the services
   restart on the old tip. `restore-hooks` exits 1 when a hook could not be

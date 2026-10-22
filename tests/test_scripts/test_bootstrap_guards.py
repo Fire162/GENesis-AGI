@@ -1019,8 +1019,11 @@ def test_recovery_warns_at_tag_or_skips_a_live_process(
     )
 
     if case == "live-pid":
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert "still running" in proc.stdout
+        # A live process at the recorded pid, nothing holding update.lock: no
+        # update is running, so this is a crash; HEAD is not the merge it
+        # recorded, so recovery refuses and touches nothing (#3532 round 3).
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "still running" not in proc.stdout and "not interfering" not in proc.stdout
         assert state_path.exists()
         assert _recovery_git(root, "rev-parse", "HEAD") == deploy
         return
@@ -1348,6 +1351,7 @@ def _recover_with(
     state: dict,
     *,
     scripts: Path | None = None,
+    token: int | None = None,
 ) -> tuple[subprocess.CompletedProcess, Path]:
     """The crash-recovery block over ``state``, as _recover runs it, with
     GENESIS_HOME unset (update.lock is then under HOME) and, optionally, another
@@ -1371,6 +1375,9 @@ def _recover_with(
         TEST_BACKUP_ROOT=str(home / ".genesis" / "premerge-backups" / "test-run"),
     )
     env.pop("GENESIS_HOME", None)
+    env.pop("GENESIS_BOOTSTRAP_UPDATE_PID", None)
+    if token is not None:
+        env["GENESIS_BOOTSTRAP_UPDATE_PID"] = str(token)
     proc = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, timeout=60, env=env
     )
@@ -1393,7 +1400,7 @@ def test_t4h_a_live_switch_killed_after_a_dropped_candidates_path_is_refused(tmp
     proc, path = _recover_with(tmp_path, d["root"], _live_state(d))
     out = proc.stdout + proc.stderr
     assert proc.returncode == 1 and "REFUSE:" in out, out
-    assert "  F" in out and path.exists(), out
+    assert "  ?? F" in out and path.exists(), out
     assert _recovery_git(d["root"], "rev-parse", "HEAD") == d["old"]
     assert (d["root"] / "F").read_text() == "f\n"
     assert not g.post_merge_advice(out), out
@@ -1406,7 +1413,7 @@ def test_t4g_bootstrap_refuses_a_real_diverged_switch_kill(tmp_path):
     g.kill_switch_after(d["root"], d["new"], "Z")
     proc, path = _recover_with(tmp_path, d["root"], _live_state(d))
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 1 and "  F" in out and path.exists(), out
+    assert proc.returncode == 1 and "  ?? F" in out and path.exists(), out
 
 
 def test_t4i_a_rollback_killed_midway_back_to_the_tag_is_refused_with_the_guards_remedy(
@@ -1423,7 +1430,7 @@ def test_t4i_a_rollback_killed_midway_back_to_the_tag_is_refused_with_the_guards
     proc, path = _recover_with(tmp_path, d["root"], _live_state(d, "done"))
     out = proc.stdout + proc.stderr
     assert proc.returncode == 1 and "REFUSE:" in out and path.exists(), out
-    assert "  O" in out and "save any you want to keep" in out, out
+    assert "  ?? O" in out and "save any you want to keep" in out, out
     assert "finish forward with" not in out, "the generic remedy was added"
     g.forward_message_is_true(out)
 
@@ -1533,8 +1540,9 @@ def test_t4l_an_update_lock_still_held_means_still_running(tmp_path):
 
 
 def test_t4l_update_sh_running_bootstrap_under_its_own_lock_goes_on(tmp_path):
-    """Control: update.sh runs bootstrap while it is alive and holds update.lock
-    (its state names its own pid): that is the normal path and must go on."""
+    """Control: update.sh runs bootstrap while it holds update.lock, naming
+    its own pid (GENESIS_BOOTSTRAP_UPDATE_PID), which its state records: the
+    normal path, and it must go on."""
     root, _common, rollback = _recovery_repo(tmp_path)
     lock = tmp_path / "home" / ".genesis" / "locks" / "update.lock"
     lock.parent.mkdir(parents=True)
@@ -1549,12 +1557,12 @@ def test_t4l_update_sh_running_bootstrap_under_its_own_lock_goes_on(tmp_path):
             "deploy_head": "",
             "pid": os.getpid(),
         }
-        proc, path = _recover_with(tmp_path, root, state)
+        proc, path = _recover_with(tmp_path, root, state, token=os.getpid())
     finally:
         holder.kill()
         holder.wait()
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 0 and "still running" in out and "AFTER_RECOVERY" in out, out
+    assert proc.returncode == 0 and "not interfering" in out and "AFTER_RECOVERY" in out, out
     assert path.exists()
 
 
@@ -1607,3 +1615,112 @@ def test_t4l_control_a_free_update_lock_recovers(tmp_path):
     lock.unlink()
     proc, path = _recover_with(tmp_path, root, state)
     assert proc.returncode == 0 and not lock.exists(), proc.stdout + proc.stderr
+
+
+def _zombie_pid() -> tuple[subprocess.Popen, int]:
+    """A child that has exited and is not reaped: `kill -0` still succeeds."""
+    child = subprocess.Popen(["true"])
+    deadline = time.monotonic() + 30
+    while True:
+        stat = Path(f"/proc/{child.pid}/stat").read_text()
+        if stat[stat.rindex(")") + 2] == "Z":
+            return child, child.pid
+        assert time.monotonic() < deadline, "the child never became a zombie"
+        time.sleep(0.02)
+
+
+@pytest.mark.parametrize("who", ["zombie", "reused", "wrong-token"])
+def test_r3_a_live_looking_pid_with_the_lock_held_refuses(tmp_path, who):
+    """P1: update.sh was killed; its pid is a zombie, or was reused by an
+    unrelated process. `kill -0` succeeds either way, and the old "still
+    running" branch went on with bootstrap under an orphaned engine holding
+    update.lock. Only bootstrap's own ancestor may hold it and go on."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    lock = tmp_path / "home" / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    holder = _holding(lock)
+    zombie = None
+    try:
+        if who == "zombie":
+            zombie, pid = _zombie_pid()
+        else:
+            pid = holder.pid  # alive, unrelated to bootstrap
+        token = pid + 1 if who == "wrong-token" else None
+        state = {
+            "phase": "merging",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": pid,
+        }
+        proc, path = _recover_with(tmp_path, root, state, token=token)
+    finally:
+        holder.kill()
+        holder.wait()
+        if zombie is not None:
+            zombie.wait()
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "update.lock" in out, out
+    assert "AFTER_RECOVERY" not in out, "bootstrap went on under an orphaned engine"
+    assert path.exists() and _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_r3_a_zombie_pid_with_the_lock_free_is_recovered_as_dead(tmp_path):
+    """A zombie is a dead update: with nothing holding the lock, crash recovery
+    runs (it used to say "still running" and skip it)."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    zombie, pid = _zombie_pid()
+    try:
+        state = {
+            "phase": "merging",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": pid,
+        }
+        proc, path = _recover_with(tmp_path, root, state)
+    finally:
+        zombie.wait()
+    out = proc.stdout + proc.stderr
+    assert "CRASHED" in out and "still running" not in out, out
+    assert proc.returncode == 0 and not path.exists(), out
+
+
+def test_review_s3_update_sh_names_itself_on_its_bootstrap_call():
+    """#3532 round-3 review S3: without the token every update's bootstrap would
+    refuse (update.lock is held) and the update roll back. Pinned exactly."""
+    code = _code(UPDATE)
+    assert (
+        'GENESIS_BOOTSTRAP_UPDATE_PID="$$" GENESIS_BOOTSTRAP_ALLOW_LIVE=1 '
+        '"$GENESIS_ROOT/scripts/bootstrap.sh"'
+    ) in code
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens a mode-000 file")
+def test_review_n1_update_sh_s_own_call_survives_an_unopenable_lock(tmp_path):
+    """#3532 round-3 review N1: update.sh's own bootstrap (the token equals the
+    state's pid) goes on even when it cannot open update.lock to look: the
+    update holding it is the one that started this bootstrap."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    lock = tmp_path / "home" / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    lock.chmod(0)
+    try:
+        state = {
+            "phase": "bootstrap",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": os.getpid(),
+        }
+        proc, path = _recover_with(tmp_path, root, state, token=os.getpid())
+    finally:
+        lock.chmod(0o600)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0 and "AFTER_RECOVERY" in out, out
+    assert path.exists()

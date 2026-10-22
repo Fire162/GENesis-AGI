@@ -325,7 +325,7 @@ def test_t4s_post_merge_refuses_a_half_written_tree_on_live(tmp_path):
     w["state"].write_text(json.dumps(live_row(d)))
     r = _guard_run(w, post_merge=True)
     assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
-    assert "  F" in r.stdout and not post_merge_advice(r.stdout), r.stdout
+    assert "  ?? F" in r.stdout and not post_merge_advice(r.stdout), r.stdout
 
 
 def test_post_merge_still_finishes_a_live_move_that_completed(tmp_path):
@@ -351,7 +351,7 @@ def test_sf4_post_merge_refuses_a_rollback_killed_after_adoption(tmp_path):
     w["state"].write_text(json.dumps(row))
     r = _guard_run(w, post_merge=True)
     assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
-    assert "  O" in r.stdout, r.stdout
+    assert "  ?? O" in r.stdout, r.stdout
 
 
 def _stub_guard(tmp_path: Path, rc: int) -> Path:

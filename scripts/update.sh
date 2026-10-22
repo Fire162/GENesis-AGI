@@ -377,7 +377,7 @@ print(to, phase)
 # sees it.
 _live_adopt_tip() {
     [ "${ON_LIVE:-0}" = 1 ] && [ "${_LIVE_ENGINE_RAN:-0}" = 1 ] || return 0
-    local got="" to="" phase="" rc=0 rb="" residue=""
+    local got="" to="" phase="" rc=0 rb="" residue="" rec
     got="$(_live_read_move_record)" || rc=$?
     [ "$rc" -ne 2 ] || return 0
     if [ "$rc" -eq 0 ] && [ -n "$got" ]; then
@@ -394,8 +394,21 @@ _live_adopt_tip() {
         moving|ref)
             rb="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "$ROLLBACK_TAG^{commit}" 2>/dev/null || true)"
             if [ -n "$rb" ]; then
-                residue="$(genesis_merge_residue "$GENESIS_ROOT" "$rb" "$to" --two-dot)" \
-                    || residue="(the residue check failed)"
+                # NUL-separated records, read as such (a $(...) would drop the
+                # NULs), each shown as one line: the status, then the path as
+                # one shell token (printf %q), so a newline or a control
+                # character in a name never splits a line or reaches a terminal.
+                local -a recs=()
+                mapfile -d '' -t recs < <(genesis_merge_residue "$GENESIS_ROOT" "$rb" "$to" --two-dot)
+                if ! wait $!; then
+                    residue="(the residue check failed)"
+                fi
+                for rec in "${recs[@]}"; do
+                    case "$rec" in
+                        "("*) residue+="$rec"$'\n' ;;
+                        *) residue+="${rec:0:3}$(printf '%q' "${rec:3}")"$'\n' ;;
+                    esac
+                done
             else
                 residue="(the rollback tag cannot be resolved)"
             fi
@@ -406,7 +419,7 @@ _live_adopt_tip() {
     esac
     _LIVE_TREE_SUSPECT=1
     echo "  The rebuild may have written part of the new tree (move record: ${phase:-unreadable}); HEAD is not at its target."
-    [ -z "$residue" ] || printf '%s\n' "$residue" | sed 's/^/    /'
+    [ -z "$residue" ] || printf '%s' "$residue" | sed 's/^/    /'
     return 0
 }
 # END live-helpers
@@ -3169,7 +3182,9 @@ _write_state "bootstrap"
 # was stopped above, and the ERR trap is armed here, so a guard refusal would
 # escalate into a full update rollback. The guard must never gate this call.
 echo "--- Running bootstrap ---"
-GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
+# GENESIS_BOOTSTRAP_UPDATE_PID: this run is the update.lock holder bootstrap
+# sees, and the pid its state records (bootstrap's crash recovery reads both).
+GENESIS_BOOTSTRAP_UPDATE_PID="$$" GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
 echo "  Bootstrap complete"
 echo ""
 
