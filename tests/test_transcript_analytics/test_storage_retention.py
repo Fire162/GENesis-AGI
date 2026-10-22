@@ -1,6 +1,7 @@
 """Retention and selection fail closed over every physical source revision."""
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -238,3 +239,93 @@ def test_failed_discovery_never_commits_projects_binding(tmp_path, monkeypatch, 
     with pytest.raises((OSError, ValueError)):
         store.ingest(target, data, adopt_projects_root=True)
     assert (binding.read_bytes() if binding.exists() else None) == before
+
+
+@pytest.mark.parametrize("swap_at", ["discovery", "open"])
+def test_ingest_rejects_a_source_leaf_replaced_by_a_symlink(tmp_path, monkeypatch, swap_at):
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    path, outside = projects / "source.jsonl", tmp_path / "outside.jsonl"
+    data = tmp_path / "data"
+    _write(path, "2026-01-01T00:00:00Z")
+    if swap_at == "open":
+        # Same inode keeps the existing descriptor fingerprint check satisfied.
+        os.link(path, outside)
+        original = store.build_source
+
+        def replace_before_open(source, *args, **kwargs):
+            source.unlink()
+            source.symlink_to(outside)
+            return original(source, *args, **kwargs)
+
+        monkeypatch.setattr(store, "build_source", replace_before_open)
+    else:
+        _write(outside, "2026-02-01T00:00:00Z")
+        original = store.discover
+
+        def replace_after_discovery(root):
+            sources = original(root)
+            path.unlink()
+            path.symlink_to(outside)
+            return sources
+
+        monkeypatch.setattr(store, "discover", replace_after_discovery)
+    result = store.ingest(projects, data)
+    assert result["failed"] == 1 and result["rebuilt"] == 0
+    assert not store.select_sources(data)[0]
+    assert outside.is_file()
+
+
+@pytest.mark.parametrize("temporary", [".current.123", ".current.notpid", "unrelated"])
+@pytest.mark.parametrize("expired", [False, True])
+def test_prune_recognizes_only_reserved_temporary_selector_links(tmp_path, temporary, expired):
+    projects, data, path, record = _seed(tmp_path)
+    outside = tmp_path / "outside"
+    outside.write_text("preserve this target")
+    (record.directory.parent / temporary).symlink_to(outside)
+    # Successful retry uses a different selector name and keeps the interrupted one.
+    _write(path, "2026-01-01T00:00:00Z")
+    assert store.ingest(projects, data)["rebuilt"] == 1
+    path.unlink()
+    removed = store.prune(
+        data, before="2027-01-01" if expired else "2026-02-01", projects=projects
+    )
+    assert removed == int(temporary == ".current.123" and expired)
+    assert outside.read_text() == "preserve this target"
+    if not removed:
+        assert record.path("fragments").exists()
+
+
+def test_source_replaced_by_directory_closes_failed_reader_descriptor(tmp_path, monkeypatch):
+    import contextlib
+    import errno
+
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    path = projects / "source.jsonl"
+    _write(path, "2026-01-01T00:00:00Z")
+    discovered = path.stat()
+    path.unlink()
+    path.mkdir()
+    original = store.os.open
+    opened = []
+
+    def observe_source_descriptor(name, flags, *args, **kwargs):
+        descriptor = original(name, flags, *args, **kwargs)
+        if os.fspath(name) == os.fspath(path):
+            opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(store.os, "open", observe_source_descriptor)
+    try:
+        with pytest.raises(IsADirectoryError):
+            store.build_source(path, "source.jsonl", tmp_path / "data", discovered)
+        assert opened
+        for descriptor in opened:
+            with pytest.raises(OSError) as error:
+                os.fstat(descriptor)
+            assert error.value.errno == errno.EBADF
+    finally:
+        for descriptor in opened:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
