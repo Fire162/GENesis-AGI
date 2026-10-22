@@ -22,7 +22,7 @@ import duckdb
 from genesis.transcript_analytics import history, store
 from genesis.transcript_analytics.extract import TABLES
 
-VIEWS_VERSION = "22"
+VIEWS_VERSION = "23"
 _READS = weakref.WeakKeyDictionary()
 _DERIVED = (
     "tool_calls",

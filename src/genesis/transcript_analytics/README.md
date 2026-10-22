@@ -72,6 +72,11 @@ require a matching call observation or a shared known context; ambiguous results
 remain orphaned. Delegation evidence is scoped to its context and requires one
 distinct spawning observation before confirming a parent. Scrub failures are
 retained when any call copy or linked result reports one.
+Paired results retain raw child IDs for search, but cannot prove or contradict
+lineage because extraction did not retain their independent result context.
+Without independent companion evidence their spawn association stays unresolved
+and excluded from confirmed coverage. Unpaired results retain their own context
+and remain eligible for the existing producer checks.
 Unknown historical actors keep distinct structured source-local identities and
 do not create lineage nodes. Missing content hashes remain unknown and count as
 excluded content; observed conflicting hashes remain conflicts. Conflicting

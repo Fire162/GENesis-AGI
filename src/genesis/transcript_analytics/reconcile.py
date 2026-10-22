@@ -238,7 +238,7 @@ def _spawn_associations(con):
       SELECT r.* EXCLUDE(result_agent_id,result_agent_ids),candidate AS result_agent_id,
         _tool_context(r.source_file,r.context_session_id,r.tool_use_id) AS association_key
       FROM raw_tool_calls r,unnest(r.result_agent_ids) identities(candidate)
-      WHERE NOT r.context_conflict;
+      WHERE r.line_no_call IS NULL AND NOT r.context_conflict;
 
       CREATE TEMP TABLE producers AS
       SELECT c.*,o.executor_id,o.attribution_status,
