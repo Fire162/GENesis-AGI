@@ -887,8 +887,8 @@ def test_unsafe_recovery_cases_refuse_without_moving_unowned_code(tmp_path, case
         assert "state is unreadable" in output
     if case == "fetching-at-deploy-head":
         assert (
-            "the checkout moved while the update was in phase 'fetching', "
-            "before it could have merged"
+            "the checkout is not at the rollback tag of an update that stopped in "
+            "phase 'fetching'"
         ) in output
     if case in {"empty-tag", "unresolvable-tag"}:
         assert "rollback tag" in output

@@ -237,6 +237,9 @@ PY
                     if [ "$_guard_rc" -eq 4 ]; then
                         _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but holds part of an update's checkout" guard
                     fi
+                    if [ "$_guard_rc" -eq 6 ]; then
+                        _crash_recovery_refuse "the update state cannot be finished forward (see above)" guard
+                    fi
                     _crash_recovery_refuse "the update state guard did not clear this state (exit $_guard_rc)"
                 fi
             fi
@@ -260,7 +263,7 @@ PY
                     _crash_recovery_refuse "the update died in phase 'bootstrap', which can change the database schema; the merged code was left in place with the database"
                     ;;
                 *)
-                    _crash_recovery_refuse "the checkout moved while the update was in phase '$STATE_PHASE', before it could have merged"
+                    _crash_recovery_refuse "the checkout is not at the rollback tag of an update that stopped in phase '$STATE_PHASE' (a --post-merge's merged code, or a move by someone else); bootstrap does not tell which"
                     ;;
             esac
             # On `live` the move was a rebuild, and moving it back also means
@@ -273,9 +276,11 @@ PY
             # verdict, which --post-merge refuses, so its message is the remedy.
             if [ "$ORIGINAL_BRANCH" = live ]; then
                 _crash_state_guard
-                if [ "$_guard_rc" -eq 4 ]; then
+                if [ "$_guard_rc" -eq 4 ] || [ "$_guard_rc" -eq 6 ]; then
+                    # 4 a half-written checkout, 6 one finishing forward would get
+                    # wrong: the guard's message is the remedy either way.
                     printf '%s\n' "$_guard_msg" | sed 's/^/  /'
-                    _crash_recovery_refuse "the update ran on live and its checkout is half-written" guard
+                    _crash_recovery_refuse "the update ran on live and its checkout cannot be finished as it is" guard
                 fi
                 if genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH" \
                     || { [ -n "$LIVE_TO" ] && genesis_checkout_unmoved "$GENESIS_ROOT" "$LIVE_TO" "$ORIGINAL_BRANCH"; }; then

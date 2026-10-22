@@ -94,7 +94,7 @@ def test_no_file_guards_nothing(guard, repo):
     ids=["malformed", "array", "string", "empty-object", "no-phase", "non-string-phase"],
 )
 def test_a_state_that_cannot_be_judged_guards(guard, repo, content):
-    assert _verdict(guard, repo, content) == "guards"
+    assert _verdict(guard, repo, content) == "holds"
 
 
 def test_done_guards_nothing(guard, repo):
@@ -123,8 +123,10 @@ def test_fetching_at_the_tag_guards_nothing(guard, repo):
 )
 def test_a_fetching_state_that_may_cover_merged_code_guards(guard, repo, state):
     """SF1: a --post-merge writes "fetching" over code that is already merged,
-    and may have made its fallback tag at that merged HEAD."""
-    assert _verdict(guard, repo, state) == "guards"
+    and may have made its fallback tag at that merged HEAD. A plain run's row
+    naming no fetched commit merged nothing: it holds (Dismiss, run again)."""
+    want = "holds" if state.get("post_merge") is False else "guards"
+    assert _verdict(guard, repo, state) == want
 
 
 def test_fetching_after_head_moved_guards(guard, repo):
@@ -135,7 +137,7 @@ def test_fetching_after_head_moved_guards(guard, repo):
         "deploy_head": repo["incoming"],
         "post_merge": False,
     }
-    assert _verdict(guard, repo, state) == "guards"
+    assert _verdict(guard, repo, state) == "holds"
 
 
 def test_merging_after_the_merge_guards(guard, repo):
@@ -175,7 +177,7 @@ def test_merging_at_the_tag_with_tracked_changes_guards(guard, repo, path):
     # The merge (pre...incoming) writes only b.txt: an edit elsewhere is not
     # its residue. It still guards, as it did before #3492, without claiming a
     # half-written tree (--post-merge refuses only that).
-    assert _verdict(guard, repo, state, {"deploy_head": repo["incoming"]}) == "guards"
+    assert _verdict(guard, repo, state, {"deploy_head": repo["incoming"]}) == "holds"
     state["deploy_head"] = ""
     assert _verdict(guard, repo, state) == "mixed_tree", "no range: every tracked change"
 
@@ -205,12 +207,13 @@ def test_a_merge_in_progress_guards(guard, repo):
     )
     assert (repo["root"] / ".git" / "MERGE_HEAD").exists(), r.stdout + r.stderr
     state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": repo["incoming"]}
-    assert _verdict(guard, repo, state) == "guards"
+    assert _verdict(guard, repo, state) == "holds"
 
 
 @pytest.mark.parametrize("phase", ["bootstrap", "migrations", "health_check", "merged"])
 def test_later_or_unknown_phases_guard(guard, repo, phase):
-    assert _verdict(guard, repo, {"phase": phase, "rollback_tag": "pre"}) == "guards"
+    want = "holds" if phase == "merged" else "guards"  # no update writes "merged"
+    assert _verdict(guard, repo, {"phase": phase, "rollback_tag": "pre"}) == want
 
 
 def test_an_inherited_git_dir_does_not_redirect_it(guard, repo, monkeypatch, tmp_path):
@@ -313,14 +316,14 @@ def test_a_state_nested_too_deeply_to_parse_guards(repo):
     path = repo["home"] / "update_state.json"
     path.write_text("[" * 200_000 + "]" * 200_000)
     r = _cli(repo, path)
-    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.returncode == 6, r.stdout + r.stderr
 
 
 def test_safe_is_a_code_no_default_failure_produces():
     """Python's uncaught exception (1), a usage error (2) and a shell's cannot-run
     codes (126, 127) must never mean safe."""
     text = GUARD.read_text()
-    assert "EXIT_CODES = {GUARDS: 0, SAFE: 10, CONFLICT_PENDING: 3, MIXED_TREE: 4}" in text
+    assert "EXIT_CODES = {GUARDS: 0, SAFE: 10, CONFLICT_PENDING: 3, MIXED_TREE: 4, HOLD: 6}" in text
 
 
 def test_a_hung_git_guards_and_returns(guard, repo, tmp_path, monkeypatch):
@@ -494,7 +497,7 @@ def test_a_clean_refusal_is_not_blamed_for_a_file_that_was_already_there(guard, 
     (live["root"] / "Z").write_text("someone's\n")
     assert _live_verdict(guard, live, live_row(live, "clean"))[0] == "safe"
     (live["root"] / "A").write_text("edited\n")
-    assert _live_verdict(guard, live, live_row(live, "clean"))[0] == "guards"
+    assert _live_verdict(guard, live, live_row(live, "clean"))[0] == "holds"
 
 
 @pytest.mark.parametrize(
@@ -513,7 +516,7 @@ def test_a_clean_refusal_is_not_blamed_for_a_file_that_was_already_there(guard, 
 def test_t4d_a_malformed_record_guards(guard, live, record):
     state = live_row(live)
     state["live_move"] = record
-    assert _live_verdict(guard, live, state)[0] == "guards"
+    assert _live_verdict(guard, live, state)[0] == "holds"
 
 
 @pytest.mark.parametrize("phase", ["fetching", "bootstrap", "done"])
@@ -522,7 +525,7 @@ def test_t4e_a_record_under_any_other_phase_guards(guard, live, phase):
     next row drops it: anywhere else it is a hand edit or a writer gone wrong."""
     state = live_row(live)
     state["phase"] = phase
-    assert _live_verdict(guard, live, state)[0] == "guards"
+    assert _live_verdict(guard, live, state)[0] == "holds"
 
 
 def test_t4i_a_rollback_killed_midway_back_to_the_tag_is_a_mixed_tree(guard, live):
@@ -644,7 +647,9 @@ def test_sf2_a_foreign_edit_outside_the_switch_is_not_a_mixed_tree(guard, live, 
         phase = "done"
     (live["root"] / "A").write_text("a session's edit\n")
     verdict, reason = _live_verdict(guard, live, live_row(live, phase))
-    assert verdict == "guards", reason
+    # At the tag the update moved nothing (HOLD: Dismiss, run it again); at the
+    # target it moved and the code awaits bootstrap (GUARDS: --post-merge).
+    assert verdict == ("holds" if at == "tag" else "guards"), reason
 
 
 @pytest.mark.parametrize("at", ["tag", "target"])
@@ -738,7 +743,7 @@ def test_n2_a_rollback_tag_that_is_not_a_tag_name_guards(guard, repo, tag):
         "deploy_head": repo["incoming"],
         "post_merge": False,
     }
-    assert _verdict(guard, repo, state) == "guards"
+    assert _verdict(guard, repo, state) == "holds"
     state["rollback_tag"] = "pre"
     assert _verdict(guard, repo, state) == "safe", "control: the tag by its name"
 
@@ -782,7 +787,7 @@ def test_main_a_foreign_edit_outside_the_merge_guards_not_mixed(guard, repo):
     (repo["root"] / "a.txt").write_text("a session's edit\n")
     state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming}
     verdict, reason = guard.verdict(str(_state(repo, state)), str(repo["root"]))
-    assert verdict == "guards", reason
+    assert verdict == "holds", reason
 
 
 def test_main_an_edit_on_a_path_the_merge_writes_is_mixed(guard, repo):
@@ -898,3 +903,258 @@ def test_r1_an_adopted_row_at_the_tag_is_judged_only_as_a_live_row(guard, live):
     row.update(own_head=live["new"], deploy_head=base)
     verdict, reason = _live_verdict(guard, live, row)
     assert verdict == "safe", reason
+
+
+# ── #3532 round 2: ACTIVATE (GUARDS, exit 0) vs HOLD (exit 6) ──────────────────
+
+
+def _merged(repo: dict) -> str:
+    """A main update that merged: HEAD (on main) at its merge, which edits a.txt
+    and adds b.txt over the tag. Returns the merge (the row's own_head)."""
+    root = repo["root"]
+    (root / "a.txt").write_text("merged\n")
+    (root / "b.txt").write_text("b\n")
+    _git(root, "add", "a.txt", "b.txt")
+    _git(root, "commit", "-qm", "the update's merge")
+    return _git(root, "rev-parse", "HEAD")
+
+
+def _merged_row(own: str, phase: str = "merging") -> dict:
+    return {
+        "phase": phase,
+        "rollback_tag": "pre",
+        "original_branch": "main",
+        "own_head": own,
+        "deploy_head": own,
+        "post_merge": False,
+    }
+
+
+@pytest.mark.parametrize("phase", ["merging", "bootstrap", "migrations", "health_check"])
+def test_p1_a_main_rollback_killed_partway_is_a_forward_mixed_tree(guard, repo, phase):
+    """P1: the merge was adopted (HEAD at own_head), then the rollback's
+    checkout back to the tag was killed after writing a.txt's tag version.
+    --post-merge (which finishes exit 0) would bootstrap that tree."""
+    own = _merged(repo)
+    (repo["root"] / "a.txt").write_text("a\n")
+    r = _cli(repo, _state(repo, _merged_row(own, phase)))
+    assert r.returncode == 4, r.stdout + r.stderr
+    assert "a.txt" in r.stdout
+    forward_message_is_true(r.stdout)
+
+
+@pytest.mark.parametrize("phase", ["merging", "bootstrap"])
+def test_activate_a_clean_merge_awaiting_bootstrap_still_guards(guard, repo, phase):
+    """Control: merged code complete on disk, bootstrap not run: exit 0, the
+    state --post-merge finishes."""
+    own = _merged(repo)
+    r = _cli(repo, _state(repo, _merged_row(own, phase)))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Finish it with scripts/update.sh --post-merge" in r.stdout, r.stdout
+
+
+def test_p2_a_live_row_with_only_a_foreign_edit_holds(guard, live):
+    """P2: the rebuild never moved the checkout (HEAD at the tag, no residue on
+    the switch's paths) and A carries someone's edit. Finishing forward would
+    bootstrap the OLD tip and clear a state whose target never deployed."""
+    (live["root"] / "A").write_text("a session's edit\n")
+    r = _cli(live, _state(live, live_row(live)))
+    assert r.returncode == 6, r.stdout + r.stderr
+    assert "never changed the checkout" in r.stdout and "Dismiss" in r.stdout, r.stdout
+    assert "scripts/update.sh again" in r.stdout, r.stdout
+    assert not post_merge_advice(r.stdout), r.stdout
+
+
+def _hold(guard, r: dict, state) -> str:
+    v, reason = guard.verdict(str(_state(r, state)), str(r["root"]))
+    assert v == "holds", (v, reason)
+    msg = guard.message("state", v, reason)
+    assert not post_merge_advice(msg), msg
+    return reason
+
+
+def test_hold_main_foreign_edit_at_the_tag(guard, repo):
+    incoming = _git(repo["root"], "rev-parse", "HEAD")
+    (repo["root"] / "a.txt").write_text("a session's edit\n")
+    state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": repo["incoming"]}
+    assert incoming
+    assert "never changed the checkout" in _hold(guard, repo, state)
+
+
+def test_hold_a_merging_row_whose_checkout_moved_elsewhere(guard, repo):
+    own = _merged(repo)
+    _git(repo["root"], "commit", "-q", "--allow-empty", "-m", "someone else's")
+    assert "not where the update left it" in _hold(guard, repo, _merged_row(own))
+
+
+def test_hold_a_later_phase_whose_checkout_moved(guard, repo):
+    own = _merged(repo)
+    _git(repo["root"], "commit", "-q", "--allow-empty", "-m", "someone else's")
+    _hold(guard, repo, _merged_row(own, "bootstrap"))
+
+
+def test_hold_a_plain_fetching_row_off_its_tag(guard, repo):
+    _merged(repo)
+    state = {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "x", "post_merge": False}
+    _hold(guard, repo, state)
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]", {"pid": 1}, {"phase": "merged"}])
+def test_hold_a_record_that_cannot_be_trusted(guard, repo, content):
+    assert "Nothing can be told" in _hold(guard, repo, content)
+
+
+def test_hold_a_merge_in_progress(guard, repo):
+    root = repo["root"]
+    _git(root, "checkout", "-q", "-b", "side")
+    (root / "a.txt").write_text("side\n")
+    _git(root, "commit", "-qam", "side")
+    _git(root, "checkout", "-q", "main")
+    (root / "a.txt").write_text("main\n")
+    _git(root, "commit", "-qam", "main")
+    _git(root, "tag", "-f", "pre")
+    subprocess.run(
+        ["git", "-C", str(root), "merge", "-q", "side"], capture_output=True, env=_git_env()
+    )
+    state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": repo["incoming"]}
+    assert "merge is in progress" in _hold(guard, repo, state)
+
+
+def test_hold_a_live_checkout_neither_at_the_tag_nor_at_the_tip(guard, live):
+    _git(live["root"], "checkout", "-q", "-B", "live", live["main0"])
+    _hold(guard, live, live_row(live, "done"))
+
+
+def test_activate_a_post_merge_fetching_row(guard, repo):
+    """A --post-merge that stopped before bootstrap: merged code it was
+    finishing, which a new --post-merge finishes."""
+    state = {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "x", "post_merge": True}
+    assert _verdict(guard, repo, state) == "guards"
+
+
+def test_activate_resolved_conflicts_still_finish(guard, repo):
+    """The conflict resolver merged deploy_head onto the tag and committed:
+    own_head is still the tag (the update never adopted a merge), and
+    --post-merge is what finishes it."""
+    root = repo["root"]
+    tag = _git(root, "rev-parse", "pre")
+    _git(root, "merge", "-q", "--no-ff", "-m", "resolved", repo["incoming"])
+    state = {
+        "phase": "merging",
+        "rollback_tag": "pre",
+        "own_head": tag,
+        "deploy_head": repo["incoming"],
+    }
+    path = _state(repo, state)
+    (repo["home"] / "update_conflicts.json").write_text(
+        json.dumps({"deploy_head": repo["incoming"]})
+    )
+    assert guard.verdict(str(path), str(root))[0] == "guards"
+
+
+def test_conflict_pending_is_unchanged(guard, repo):
+    state = {"phase": "merging", "rollback_tag": "pre", "deploy_head": repo["incoming"]}
+    assert _verdict(guard, repo, state, {"deploy_head": repo["incoming"]}) == "conflict_pending"
+
+
+# ── #3532 round-2 class audit ───────────────────────────────────────────────
+
+
+def _post_merge_fetching(own: str) -> dict:
+    return {
+        "phase": "fetching",
+        "rollback_tag": "pre",
+        "original_branch": "main",
+        "own_head": own,
+        "deploy_head": own,
+        "post_merge": True,
+    }
+
+
+def test_audit1_a_post_merge_fetching_row_whose_head_moved_holds(guard, repo):
+    """Audit 1: a --post-merge wrote "fetching" naming its own_head and stopped;
+    the checkout then moved. Finishing would activate code it never checked."""
+    own = _merged(repo)
+    assert _verdict(guard, repo, _post_merge_fetching(own)) == "guards", "control"
+    _git(repo["root"], "commit", "-q", "--allow-empty", "-m", "someone else's")
+    assert "not where the update left it" in _hold(guard, repo, _post_merge_fetching(own))
+
+
+def test_audit1_a_post_merge_fetching_row_without_its_tag_holds(guard, repo):
+    own = _merged(repo)
+    _git(repo["root"], "tag", "-d", "pre")
+    _hold(guard, repo, _post_merge_fetching(own))
+
+
+def _conflicted_at(repo: dict) -> str:
+    """HEAD at the update's merge (own_head) with a conflicting merge started on
+    top of it: MERGE_HEAD present, markers in a.txt. Returns own_head."""
+    root = repo["root"]
+    own = _merged(repo)
+    _git(root, "checkout", "-q", "-b", "side", "pre")
+    (root / "a.txt").write_text("side\n")
+    _git(root, "commit", "-qam", "side")
+    _git(root, "checkout", "-q", "main")
+    subprocess.run(
+        ["git", "-C", str(root), "merge", "-q", "side"], capture_output=True, env=_git_env()
+    )
+    assert (root / ".git" / "MERGE_HEAD").exists(), "the fixture built no merge in progress"
+    assert _git(root, "rev-parse", "HEAD") == own
+    return own
+
+
+@pytest.mark.parametrize("phase", ["fetching", "bootstrap", "migrations", "health_check"])
+def test_audit2_a_merge_in_progress_holds_in_every_phase(guard, repo, phase):
+    """Audit 2: MERGE_HEAD was checked only in "merging"; in any other phase a
+    conflicted merge over the update's code read exit 0, and --post-merge would
+    bootstrap over the markers."""
+    own = _conflicted_at(repo)
+    row = _merged_row(own, phase)
+    row["post_merge"] = phase == "fetching"
+    reason = _hold(guard, repo, row)
+    assert "merge is in progress" in reason, reason
+    assert "update_in_progress.pid" in reason, "N10: the remedy must not abort a resolver's merge"
+
+
+def _landed_before_adoption(repo: dict, shape: str) -> dict:
+    """update.sh's merge landed but the run died before it recorded own_head
+    (still the tag's commit). "ff": HEAD is deploy_head; "merge": HEAD is a
+    two-parent merge of the tag and deploy_head, as `git merge` makes it."""
+    root = repo["root"]
+    if shape == "merge":
+        (root / "local.txt").write_text("local\n")
+        _git(root, "add", "local.txt")
+        _git(root, "commit", "-qm", "local work under the tag")
+        _git(root, "tag", "-f", "pre")
+        tag = _git(root, "rev-parse", "HEAD")
+        _git(root, "merge", "-q", "--no-ff", "--no-edit", repo["incoming"])
+    else:
+        tag = _git(root, "rev-parse", "pre")
+        _git(root, "merge", "-q", "--ff-only", repo["incoming"])
+    return {
+        "phase": "merging",
+        "rollback_tag": "pre",
+        "original_branch": "main",
+        "own_head": tag,
+        "deploy_head": repo["incoming"],
+        "post_merge": False,
+    }
+
+
+@pytest.mark.parametrize("shape", ["ff", "merge"])
+def test_audit3_a_merge_that_landed_before_adoption_guards(guard, repo, shape):
+    """Audit 3 (a regression in round 2): the merge landed, the run died before
+    adopting it (own_head is still the tag's commit). HEAD is exactly what
+    update.sh's own adoption rule accepts, so --post-merge finishes it (exit 0);
+    "Dismiss and run again" would leave it never bootstrapped (the rerun finds
+    nothing new)."""
+    state = _landed_before_adoption(repo, shape)
+    r = _cli(repo, _state(repo, state))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_audit3_any_other_commit_over_the_tag_still_holds(guard, repo):
+    """Control: a commit on top of the tag that is not the update's merge shape."""
+    state = _landed_before_adoption(repo, "ff")
+    _git(repo["root"], "commit", "-q", "--allow-empty", "-m", "someone else's")
+    _hold(guard, repo, state)

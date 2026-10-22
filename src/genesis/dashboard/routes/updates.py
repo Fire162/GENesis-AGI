@@ -715,8 +715,10 @@ def _load_state_guard():
 def _state_guard_verdict() -> tuple[str, str, str | None]:
     """The restart-guard verdict on update_state.json: (verdict, reason, remedy).
 
-    ``verdict`` is "safe", "guards", "conflict_pending" or "mixed_tree" (a
-    half-written checkout, which --post-merge refuses); ``remedy`` is the
+    ``verdict`` is "safe", "guards" (merged code awaiting bootstrap, which
+    --post-merge finishes), "conflict_pending", "mixed_tree" (a half-written
+    checkout) or "holds" (finishing forward is wrong or unknown; --post-merge
+    refuses both of the last two); ``remedy`` is the
     message every refusing caller prints, None when safe. A guard that cannot be
     evaluated keeps an existing file (doubt keeps the guard)."""
     try:

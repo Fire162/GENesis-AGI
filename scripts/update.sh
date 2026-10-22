@@ -53,8 +53,11 @@
 # never activated, or a merge conflict it is waiting on (the rule is
 # scripts/lib/update_state_guard.py). Finish that one with --post-merge, resolve
 # its conflicts, or Dismiss it on the dashboard's update card. --post-merge itself
-# exits 5 when that rule finds the checkout half-written (its exit 4: the paths it
-# names are put back by hand first) or could not run at all.
+# finishes only merged code bootstrap has not run on (the rule's exit 0, which a
+# resolved and committed conflict reads too), and exits 5 on every other answer,
+# printing the rule's remedy: a conflict not yet resolved (3), a half-written
+# checkout (4), a state finishing forward would get wrong (6), nothing to finish
+# (10), or a rule that could not run.
 
 set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
                     # (see _on_err's BASH_SUBSHELL guard for the subshell case)
@@ -543,17 +546,24 @@ if [[ "$POST_MERGE" != "true" ]] && { [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE"
         exit 5
     fi
 elif { [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; }; then
-    # --post-merge finishes the merge a state records, but never over a
-    # half-written checkout (the guard's exit 4, main and `live` alike): it would
-    # bootstrap and restart on part of two trees (#3492), and never when the
-    # guard could not say (1 an uncaught failure, 2 a usage error, 126/127 not
-    # runnable). It guards (0), a pending conflict (3) and nothing to guard (10)
-    # are what --post-merge exists to finish. A failure INSIDE the guard's check
-    # (a git call failing or timing out) exits 1, so it refuses here too.
+    # --post-merge finishes exactly one state (#3532): merged code complete on
+    # disk that bootstrap has not run on (the guard's exit 0; a conflict the
+    # resolver merged and committed reads 0 too). It refuses every other answer
+    # with the guard's own remedy: a conflict not resolved yet (3: nothing is
+    # merged, so finishing would bootstrap the old code and drop the conflict
+    # record), a half-written checkout (4), a state where finishing forward is
+    # wrong or unknown (6: the update never changed the checkout, it moved, the
+    # record cannot be trusted, a merge is in progress), nothing to finish (10),
+    # and a guard that could not say (1, 2, 126, 127).
     _prior_state_rc=0
     _prior_state_msg="$(python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$STATE_FILE" "$GENESIS_ROOT" 2>&1)" \
         || _prior_state_rc=$?
-    if [ "$_prior_state_rc" -ne 0 ] && [ "$_prior_state_rc" -ne 3 ] && [ "$_prior_state_rc" -ne 10 ]; then
+    if [ "$_prior_state_rc" -eq 10 ]; then
+        _prior_state_msg="$STATE_FILE records an update that merged nothing, so there is nothing to finish: run scripts/update.sh."
+    elif [ "$_prior_state_rc" -eq 3 ]; then
+        _prior_state_msg="Nothing is merged yet: resolve the conflicts first, then run --post-merge. $_prior_state_msg"
+    fi
+    if [ "$_prior_state_rc" -ne 0 ]; then
         echo "REFUSED: ${_prior_state_msg:-$STATE_FILE could not be checked (exit $_prior_state_rc); it is kept.}"
         echo "         Nothing was changed."
         exit 5
@@ -2366,24 +2376,26 @@ with open(sys.argv[11], 'w') as f:
     # (checkout_ok): a rollback that left merged code on disk keeps it, because
     # it is what stops deploy_code_only.sh and the live engine restarting onto
     # that code. The same holds for a --post-merge, whose state it is finishing.
-    # A tree the live rollback marked suspect (part of a rebuild's checkout on
-    # disk) gets the shared guard's own words instead: --post-merge refuses a
-    # half-written tree, so recommending it there would be false (#3492).
+    # A kept state is described by the shared guard's own words, which name the
+    # right remedy for the tree as it is (#3492, #3532): finish with
+    # --post-merge, put back a half-written checkout first, or Dismiss and run
+    # the update again. The line below is only for a guard that could not say.
     _kept_msg="" _kept_rc=0
     if [ "$checkout_ok" = "true" ]; then
         rm -f "$STATE_FILE" 2>/dev/null || true
     else
-        if [ "${_LIVE_TREE_SUSPECT:-0}" = 1 ]; then
-            _kept_msg="$(python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$STATE_FILE" "$GENESIS_ROOT" 2>&1)" \
-                || _kept_rc=$?
-        fi
-        if [ "$_kept_rc" -eq 4 ] && [ -n "$_kept_msg" ]; then
+        _kept_msg="$(python3 -I -S "${SCRIPT_DIR:-}/lib/update_state_guard.py" "$STATE_FILE" "${GENESIS_ROOT:-}" 2>&1)" \
+            || _kept_rc=$?
+        case "$_kept_rc" in 0|1|3|4|6) ;; *) _kept_msg="" ;; esac
+        if [ "$_kept_rc" -ne 10 ] && [ -n "$_kept_msg" ]; then
             echo "  $STATE_FILE is kept as the restart guard."
             printf '%s\n' "$_kept_msg" | sed 's/^/  /'
+        elif [ "$_kept_rc" -eq 10 ]; then
+            echo "  $STATE_FILE is kept, though the restart guard says it guards nothing now (nothing merged is on disk); Dismiss it on the dashboard's update card."
         elif [ "${_LIVE_TREE_SUSPECT:-0}" = 1 ]; then
             echo "  $STATE_FILE is kept as the restart guard: the rebuild may have left part of its checkout on disk. Put back the paths the rebuild's message above names (save any edits of yours first), then Dismiss it on the dashboard's update card."
         else
-            echo "  $STATE_FILE is kept as the restart guard: finish with scripts/update.sh --post-merge, or Dismiss it on the dashboard's update card."
+            echo "  $STATE_FILE is kept as the restart guard; the check that names its remedy could not run. Check the checkout by hand, then Dismiss it on the dashboard's update card."
         fi
     fi
     _clear_deploy_marker

@@ -363,21 +363,25 @@ def _stub_guard(tmp_path: Path, rc: int) -> Path:
     return scripts
 
 
-@pytest.mark.parametrize("rc", [1, 2, 4, 126, 127])
+@pytest.mark.parametrize("rc", [1, 2, 3, 4, 6, 10, 126, 127])
 def test_post_merge_refuses_when_the_guard_could_not_run(world, tmp_path, rc):
-    """NOTE 5: 1, 2, 126 and 127 mean the guard crashed or could not run, so
-    --post-merge cannot know the tree is whole; it refuses with what the guard
-    said (exit 4: the half-written verdict)."""
+    """NOTE 5 and #3532: 1, 2, 126 and 127 mean the guard crashed or could not
+    run, 4 a half-written tree, 6 a state finishing forward would get wrong, 10
+    nothing to finish. --post-merge refuses each, with what the guard said (10:
+    that there is nothing to finish)."""
     world["state"].write_text(json.dumps({"phase": "bootstrap", "rollback_tag": "pre"}))
     r = _guard_run(world, post_merge=True, scripts=_stub_guard(tmp_path, rc))
     assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
-    assert "STUB GUARD SAID THIS" in r.stdout, r.stdout
+    said = {10: "nothing to finish", 3: "resolve the conflicts first"}.get(
+        rc, "STUB GUARD SAID THIS"
+    )
+    assert said in r.stdout, r.stdout
 
 
-@pytest.mark.parametrize("rc", [0, 3, 10])
+@pytest.mark.parametrize("rc", [0])
 def test_post_merge_finishes_what_the_guard_judged(world, tmp_path, rc):
-    """Control: guards (0), a pending conflict (3) and nothing to guard (10) are
-    what --post-merge exists to finish."""
+    """Control: merged code awaiting bootstrap (0, a resolved conflict
+    included) is the one thing --post-merge exists to finish (#3532)."""
     world["state"].write_text(json.dumps({"phase": "bootstrap", "rollback_tag": "pre"}))
     r = _guard_run(world, post_merge=True, scripts=_stub_guard(tmp_path, rc))
     assert r.returncode == 0 and "PASSED_GUARD" in r.stdout, r.stdout + r.stderr
@@ -432,12 +436,14 @@ def _main_merge_killed(world: dict, edited: str) -> None:
     )
 
 
-def test_main_post_merge_is_not_refused_by_a_foreign_edit(world):
-    """A tracked edit the merge never writes guards (exit 0), which --post-merge
-    finishes, as it did before #3492; only real residue refuses."""
+def test_main_post_merge_is_refused_over_a_foreign_edit_with_nothing_merged(world):
+    """A tracked edit the merge never writes, HEAD at the tag: the update merged
+    nothing, so --post-merge has nothing to finish (#3532 round 2); the remedy
+    is to save the edit, Dismiss, and run the update again."""
     _main_merge_killed(world, "a.txt")
     r = _guard_run(world, post_merge=True)
-    assert r.returncode == 0 and "PASSED_GUARD" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+    assert "never changed the checkout" in r.stdout and "half-written" not in r.stdout
 
 
 def test_main_post_merge_refuses_residue_on_a_path_the_merge_writes(world):
@@ -445,3 +451,72 @@ def test_main_post_merge_refuses_residue_on_a_path_the_merge_writes(world):
     r = _guard_run(world, post_merge=True)
     assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
     assert "b.txt" in r.stdout, r.stdout
+
+
+# ── #3532 round 2: --post-merge finishes ACTIVATE (0) and a conflict (3) only ──
+
+
+def test_p1_post_merge_refuses_a_main_rollback_killed_partway(world):
+    root = world["root"]
+    (root / "a.txt").write_text("merged\n")
+    _git(root, "add", "a.txt")
+    _git(root, "commit", "-qm", "the update's merge")
+    own = _git(root, "rev-parse", "HEAD")
+    _git(root, "rm", "-q", "a.txt")
+    world["state"].write_text(
+        json.dumps({"phase": "merging", "rollback_tag": "pre", "own_head": own, "deploy_head": own})
+    )
+    r = _guard_run(world, post_merge=True)
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+
+
+def test_p2_post_merge_refuses_a_live_row_that_never_moved(tmp_path):
+    d, w = _live_world(tmp_path)
+    (d["root"] / "A").write_text("a session's edit\n")
+    w["state"].write_text(json.dumps(live_row(d)))
+    r = _guard_run(w, post_merge=True)
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+    assert "never changed the checkout" in r.stdout, r.stdout
+
+
+def test_post_merge_still_finishes_a_clean_merge(world):
+    root = world["root"]
+    (root / "a.txt").write_text("merged\n")
+    _git(root, "add", "a.txt")
+    _git(root, "commit", "-qm", "the update's merge")
+    own = _git(root, "rev-parse", "HEAD")
+    world["state"].write_text(
+        json.dumps({"phase": "merging", "rollback_tag": "pre", "own_head": own, "deploy_head": own})
+    )
+    r = _guard_run(world, post_merge=True)
+    assert r.returncode == 0 and "PASSED_GUARD" in r.stdout, r.stdout + r.stderr
+
+
+def test_post_merge_refuses_a_conflict_not_yet_resolved(world):
+    """Audit 4: a pending conflict (exit 3) means nothing is merged yet; a
+    resolved one reads 0. Finishing 3 would bootstrap the old code, record a
+    success from the old version to itself and delete the conflict record."""
+    world["state"].write_text(
+        json.dumps({"phase": "merging", "rollback_tag": "pre", "deploy_head": world["head"]})
+    )
+    (world["home"] / ".genesis" / "update_conflicts.json").write_text(
+        json.dumps({"deploy_head": world["head"]})
+    )
+    r = _guard_run(world, post_merge=True)
+    assert r.returncode == 5 and "PASSED_GUARD" not in r.stdout, r.stdout + r.stderr
+    assert "resolve the conflicts first" in r.stdout, r.stdout
+
+
+def test_n7_a_kept_state_that_guards_nothing_says_so(world):
+    """N7: a kept state the guard calls safe (exit 10) is not "a check that
+    could not run"."""
+    world["state"].write_text(json.dumps({"phase": "done"}))
+    script = (
+        "set -Eeuo pipefail\n"
+        f'STATE_FILE="{world["state"]}"\ncheckout_ok=false\n'
+        f'SCRIPT_DIR="{REPO / "scripts"}"\nGENESIS_ROOT="{world["root"]}"\n'
+        f'. "{MARKER_LIB}"\n' + _function("_clear_deploy_marker") + _block("rollback-state-clear")
+    )
+    r = _bash(script, world["home"])
+    assert r.returncode == 0, r.stderr
+    assert "could not run" not in r.stdout and "guards nothing" in r.stdout, r.stdout

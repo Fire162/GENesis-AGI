@@ -3968,31 +3968,43 @@ tool-disabled CC probe without changing its schedule or routing authority.
   update that merged code and never activated it, or that stopped on merge
   conflicts, leaves it behind. Whether it still guards is ONE rule,
   `scripts/lib/update_state_guard.py` (stdlib; `safe` / `guards` /
-  `conflict_pending` / `mixed_tree`, plus the remedy text): a "done" state, a
-  plain run's "fetching" at its rollback tag, and a "merging" at the tag with no
-  merge residue and no recorded conflict guard nothing; anything unreadable
-  guards. Merge residue at the tag is `mixed_tree` (exit 4): a half-written
+  `conflict_pending` / `mixed_tree` / `holds`, plus the remedy text): a "done"
+  state, a plain run's "fetching" at its rollback tag, and a "merging" at the tag
+  with no merge residue and no recorded conflict guard nothing. A guarding state
+  is one of two kinds (#3532): `guards` (exit 0) is merged code complete on disk
+  that bootstrap has not run on, which `--post-merge` finishes; `holds` (exit 6)
+  is every state where finishing forward is wrong or unknown (the update never
+  changed the checkout, it is not where the update left it, the record cannot be
+  trusted or read, a merge is in progress), whose message names the remedy
+  (usually: save any edit, Dismiss, run the update again). HEAD at the update's
+  own new code (`own_head`) in any phase is checked for a rollback checkout
+  killed partway back to the tag (the two-dot residue back toward the tag),
+  main and `live` alike. Merge residue at the tag is `mixed_tree` (exit 4): a half-written
   checkout, whose message lists the paths and says to save, restore and
   Dismiss. Residue counts tracked changes only on the paths the merge
   (`rollback...deploy_head`) writes; a tracked change elsewhere (an indexer's,
-  another session's) guards as before but is not `mixed_tree`. A "merging" row carrying the live engine's move record
+  another session's) with nothing merged `holds`, not `mixed_tree`. A "merging" row carrying the live engine's move record
   (`live_move`, #3492) is judged by the TWO-DOT diff a `git switch` writes
   (the old and new `live` tips diverge, so main's symmetric range would miss
   what a dropped candidate had deleted), toward the record's target with HEAD
   at the tag, and back toward the tag with HEAD at the target (a rollback
   checkout killed partway); only tracked changes on the switch's own paths
-  count there, one anywhere else guarding as someone else's edit. A "merging"
+  count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
   row on `live` whose record update.sh already dropped (it adopted the tip,
   own_head is that tip) is judged the same way toward own_head, so a rollback
   killed partway after adoption is caught too. The remedy follows HEAD: at the
-  tag, put the paths back and Dismiss; at the rebuilt tip, put them back and
-  finish with `--post-merge` (Dismissing there leaves code bootstrap never ran
-  on). The dashboard's progress poll returns the guard's remedy
+  tag, put the paths back and Dismiss; at the update's new code (main's merge
+  or the rebuilt tip), put them back and finish with `--post-merge`
+  (Dismissing there leaves code bootstrap never ran on). The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
-  409 on both paths; `--post-merge` is the run that finishes it, except over a
-  `mixed_tree`, or when the guard could not run, which it refuses (exit 5, main and `live` alike). Only the run
+  409 on both paths; `--post-merge` finishes only `guards` (a resolved, committed conflict and a
+  merge that landed before update.sh recorded it read so too), and refuses
+  (exit 5, main and `live` alike) a `conflict_pending`, a `mixed_tree`, a
+  `holds`, a state with nothing to finish, or a guard that could not run, with
+  the guard's remedy. Bootstrap's crash recovery and update.sh's kept-state line
+  print that remedy too. Only the run
   that wrote the file deletes it on its exits (never a `--post-merge`, never a
   run that had not written yet), a rollback that left merged code keeps it, and
   bootstrap's crash recovery keeps a pending conflict. Bootstrap's crash
