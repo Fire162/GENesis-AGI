@@ -37,7 +37,8 @@ SELECT DISTINCT turn_key,event_key FROM observations WHERE turn_key IS NOT NULL;
 
 CREATE TEMP TABLE event_states AS
 SELECT event_key, count(DISTINCT message_id)>1 AS identity_conflict,
- count(DISTINCT content_hash) > 1 AS content_conflict,
+ CASE WHEN count(DISTINCT content_hash)>1 THEN TRUE
+ WHEN count(*) FILTER(WHERE content_hash IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
  count(DISTINCT immutable_hash) > 1 OR count(DISTINCT request_id_hash) > 1 AS immutable_conflict,
  count(DISTINCT payload_hash) FILTER(WHERE stop_reason IS NOT NULL) AS terminal_variants,
  count(DISTINCT payload_hash) AS payload_variants,
@@ -122,7 +123,9 @@ WITH events AS (
  JOIN event_ownership o USING(event_key)
 ), grouped AS (
  SELECT turn_key,count(*) AS distinct_event_count,
- bool_or(content_conflict) AS content_conflict,bool_or(state_conflict) AS state_conflict,
+ CASE WHEN bool_or(content_conflict) THEN TRUE
+ WHEN count(*) FILTER(WHERE content_conflict IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
+ bool_or(state_conflict) AS state_conflict,
  bool_or(identity_conflict) AS identity_conflict,bool_or(identity_conflict) AS count_uncertain,
  CASE WHEN NOT bool_or(identity_conflict) AND count(DISTINCT executor_id)=1 AND count(*) FILTER(WHERE executor_id IS NULL)=0
  THEN any_value(executor_id) END AS executor_id,
@@ -161,6 +164,8 @@ def _parent_graph(rows):
     evidence = {}
     explicit = {}
     for actor, parent, status, kind, ref in rows:
+        if actor is None:
+            continue
         evidence.setdefault(actor, []).append((parent, status, kind, ref))
         if kind == "parentAgentId":
             explicit.setdefault(actor, set()).add(parent)
@@ -232,7 +237,8 @@ def _spawn_associations(con):
       CREATE TEMP TABLE result_candidates AS
       SELECT r.* EXCLUDE(result_agent_id,result_agent_ids),candidate AS result_agent_id,
         _tool_context(r.source_file,r.context_session_id,r.tool_use_id) AS association_key
-      FROM raw_tool_calls r,unnest(r.result_agent_ids) identities(candidate);
+      FROM raw_tool_calls r,unnest(r.result_agent_ids) identities(candidate)
+      WHERE NOT r.context_conflict;
 
       CREATE TEMP TABLE producers AS
       SELECT c.*,o.executor_id,o.attribution_status,

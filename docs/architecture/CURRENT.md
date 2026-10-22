@@ -2827,7 +2827,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: fa913afc1d2b 2026-10-22
+verified: 50b6e2319f6f 2026-10-22
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -2856,6 +2856,10 @@ verified: fa913afc1d2b 2026-10-22
   tool blocks remain distinct, and uncertain result or delegation matches stay
   unresolved. CLI and scheduling arrive in dependent changes. Additional backup
   and recovery integration is deferred independently of collection and search.
+  Unknown historical content is excluded from content metrics; query manifests
+  identify the views version. Historical actors without identities cannot form
+  lineage nodes. Paired-result context provenance remains a release decision;
+  this checkpoint does not establish that result-based lineage is fully correct.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
   interpreter operands; ambiguous commands report `<unknown>` while preserving

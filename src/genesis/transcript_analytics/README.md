@@ -72,10 +72,14 @@ require a matching call observation or a shared known context; ambiguous results
 remain orphaned. Delegation evidence is scoped to its context and requires one
 distinct spawning observation before confirming a parent. Scrub failures are
 retained when any call copy or linked result reports one.
+Unknown historical actors keep distinct structured source-local identities and
+do not create lineage nodes. Missing content hashes remain unknown and count as
+excluded content; observed conflicting hashes remain conflicts. Conflicting
+tool observations retain stable display values without resolving their ownership.
 
 `source_coverage` exposes original per-source provenance and unavailable
 historical facts. `run_query(..., manifest_path=...)` records the same captured
-coverage alongside result denominators and scrubbed query labels. Missing
+coverage alongside result denominators, the query views version and scrubbed query labels. Missing
 historical identity is unresolved, not attributed to a current executor.
 
 Each connection uses its own 0700 spill directory under `TA_DUCKDB_TMP` or
