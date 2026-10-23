@@ -23,6 +23,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -544,7 +545,12 @@ def _build_source(
     # Fingerprint the descriptor actually read (review #23): a path re-stat can
     # describe a different inode than the one extraction consumed, and comparing
     # only ``meta`` missed body churn. Compare the whole fingerprint afterwards.
-    with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW)) as handle:
+    with open(
+        path, "rb",
+        opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK),
+    ) as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("source is not a regular file")
         res = extract_source(path, rel, stop_at=st.st_size, fh=handle)
         observed = source_fingerprint(path, os.fstat(handle.fileno()))
     if observed != fp:
