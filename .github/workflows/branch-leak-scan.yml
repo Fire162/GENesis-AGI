@@ -139,3 +139,17 @@ jobs:
           # merge-base(origin/main, HEAD)..HEAD. See leak_scan_added_lines.py.
           LEAK_SCAN_RANGE: branch
         run: bash scripts/ci/leak_scan.sh private
+
+      - name: Encrypted diagnosis of published storage head
+        if: >-
+          always() &&
+          github.ref == 'refs/heads/chore/transcript-private-scan-diagnostic-20261022' &&
+          github.repository == 'WingedGuardian/GENesis-AGI' &&
+          github.actor != 'dependabot[bot]'
+        env:
+          PRIV: ${{ secrets.GENESIS_PRIVATE_PATTERNS }}
+        run: >-
+          python3 scripts/ci/private_scan_diagnostic.py
+          --base 50b6e2319f6fee22f801b72608b53c5c77f9ff3c
+          --head e9ee6d5ed40e3b9104948a2ffaea93c1da07bd67
+          --certificate .github/private-scan-diagnostic-recipient.pem
