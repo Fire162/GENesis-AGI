@@ -503,6 +503,10 @@ def _derp_condition(pin: dict[str, Any]) -> str | None:
         for v in (pin.get("code"), pin.get("seen"))
     )
     texts = {
+        "clear-pending": "The home-DERP pin setting is disabled, but the watchdog has"
+        " not yet cleared the daemon's runtime preference.",
+        "clear-failed": "The watchdog could not clear the home-DERP pin:"
+        " tailscale debug force-prefer-derp 0 failed. The runtime preference may remain set.",
         "failed": "The Tailscale watchdog could not apply the home-DERP pin:"
         f" tailscale debug force-prefer-derp {wanted} failed.",
         "unknown": "The Tailscale watchdog cannot tell whether the home-DERP pin holds:"

@@ -243,8 +243,13 @@ live run keeps this node homed there with `tailscale debug force-prefer-derp
 the running daemon (tailscaled started since, a new boot, or this run's own
 restart heal, after which it is re-applied at once). Remembering which daemon
 got it, rather than calling the setter every run, keeps tailscaled's log quiet.
-The command's exit code decides `applied` or `failed`; the next run judges
-whether it took (it takes effect at the next netcheck). The run records
+The command's exit code decides `applied` or `failed`; after a heal, unreadable
+or changed daemon identity around the setter records `unknown`. The next run
+judges whether it took (it takes effect at the next netcheck). Removing the
+setting or setting it to `0` clears a previously managed pin. Failed clears
+remain `clear-failed` and retry; observe mode records `clear-pending` without
+clearing. Incomplete runs retain ownership as `unknown` so later removal can
+still clear it. The run records
 `derp_pin` (`ok`, `applied`, `failed`, `drift-persists`, `unknown` for a
 missing relay, a region not in the DERP map or an unreadable tailscaled start
 time, or `drift` in observe mode, which runs nothing and marks `would_apply`
@@ -256,7 +261,8 @@ event or spends the rate limit, the pin's calls have their own 20s timeout, and
 a voided run leaves the pin alone. The awareness tick raises one `high` row per
 lapse (`tailscale_derp_pin`, keyed per boot and lapse, naming the result of the
 re-apply), and one `high` condition for `failed`, `unknown`, `drift` or
-`drift-persists`, resolved on `ok` or when the setting is removed.
+`drift-persists`, `clear-failed` or `clear-pending`, resolved on `ok` or after
+the pin is cleared.
 
 ## How the body schema surfaces it
 

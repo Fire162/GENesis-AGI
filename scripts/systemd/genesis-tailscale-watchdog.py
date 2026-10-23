@@ -179,10 +179,10 @@ SETTINGS = {
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 _REGION_RE = re.compile(r"[a-z0-9-]{1,32}")
 # Each call the home-DERP pin adds (derp-map, the pin before and after a heal,
-# the identity read after it) gets this, not NETWD_TS_CALL_TIMEOUT_SEC: they are
+# identity reads on either side of it) gets this, not NETWD_TS_CALL_TIMEOUT_SEC: they are
 # local CLI calls to an idempotent in-memory setter, a failure only records
 # "unknown"/"failed" and is retried next run, and the unit's start timeout
-# budgets four of them (tests/test_scripts/test_network_resilience.py).
+# budgets five of them (tests/test_scripts/test_network_resilience.py).
 DERP_CALL_TIMEOUT_SEC = 20
 
 
@@ -639,30 +639,60 @@ def _prefer(ctx: Ctx, region: int) -> int | None:
     return ctx.run(argv, DERP_CALL_TIMEOUT_SEC)[0]
 
 
-def reconcile_derp(ctx: Ctx, status_text: str, started, prior: dict, since, lapses: int):
+def _clear_derp_pin(ctx: Ctx, prior: dict):
+    if type(prior.get("wanted")) is not int or prior["wanted"] <= 0:
+        return None
+    pin = {**prior, "action": "clear-pending", "at": int(ctx.wall())}
+    if ctx.mode != "live":
+        return pin
+    rc = _prefer(ctx, 0)
+    log(f"clear home-DERP pin: rc={rc}")
+    if rc == 0:
+        return None
+    return {**pin, "action": "clear-failed"}
+
+
+def _region_label(code: str | None, fallback: str) -> str | None:
+    if code is None or not code or _REGION_RE.fullmatch(code):
+        return code
+    return fallback
+
+
+def reconcile_derp(ctx: Ctx, status_text: str, started, prior: dict, lapses: int):
     """(the ``derp_pin`` record, lapses this boot). ``force-prefer-derp`` sets
     nothing ``status`` shows, so the pin is re-applied unless THIS daemon
     (``started``, its start) already got it and its relay is on the region.
     Its exit code decides ``applied``/``failed``: it takes effect at the next
     netcheck, so the next run judges. A missing relay or a region absent from
     the DERP map is ``unknown`` and runs nothing. Observe mode never pins, so
-    it reports ``would_apply`` on drift or a daemon started since the last run
-    (``since``). Tracking ``applied_for`` instead of calling the setter every
+    it reports ``would_apply`` whenever the equivalent live run would set it.
+    Tracking ``applied_for`` instead of calling the setter every
     run keeps tailscaled's log quiet (about 720 fewer lines a day). With the
     daemon's start unreadable it can never be known to hold: still applied in
     live mode, but recorded ``unknown``."""
     wanted = ctx.settings["NETWD_TS_PREFER_DERP"]
+    if not wanted:
+        return _clear_derp_pin(ctx, prior), lapses
     relay = code = None
     with contextlib.suppress(ValueError, AttributeError):
         relay = json.loads(status_text).get("Self", {}).get("Relay")
     rc, out = ctx.run([ctx.tailscale, "debug", "derp-map"], DERP_CALL_TIMEOUT_SEC)
     with contextlib.suppress(ValueError, KeyError, TypeError):
         code = json.loads(out)["Regions"][str(wanted)]["RegionCode"] if rc == 0 else None
-    code = code if isinstance(code, str) and _REGION_RE.fullmatch(code) else None
-    seen = relay if isinstance(relay, str) and _REGION_RE.fullmatch(relay) else ""
+    # RegionCode is an unrestricted string in Tailscale's schema. Compare
+    # actual codes; restrict only the labels persisted for owner-facing text.
+    code = code if isinstance(code, str) and code else None
+    seen = relay if isinstance(relay, str) else ""
+    code_label = _region_label(code, f"region-{wanted}")
+    seen_label = _region_label(seen, code_label if seen == code else "custom-region")
     mine = (prior.get("wanted"), prior.get("applied_for"))
     held = started is not None and mine == (wanted, started)
-    pin = {"wanted": wanted, "code": code, "seen": seen, "applied_for": started if held else None}
+    pin = {
+        "wanted": wanted,
+        "code": code_label,
+        "seen": seen_label,
+        "applied_for": started if held else None,
+    }
     pin["at"] = int(ctx.wall())
     drift = seen != code
     if code is None or not seen:
@@ -671,7 +701,7 @@ def reconcile_derp(ctx: Ctx, status_text: str, started, prior: dict, since, laps
         pin["action"] = "ok"
     elif ctx.mode != "live":
         pin["action"] = "drift" if drift else "ok"
-        if drift or started is None or not _number(since) or started > since:
+        if not held or drift:
             pin["would_apply"] = True
             log(f"observe: would apply DERP region {wanted} (relay {seen!r})")
     else:
@@ -811,8 +841,16 @@ def run_once(ctx: Ctx) -> int:
     derp_lapses = prior.get("derp_lapses") if same_boot else 0
     if type(derp_lapses) is not int or derp_lapses < 0:
         derp_lapses = 0
-    # None: the pin is off. Absent: on, but this run did not get to it.
-    derp_pin = None if not ctx.settings["NETWD_TS_PREFER_DERP"] else ...
+    # Preserve ownership through incomplete runs so disabling can still clear
+    # a pin set earlier. Such a run cannot claim the pin is currently healthy.
+    enabled = bool(ctx.settings["NETWD_TS_PREFER_DERP"])
+    derp_pin = (
+        {**prior_pin, "action": "unknown" if enabled else "clear-pending", "at": int(ctx.wall())}
+        if prior_pin
+        else ...
+        if enabled
+        else None
+    )
     counters = {"probed": 0, "unjudged": 0, "skipped": 0, "malformed_peers": 0}
     evidence: dict = {}
     present: list = []
@@ -825,8 +863,10 @@ def run_once(ctx: Ctx) -> int:
         # one of them could be judged (scan limits, or every ping hanging).
         judged = counters["probed"] - counters["unjudged"]
         waiting = counters["skipped"] + counters["unjudged"]
-        blind = action in BLIND_ACTIONS or (waiting > 0 and judged == 0) or (
-            counters["malformed_peers"] > 0 and not evidence
+        blind = (
+            action in BLIND_ACTIONS
+            or (waiting > 0 and judged == 0)
+            or (counters["malformed_peers"] > 0 and not evidence)
         )
         if event is not None:
             events = (events + [event])[-MAX_EVENTS:]
@@ -956,8 +996,7 @@ def run_once(ctx: Ctx) -> int:
         evidence = dict(sorted(evidence.items(), key=lambda kv: (rank[kv[1]], kv[0]))[:MAX_PEERS])
         present_complete = False
     if derp_pin is not None:
-        since = prior.get("last_check_mono") if same_boot else None
-        derp_pin, derp_lapses = reconcile_derp(ctx, status, started, prior_pin, since, derp_lapses)
+        derp_pin, derp_lapses = reconcile_derp(ctx, status, started, prior_pin, derp_lapses)
     for peer in stuck:
         ages[peer.ip] = peer.age
         age = "unknown" if peer.age is None else f"{peer.age}s"
@@ -1033,12 +1072,16 @@ def run_once(ctx: Ctx) -> int:
             # nor a restart that failed to help (that would count toward the
             # limit and could stop healing this peer for the boot).
             outcome = "restart-unconfirmed"
-        if derp_pin is not None and derp_pin["code"]:
+        if not ctx.settings["NETWD_TS_PREFER_DERP"]:
+            derp_pin = None  # the verified restart cleared any pending old pin
+        elif derp_pin is not None and derp_pin["code"]:
             # The restart cleared the pin; re-apply it to the new daemon now.
+            before = daemon_identity(ctx, DERP_CALL_TIMEOUT_SEC)
             pin_rc = _prefer(ctx, derp_pin["wanted"])
             new = daemon_identity(ctx, DERP_CALL_TIMEOUT_SEC)
-            applied_for = new[2] if pin_rc == 0 and new else None
-            derp_pin.update(action="applied" if pin_rc == 0 else "failed", applied_for=applied_for)
+            applied_for = new[2] if pin_rc == 0 and before and same_daemon(before, new) else None
+            action = "failed" if pin_rc != 0 else "unknown" if applied_for is None else "applied"
+            derp_pin.update(action=action, applied_for=applied_for)
             derp_pin["after_heal"] = True
             log(f"home-DERP pin after the restart: {derp_pin['action']} (rc={pin_rc})")
     messages = {

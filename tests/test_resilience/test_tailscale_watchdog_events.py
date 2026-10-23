@@ -835,7 +835,9 @@ async def test_a_new_boots_lapse_is_a_new_row(db, tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["failed", "unknown", "drift", "drift-persists"])
+@pytest.mark.parametrize(
+    "action", ["failed", "unknown", "drift", "drift-persists", "clear-pending", "clear-failed"]
+)
 async def test_a_pin_that_does_not_hold_is_one_condition_resolved_on_ok(db, tmp_path, action):
     path = tmp_path / "s.json"
     assert await _run(db, _write(path, derp_pin=_pin(action, seen="abc"))) == 1
