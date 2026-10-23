@@ -27,6 +27,14 @@ checks public content. This workflow avoids the inline limitation; it does not
 restore arbitrary heredoc parity or authorize raw publishing commands. Guards
 still receive the complete unchanged command, including the anchor.
 
+GraphQL file inputs have a separate accepted limitation: the push guard trusts
+`@query` and `--input` bodies only in a single-step command. The mandatory anchor
+therefore makes even a read-only GraphQL file request refuse, including with an
+absolute filename. Ordinary `gh` read commands and REST GET remain the planned
+read paths where available. An inline `-f query=...` is not a validator-role
+workaround: the planned role policy prohibits those field flags. This restriction
+does not affect message body files passed to the authorized scanned filer.
+
 Patches use their native cwd for relative paths; they are never rebased into a
 different scratch directory. Every source and move destination must pass the
 existing patch policy under `~/tmp/validator/`, `~/.genesis/output/prv-*/` or

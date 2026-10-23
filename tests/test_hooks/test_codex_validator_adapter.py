@@ -268,6 +268,38 @@ def test_outer_missing_evaluator_is_an_explained_deny(tmp_path):
     assert b"did not explicitly allow" in result.stderr
 
 
+@pytest.mark.parametrize("dependency,fault", [(None, None)] + [
+    (name, fault) for name in ("codex_validator_guard", "codex_validator_patch")
+    for fault in ("missing", "crash")
+])
+def test_launcher_denies_each_module_scope_import_failure(tmp_path, dependency, fault):
+    from tests.test_hooks.test_codex_validator_adapter_native import source_copy
+
+    runtime = source_copy(tmp_path)
+    if dependency:
+        target = runtime / "scripts/hooks" / (dependency + ".py")
+        if fault == "missing":
+            target.unlink()
+        else:
+            target.write_text("raise RuntimeError('fixture-import-failure')\n")
+    data = payload(name="mcp__genesis_validator_memory__memory_store")
+    data["tool_input"] = {"content": "synthetic"}
+    signal_file = tmp_path / "fd3"
+    result = subprocess.run(
+        ["bash", "-c", 'bash "$1" 3>"$2"', "fixture",
+         str(runtime / "scripts/hooks/codex-validator-adapter"), str(signal_file)],
+        input=json.dumps(data), capture_output=True, text=True, timeout=10,
+        env={"PATH": os.defpath, "HOME": str(tmp_path), "GENESIS_HOME": str(tmp_path / ".genesis"),
+             "GENESIS_DB_PATH": str(tmp_path / "absent.db")},
+    )
+    assert result.returncode == (2 if dependency else 0)
+    assert signal_file.read_text() == ("deny\n" if dependency else "allow\n")
+    assert not result.stdout
+    if dependency:
+        assert "did not explicitly allow" in result.stderr
+        assert ("fixture-import-failure" if fault == "crash" else dependency) in result.stderr
+
+
 # Reuse existing guard fixtures/vectors, and exercise each through the adapter's
 # real invocation path. Commands here are INPUT ONLY, never executed as shell.
 @pytest.mark.parametrize("guard,command,note,denied", [

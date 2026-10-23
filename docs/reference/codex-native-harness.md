@@ -54,18 +54,63 @@ existing compatible Bash cases through the adapter and copied `genesis-hook`.
 For ordinary cases, the original assertions and adapter decision/context checks
 use the same child execution, preserving advisory deduplication. Explicit named
 mappings retain direct controls for the missing-cwd fallback, the single-step
-discard note and the compound-heredoc limitation. Lexical-cwd fixtures are
+discard note, compound-heredoc and GraphQL-file limitations. The guard-only
+no-spawn invariant runs directly before its separately checked adapter action;
+that action must preserve the baseline admission and API-refusal marker.
+Lexical-cwd fixtures are
 materialized only under the owned test directory, and the self-cwd test derives
 its target after entering that directory. The copied public topology fallback
 and imported source dependencies are hashed alongside the actual guard copies.
-The discard guard's copied-tree cases retain their complete fixture hook tree,
-including each intentionally missing helper. Each has a private runtime and a
-receipt manifest; they are replayed without replacing their fault premise by
-an intact copy.
+Copied guards execute at their original owned fixture paths through the copied
+launcher. Their manifests retain missing/poisoned siblings, script-parent
+dependencies and explicit public-source imports; no intact overlay repairs a
+fixture. Normal runtime files come from the tracked scripts/hook inventory with
+executable modes preserved. The native harness's source copier is unchanged.
 
-For example, after activating the Genesis Python environment:
+The frozen remote-policy test module uses a paired execution: its original
+assertions inspect an unanchored baseline from the copied launcher, taken before
+any injected fault. The anchored adapter must preserve admission. For force
+pushes, a separate source parser census must agree with the baseline's force
+reason; the adapter must produce a genuine force refusal, including the shared
+guard's whole-command refusal. Other calls must also preserve raw permission
+and explanations. Both no-op and generic-denial child controls must catch every
+force case. This pairing is limited to that module's empty local remotes; it
+does not apply to guards with advisory deduplication or publishing state.
+
+The plugin requires fresh, separate absolute base, receipt and sidecar paths
+under the original `HOME/tmp`, outside the checkout. Before collection it gives
+the pytest process a fresh shallow owned HOME under `/tmp`, preserving existing
+path-depth assertions. Bulk fixtures and the Python temporary-directory cache
+stay in the disk-based base/sidecar. All replay state must resolve under those
+three owned roots. HOME and the cache restore at unconfigure, including partial
+setup failure; rejected newly allocated homes are removed. Parent TMPDIR stays
+unchanged. A replay child's inherited ambient temp root is narrowed to owned
+temp; explicit fixture-specific state paths must already be owned. Per-case
+imported push-guard deadlines reset before fixtures model separate invocations;
+explicit fixture/body deadlines still take precedence.
+An omitted operation cwd uses the actual process cwd when it is already owned,
+otherwise the neutral owned operation directory. Outside the named
+repository-independent fixture mappings, explicit non-owned cwd values remain
+ineligible; this fallback never replaces them.
+The command-only refusal-precedence class uses that owned operation directory
+before its helper derives payload/process cwd and the git ceiling. Explicit
+Claude dispatched-session push and credential cases retain direct assertions:
+Codex must scrub their session stamp, so those cases are not compatible replays.
+
+Run the qualification child with umask `022`. The existing FIFO helper creates
+its directory with default permissions and expects to reach the regular-file
+check; inherited umask `002` creates a group-writable directory and correctly
+triggers the earlier directory-safety refusal instead. This process-local test
+premise does not change the host or the guard's accepted permissions.
+
+For example, after activating the Genesis Python environment, this bounded
+starter set runs the main guard modules. Complete qualification also inventories
+and accounts for compatible cases in other guard consumers, including inline
+hooks and `tests/test_scripts/test_hook_input_contract.py`:
 
 ```bash
+(
+umask 022
 GENESIS_PYTEST_LOCK_WAIT=1 python -m genesis.hostmetrics run \
   --name codex-guard-replay --ram 1 --cpu 100 -- python -m pytest -q \
   -p tests.test_hooks.codex_adapter_replay \
@@ -89,11 +134,13 @@ GENESIS_PYTEST_LOCK_WAIT=1 python -m genesis.hostmetrics run \
   tests/test_hooks/test_worktree_guard.py \
   -o tmp_path_retention_policy=all \
   --basetemp "$HOME/tmp/codex-guard-replay-$$"
+)
 ```
 
 The private receipt lists every test's source location, direct result, replay
-count and `FULL`/`PARTIAL`/`NO` invocation coverage. A failed test has zero qualified
-replays. Every unreplayed invocation has a reason; tests without a subprocess
+count and `FULL`/`PARTIAL`/`NO` invocation coverage. Failed, skipped and unfinished
+test lifecycles have zero qualified replays. Changed instrument, copied/public
+source or HEAD invalidates qualification. Every unreplayed invocation has a reason; tests without a subprocess
 payload retain their direct evidence and referenced source symbols. Internal
 helper/mocked-main tests, Claude-only lifecycle/read/file event shapes, malformed
 or empty non-native payloads and the explicitly excluded main-checkout Bash half
