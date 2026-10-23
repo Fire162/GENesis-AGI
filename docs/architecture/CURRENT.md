@@ -2830,7 +2830,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 8a62059720cd 2026-10-22
+verified: ed048e214017 2026-10-22
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -3073,7 +3073,7 @@ verified: 8a62059720cd 2026-10-22
   and separately restored bytes bound by human approval. Original paths remain
   logical provenance identities; archive creation supplies no approval or
   independent-backup claim. Missing retained evidence refuses before rendering.
-  The isolated serial CLI supports Flash-only or historical paired execution
+  The isolated serial CLI supports Flash-only, explicit Pro–Flash or historical MiMo–Flash execution
   under an exact frozen operating plan and a separate local spending assertion.
   A credential-scoped lock precedes journal writers and credential reads. The
   actual pre-dispatch key snapshot must fund the whole selected pending
