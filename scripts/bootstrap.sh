@@ -146,18 +146,24 @@ PY
     # (and an engine it ran keeps it through the inherited fd, even after
     # update.sh dies, #3492), so the lock is the answer, not the recorded pid,
     # which a zombie or a reused pid makes look alive. Held, it is update.sh's
-    # own step only when update.sh said so: it names its pid in
-    # GENESIS_BOOTSTRAP_UPDATE_PID on its bootstrap call, and that must be the
-    # pid the state records. Held otherwise, bootstrap refuses: a hand-run
-    # bootstrap during a live update now refuses too, the safe direction (a
-    # validation hold, flock -s, reads the same). Free, no update is running and
-    # the state is a dead one's.
+    # own step only when the recorded pid is the one running it: update.sh names
+    # its pid in GENESIS_BOOTSTRAP_UPDATE_PID on its bootstrap call, or bootstrap
+    # is its direct child ($PPID is the recorded pid). The second is how the
+    # update.sh before this check calls it (no token), and every install runs
+    # that one once, against this bootstrap, on the update that brings it in. A
+    # dead recorded pid cannot be bootstrap's running parent; a reused one could
+    # only while the lock stays held without update.sh (an orphaned engine), a
+    # window pid_max makes remote. Held
+    # otherwise, bootstrap refuses: a hand-run bootstrap during a live update
+    # (its parent is a shell) now refuses too, the safe direction (a validation
+    # hold, flock -s, reads the same). Free, no update is running and the state
+    # is a dead one's.
     _lock_rc=0
     _update_lock_held || _lock_rc=$?
-    # The token first: update.sh's own call goes on whether bootstrap can see
-    # the lock as held (0) or cannot open it (2); update.sh holds it either way.
-    if [ "$_lock_rc" -ne 1 ] && [ -n "${GENESIS_BOOTSTRAP_UPDATE_PID:-}" ] \
-        && [ "$GENESIS_BOOTSTRAP_UPDATE_PID" = "$STATE_PID" ]; then
+    # update.sh's own call first: it goes on whether bootstrap can see the lock
+    # as held (0) or cannot open it (2); update.sh holds it either way.
+    if [ "$_lock_rc" -ne 1 ] && [ -n "$STATE_PID" ] \
+        && { [ "${GENESIS_BOOTSTRAP_UPDATE_PID:-}" = "$STATE_PID" ] || [ "$PPID" = "$STATE_PID" ]; }; then
         echo "  Update process (pid $STATE_PID) is running this bootstrap in phase '$STATE_PHASE' — not interfering."
     elif [ "$_lock_rc" -eq 2 ]; then
         echo "  REFUSE: ${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock cannot be opened (check its owner and mode), so whether an update still holds it is unknown: bootstrap does not run." >&2

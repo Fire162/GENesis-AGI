@@ -1724,3 +1724,116 @@ def test_review_n1_update_sh_s_own_call_survives_an_unopenable_lock(tmp_path):
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0 and "AFTER_RECOVERY" in out, out
     assert path.exists()
+
+
+#: The bootstrap call of the update.sh every install runs ONCE against this
+#: tree: the one before the token, frozen in a temp copy before it merges
+#: (update.sh copies itself and execs the copy). Verbatim from
+#: scripts/update.sh at d67ee3369 (main before #3532, line 3100). Pinned,
+#: not read from origin/main, which carries the token once this merges.
+_PRE_TOKEN_CALL = (
+    'GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10'
+)
+
+
+def _old_bootstrap_call() -> str:
+    """The previous update.sh's call, checked against this tree's: the same
+    line without the token this PR added."""
+    token = 'GENESIS_BOOTSTRAP_UPDATE_PID="$$" '
+    ours = _this_bootstrap_call()
+    assert token in ours, "this tree's call no longer names its pid"
+    assert ours.replace(token, "").strip() == _PRE_TOKEN_CALL, ours
+    return _PRE_TOKEN_CALL
+
+
+def _this_bootstrap_call() -> str:
+    return next(
+        ln
+        for ln in UPDATE.read_text().splitlines()
+        if '/scripts/bootstrap.sh" 2>&1 | tail' in ln and not ln.lstrip().startswith("#")
+    )
+
+
+def _under_update_parent(tmp_path, call: str, *, state_pid: str = "$$"):
+    """Run `call` the way update.sh runs it: from a bash that holds update.lock
+    and has written a state row whose pid is `state_pid` (shell text, default
+    its own $$). GENESIS_ROOT points at a tree whose bootstrap.sh is this
+    tree's crash-recovery block followed by AFTER_RECOVERY."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    (home / ".genesis" / "locks").mkdir(parents=True)
+    fake = tmp_path / "fake-root"
+    (fake / "scripts").mkdir(parents=True)
+    harness = fake / "scripts" / "bootstrap.sh"
+    harness.write_text(
+        '#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR="${RECOVERY_SCRIPTS:?}"\n'
+        'GENESIS_ROOT="${RECOVERY_ROOT:?}"\nUPDATE_STATE="$HOME/.genesis/update_state.json"\n'
+        '. "$SCRIPT_DIR/lib/deploy_marker.sh"\n. "$SCRIPT_DIR/lib/deploy_checkout.sh"\n'
+        '. "$SCRIPT_DIR/lib/deploy_recovery.sh"\nEPHEMERAL_BACKUP_ROOT="${TEST_BACKUP_ROOT:?}"\n'
+        + _crash_recovery_source()
+        + "\necho AFTER_RECOVERY\n"
+    )
+    harness.chmod(0o755)
+    parent = (
+        "set -Eeuo pipefail\n"
+        'exec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\n'
+        'flock -n "$_UPDATE_LOCK_FD"\n'
+        "sleep 120 & _other=$!\n"
+        "trap 'kill $_other 2>/dev/null || true' EXIT\n"
+        'printf \'{"phase": "merging", "rollback_tag": "rollback", '
+        '"original_branch": "main", "own_head": "", "deploy_head": "", '
+        f'"pid": %s}}\' "{state_pid}" > "$HOME/.genesis/update_state.json"\n'
+        f'GENESIS_ROOT="{fake}"\n' + call + "\necho PARENT_DONE\n"
+    )
+    env = _recovery_env(
+        HOME=str(home),
+        RECOVERY_SCRIPTS=str(REPO_ROOT / "scripts"),
+        RECOVERY_ROOT=str(root),
+        TEST_BACKUP_ROOT=str(home / ".genesis" / "premerge-backups" / "test-run"),
+    )
+    env.pop("GENESIS_HOME", None)
+    env.pop("GENESIS_BOOTSTRAP_UPDATE_PID", None)
+    proc = subprocess.run(
+        ["bash", "-c", parent], capture_output=True, text=True, env=env, timeout=60
+    )
+    return proc, proc.stdout + proc.stderr, root, rollback
+
+
+def test_upgrade_the_previous_update_sh_runs_this_bootstrap(tmp_path):
+    """#3532 upgrade path: the update that brings this change in is run by the
+    PREVIOUS update.sh (a frozen temp copy), which calls the NEW bootstrap its
+    own way: no token, holding update.lock, its pid in the state. Bootstrap must
+    take it as the update's own step (its parent is the recorded pid), or every
+    such update refuses, rolls back, and the next one does the same."""
+    call = _old_bootstrap_call()
+    assert "GENESIS_BOOTSTRAP_UPDATE_PID" not in call, call
+    proc, out, _root, _rb = _under_update_parent(tmp_path, call)
+    assert proc.returncode == 0 and "AFTER_RECOVERY" in out and "PARENT_DONE" in out, out
+    assert "not interfering" in out, out
+
+
+def test_upgrade_this_update_sh_s_token_carries_a_call_that_is_not_a_direct_child(tmp_path):
+    """The token is kept for robustness: this tree's own call goes on even
+    where bootstrap is not update.sh's direct child (here, run from a
+    subshell), because update.sh names its pid."""
+    call = _this_bootstrap_call()
+    assert 'GENESIS_BOOTSTRAP_UPDATE_PID="$$"' in call, call
+    proc, out, _root, _rb = _under_update_parent(tmp_path, "( " + call + " )")
+    assert proc.returncode == 0 and "AFTER_RECOVERY" in out and "not interfering" in out, out
+
+
+@pytest.mark.parametrize("who", ["hand-run", "reused"])
+def test_upgrade_only_the_recorded_pid_as_direct_parent_goes_on(tmp_path, who):
+    """No token, update.lock held. A hand run during a live update (its parent
+    is a shell, not the recorded update) refuses; so does a recorded pid that
+    is alive but is not bootstrap's parent (a reused pid)."""
+    if who == "hand-run":
+        # Two commands, so bash -c forks: bootstrap's parent is that shell.
+        call = 'bash -c ""$GENESIS_ROOT/scripts/bootstrap.sh"; exit \\$?" 2>&1 | tail -10'
+        proc, out, root, rollback = _under_update_parent(tmp_path, call)
+    else:
+        call = _old_bootstrap_call()
+        proc, out, root, rollback = _under_update_parent(tmp_path, call, state_pid="$_other")
+    assert proc.returncode != 0 and "REFUSE: an update holds update.lock" in out, out
+    assert "AFTER_RECOVERY" not in out, out
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback

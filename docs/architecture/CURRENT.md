@@ -4009,15 +4009,18 @@ tool-disabled CC probe without changing its schedule or routing authority.
   run that had not written yet), a rollback that left merged code keeps it, and
   bootstrap's crash recovery keeps a pending conflict. Bootstrap's crash
   recovery judges liveness by update.lock alone, never the recorded pid (a
-  zombie or a reused pid looks alive): held, it goes on only when update.sh
-  started it (update.sh names its own pid in `GENESIS_BOOTSTRAP_UPDATE_PID`,
-  which must equal the state's pid) and refuses otherwise, a hand-run bootstrap
-  during a live update or an orphaned engine included; free, the update is dead
-  and recovery runs. At the tag in "merging" it goes on only on the
-  guard's exit 10, printing the guard's message otherwise. The dashboard's
-  progress poll is read-only: it reports the verdict and offers Dismiss, the
-  one retirement by hand. The residue check is `genesis_merge_residue` in
-  `scripts/lib/deploy_checkout.sh` (`--two-dot` for a live row). One exception
+  zombie or a reused pid looks alive): held, it goes on only when the state's
+  pid is running it, either named in `GENESIS_BOOTSTRAP_UPDATE_PID` (update.sh
+  passes its own pid) or as bootstrap's direct parent (`$PPID`, how an
+  update.sh from before the token calls it: every install runs that one once,
+  against this bootstrap, on the update that brings it in), and refuses
+  otherwise, a hand-run bootstrap during a live update (its parent is a shell)
+  or an orphaned engine included; free, the update is dead and recovery runs.
+  At the tag in "merging" it goes on only on the guard's exit 10, printing
+  the guard's message otherwise. The dashboard's progress poll is read-only:
+  it reports the verdict and offers Dismiss, the one retirement by hand. The
+  residue check is `genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`
+  (`--two-dot` for a live row). One exception
   in the engine: the "merging" row of the `update.sh` that is running the
   rebuild (its pid named in `DEPLOY_CANDIDATES_OWN_STATE_PID`, equal to the
   engine's parent, update.lock handed over, a plain run) is neither refused nor

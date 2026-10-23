@@ -3184,6 +3184,9 @@ _write_state "bootstrap"
 echo "--- Running bootstrap ---"
 # GENESIS_BOOTSTRAP_UPDATE_PID: this run is the update.lock holder bootstrap
 # sees, and the pid its state records (bootstrap's crash recovery reads both).
+# Bootstrap also takes its direct parent being that pid (how an update.sh from
+# before the token calls it), so the token is what keeps a call that is not a
+# direct child, a subshell or a wrapper, working.
 GENESIS_BOOTSTRAP_UPDATE_PID="$$" GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
 echo "  Bootstrap complete"
 echo ""

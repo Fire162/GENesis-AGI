@@ -187,21 +187,44 @@ def _move_record(state: dict) -> tuple[str, str] | None:
     return (to, phase) if phase in MOVE_PHASES else None
 
 
-def _merge_residue(repo: str, rb_commit: str, deploy_head: str, two_dot: bool = False) -> list[str]:
+#: genesis_merge_residue, and with ``$6`` set, without the records on the
+#: known-ephemeral tracked paths (EPHEMERAL_DIRTY_RE, defined once in
+#: deploy_marker.sh), the path matched whole: a tracked "d/x AGENTS.md" counts.
+_RESIDUE_SH = """
+. "$1/deploy_checkout.sh" || exit 1
+if [ -z "$6" ]; then genesis_merge_residue "$2" "$3" "$4" ${5:+"$5"}; exit; fi
+. "$1/deploy_marker.sh" && [ -n "${EPHEMERAL_DIRTY_RE:-}" ] || exit 1
+set -o pipefail
+genesis_merge_residue "$2" "$3" "$4" ${5:+"$5"} | while IFS= read -r -d '' r; do
+    [[ "$r" != '??'* && " ${r:3}" =~ ^($EPHEMERAL_DIRTY_RE)$ ]] || printf '%s\\0' "$r"
+done
+"""
+
+
+def _merge_residue(
+    repo: str,
+    rb_commit: str,
+    deploy_head: str,
+    two_dot: bool = False,
+    *,
+    ephemeral_ok: bool = False,
+) -> list[str]:
     """genesis_merge_residue's records (NUL-separated on the wire, so every
     legal file name arrives exactly; bytes that are not UTF-8 are kept as
-    surrogates); any failure to run it is residue."""
+    surrogates); any failure to run it is residue. ``ephemeral_ok`` leaves out
+    the known-ephemeral paths."""
     proc = subprocess.run(
         [
             "bash",
             "-c",
-            '. "$1/deploy_checkout.sh" && genesis_merge_residue "$2" "$3" "$4" ${5:+"$5"}',
+            _RESIDUE_SH,
             "update_state_guard",
             _LIB,
             repo,
             rb_commit,
             deploy_head,
             "--two-dot" if two_dot else "",
+            "1" if ephemeral_ok else "",
         ],
         capture_output=True,
         text=True,
@@ -333,8 +356,17 @@ def _forward(repo: str, tag: str, to: str) -> tuple[str, str] | None:
     two-dot residue back toward the tag is non-empty, the paths a rollback
     checkout from ``to`` to the tag writes (one killed partway leaves HEAD at
     ``to`` with tag-side files written); None when the tree is whole. The one
-    implementation for main and `live` (#3532 round 2)."""
-    residue = _merge_residue(repo, to, tag, two_dot=True)
+    implementation for main and `live` (#3532 round 2).
+
+    The known-ephemeral paths do not count here (round 4): with HEAD at the new
+    code the update has adopted it, and the runtime rewrites those paths
+    (GitNexus, AGENTS.md's stat block) while bootstrap, migrations and the
+    health check run; update.sh backs them up and clears them before every
+    merge and rebuild, and a half-written one loses nothing. The checks at the
+    rollback tag still count them: that is main's existing, tested behaviour
+    (test_merging_at_the_tag_with_tracked_changes_guards), not a safety need,
+    and changing it is tracked on its own (#3566)."""
+    residue = _merge_residue(repo, to, tag, two_dot=True, ephemeral_ok=True)
     return _mixed(tag, to, residue, forward=True) if residue else None
 
 

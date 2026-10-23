@@ -1222,3 +1222,32 @@ def test_review_n2_c1_controls_and_line_separators_are_escaped(guard, name):
     assert all(not (0x80 <= ord(c) <= 0x9F) and c not in "\u2028\u2029" for c in token), token
     got = subprocess.run(["bash", "-c", f"printf %s {token}"], capture_output=True).stdout
     assert got == name.encode(), (token, got)
+
+
+@pytest.mark.parametrize(
+    ("path", "verdict"),
+    [
+        ("AGENTS.md", "guards"),
+        ("config/procedure_triggers.yaml", "guards"),
+        ("docs/AGENTS.md", "mixed_tree"),
+        ("d/x AGENTS.md", "mixed_tree"),
+    ],
+)
+def test_r4_a_runtime_rewrite_of_an_ephemeral_path_is_not_a_forward_mixed_tree(
+    guard, live, path, verdict
+):
+    """Round 4 (CodeRabbit): after adoption the runtime rewrites the known
+    ephemeral tracked paths (EPHEMERAL_DIRTY_RE, deploy_marker.sh: GitNexus
+    rewrites AGENTS.md's stat block), so a change there on a path the update
+    brought in is not a rollback killed partway; it must not refuse recovery or
+    --post-merge. The list matches exact paths only: docs/AGENTS.md still counts."""
+    root = live["root"]
+    _git(root, "checkout", "-q", "-B", "live", live["new"])
+    (root / path).parent.mkdir(parents=True, exist_ok=True)
+    (root / path).write_text("generated\n")
+    _git(root, "add", "--", path)
+    _git(root, "commit", "-qm", "the update brings the path in")
+    tip = _git(root, "rev-parse", "HEAD")
+    (root / path).write_text("regenerated at runtime\n")
+    got, reason = _live_verdict(guard, live, {**_adopted_row(live), "own_head": tip})
+    assert got == verdict, reason
