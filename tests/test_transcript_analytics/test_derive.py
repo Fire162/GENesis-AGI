@@ -377,6 +377,48 @@ def test_restore_cache_discard_reports_failed_parent_sync(tmp_path, monkeypatch)
         derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
 
 
+@pytest.mark.parametrize("failures", [1, 2])
+def test_restore_cache_discard_retries_failed_parent_sync(tmp_path, monkeypatch, failures):
+    data = tmp_path / "data"
+    root = data / "derived"
+    root.mkdir(parents=True)
+    calls = []
+    fsync = store._fsync_directory
+
+    def retry_sync(path):
+        assert not root.exists() and not root.is_symlink()
+        calls.append(path)
+        if len(calls) <= failures:
+            raise OSError("synthetic directory sync failure")
+        fsync(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", retry_sync)
+    for _ in range(failures):
+        with pytest.raises(OSError, match="synthetic directory sync failure"):
+            derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+    derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+    assert calls == [data] * (failures + 1)
+
+
+@pytest.mark.parametrize("data_exists", [False, True])
+def test_restore_cache_discard_with_absent_cache(tmp_path, monkeypatch, data_exists):
+    data = tmp_path / "data"
+    if data_exists:
+        data.mkdir()
+    calls = []
+    fsync = store._fsync_directory
+
+    def record_sync(path):
+        calls.append(path)
+        fsync(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", record_sync)
+    for _ in range(2):
+        derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+    assert calls == ([data, data] if data_exists else [])
+    assert data.exists() == data_exists
+
+
 @pytest.mark.parametrize("entry", [".staging", ".current.424242", "current", "."])
 def test_rebuild_unlinks_cache_links_without_searching_their_targets(built, tmp_path, entry):
     _projects, data, _path = built

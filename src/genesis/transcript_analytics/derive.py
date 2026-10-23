@@ -139,4 +139,6 @@ def discard_after_restore(data: Path, *, lock_path: Path | None = None):
         root = data / "derived"
         if root.is_symlink() or root.exists():
             _remove_cache_entry(root)
+        # A retry must finish a failed removal fence even when the cache is gone.
+        if data.is_dir():
             store._fsync_directory(data)
