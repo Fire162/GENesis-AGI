@@ -860,6 +860,31 @@ async def test_the_open_condition_follows_the_latest_cause(db, tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action", ["failed", "unknown", "drift", "drift-persists", "clear-pending", "clear-failed"]
+)
+async def test_a_continuing_pin_condition_renews_expiry_without_a_new_alert(db, tmp_path, action):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, derp_pin=_pin("failed")))
+    (first,) = await _rows(db, category=CATEGORY_DERP)
+    surfaced = datetime.now(UTC).isoformat()
+    await observations.mark_surfaced(db, [first["id"]], surfaced)
+    past = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
+    await observations.set_expires_at(db, first["id"], past)
+
+    assert await _run(db, _write(path, derp_pin=_pin(action))) == 0
+    (current,) = await _rows(db, category=CATEGORY_DERP)
+    remaining = datetime.fromisoformat(current["expires_at"]) - datetime.now(UTC)
+    assert timedelta(days=2, hours=23) < remaining <= timedelta(days=3)
+    assert current["id"] == first["id"] and current["surfaced_at"] == surfaced
+    assert await observations.resolve_expired(db) == 0
+    assert await _run(db, _write(path, derp_pin=_pin(action))) == 0
+    assert len(await _rows(db, category=CATEGORY_DERP)) == 1
+    await _run(db, _write(path, derp_pin=_pin("ok")))
+    assert not await _rows(db, resolved=False, category=CATEGORY_DERP)
+
+
+@pytest.mark.asyncio
 async def test_turning_the_pin_off_resolves_and_a_run_that_missed_it_changes_nothing(db, tmp_path):
     path = tmp_path / "s.json"
     await _run(db, _write(path, derp_pin=_pin("failed")))

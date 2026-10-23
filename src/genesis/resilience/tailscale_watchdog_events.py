@@ -69,7 +69,9 @@ system journal.
 pin held) is a one-off row keyed per boot and lapse number. ``failed``,
 ``unknown``, ``drift`` (observe mode) and ``drift-persists`` are one condition
 row, kept to the latest text and resolved on ``ok`` or when the pin is turned
-off. A run that did not reach the pin (no ``derp_pin`` key) changes nothing.
+off. Fresh failure evidence renews the store's type TTL without creating or
+surfacing another alert. A run that did not reach the pin (no ``derp_pin`` key)
+changes nothing.
 
 The observation names a peer by its IPv4 address only. The watchdog never
 reads peer hostnames (another tailnet member chooses those), and first-party
@@ -556,8 +558,11 @@ async def _apply_derp(db, state: dict[str, Any], boot: str) -> int:
             )
     text = _derp_condition(pin) if isinstance(pin, dict) else None
     if text is not None:
+        ttl = observations._compute_ttl(TYPE)
+        expires_at = (_now() + ttl).isoformat() if ttl else None
         row = await observations.latest_by_hash(db, source=SOURCE, content_hash=_hash("derp-pin"))
         if row is not None and not row["resolved"]:
+            await observations.set_expires_at(db, row["id"], expires_at)
             await observations.update_content(db, row["id"], text)
         else:
             created += await _create(
@@ -567,6 +572,7 @@ async def _apply_derp(db, state: dict[str, Any], boot: str) -> int:
                 category=CATEGORY_DERP,
                 once=False,
                 content=text,
+                expires_at=expires_at,
             )
     elif pin is None or pin.get("action") == "ok":
         why = "the pin is turned off" if pin is None else "this node is homed on the pinned region"

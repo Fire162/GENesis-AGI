@@ -262,7 +262,8 @@ a voided run leaves the pin alone. The awareness tick raises one `high` row per
 lapse (`tailscale_derp_pin`, keyed per boot and lapse, naming the result of the
 re-apply), and one `high` condition for `failed`, `unknown`, `drift` or
 `drift-persists`, `clear-failed` or `clear-pending`, resolved on `ok` or after
-the pin is cleared.
+the pin is cleared. Each fresh failure sighting renews that condition's
+three-day expiry without creating a new alert or repeating its notification.
 
 ## How the body schema surfaces it
 
