@@ -63,6 +63,11 @@ def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instr
     if case == "patch-relative":
         receipt = run_root / "workspace/patch-receipt.txt"
     command = f"cd {scratch} && printf fixture > {receipt}"
+    body_marker = "fixture-body: xargs git worktree remove"
+    if case == "shell":
+        body = scratch / "fixture-body.txt"
+        body.write_text(body_marker + "\n")
+        command = f"cd {scratch} && cat {shlex.quote(str(body))}; printf fixture > {receipt}"
     if case == "advisory":
         command = f"cd {scratch} && false | true; echo $?; printf fixture > {receipt}"
     if case == "deny":
@@ -156,6 +161,9 @@ def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instr
         if case == "advisory":
             assert "PIPESTATUS" not in json.dumps(requests[0]["input"])
             assert "PIPESTATUS" in json.dumps(requests[1]["input"])
+        if case == "shell":
+            assert body_marker not in json.dumps(requests[0]["input"])
+            assert body_marker in json.dumps(requests[1]["input"])
     else:
         # Refusal must come from the intended boundary, never an unrelated broken
         # fixture that merely happened to suppress every receipt.

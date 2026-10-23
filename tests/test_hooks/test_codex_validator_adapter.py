@@ -428,3 +428,54 @@ def test_install_ask_suppression_is_honored_without_changing_other_clients(adapt
     else:
         with pytest.raises(ValueError, match="owner"):
             asyncio.run(adapter.run_guard(*invocation))
+
+
+@pytest.mark.parametrize("receiver", ["cat", "git commit -F -", "gh pr comment 1 --body-file -"])
+@pytest.mark.parametrize("shape", ["prose-only", "neutral-only", "real-tail"])
+def test_compound_heredoc_cost_and_real_removal_control(adapter, tmp_path, monkeypatch, receiver, shape):
+    from tests.test_hooks.test_codex_validator_adapter_native import source_copy
+
+    runtime = source_copy(tmp_path)
+    monkeypatch.setattr(adapter, "RUNTIME_ROOT", runtime)
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / ".genesis"))
+    # The tail arm has neutral data: refusal must come from the actual trailing
+    # operation, never the separately pinned inline-prose limitation.
+    body = "fix: refuse `xargs git worktree remove`" if shape == "prose-only" else "fixture neutral text"
+    command = receiver + " <<'EOF'\n" + body + "\nEOF"
+    if shape == "real-tail":
+        command += "\ngit worktree remove /tmp/fixture-not-executed"
+    # Both inputs are guard data only: no cat, commit, post or removal executes.
+    baseline = subprocess.run(
+        [str(runtime / ".claude/hooks/genesis-hook"), "hooks/worktree_cwd_guard.py"],
+        input=json.dumps(payload(command, cwd=str(tmp_path))),
+        capture_output=True, text=True, cwd=tmp_path, timeout=8,
+    )
+    assert baseline.returncode == (2 if shape == "real-tail" else 0)
+    call = next(c for c in adapter.prepare(payload(f"cd {tmp_path} && {command}"))
+                if "/worktree_cwd_guard.py" in " ".join(c[0]))
+    if shape == "neutral-only":
+        asyncio.run(adapter.run_guard(*call))
+    else:
+        with pytest.raises(ValueError, match="worktree") as caught:
+            asyncio.run(adapter.run_guard(*call))
+        if shape == "prose-only":
+            assert "stdin or a list" in str(caught.value)
+
+
+@pytest.mark.parametrize("receiver", ["cat", "git commit -F", "gh pr comment 1 --body-file"])
+def test_body_file_avoids_inline_prose_refusal(adapter, tmp_path, monkeypatch, receiver):
+    from tests.test_hooks.test_codex_validator_adapter_native import source_copy
+
+    runtime = source_copy(tmp_path)
+    monkeypatch.setattr(adapter, "RUNTIME_ROOT", runtime)
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / ".genesis"))
+    scratch = tmp_path / "tmp/validator"
+    scratch.mkdir(parents=True)
+    body = scratch / "fixture-body.txt"
+    body.write_text("fixture-body: xargs git worktree remove\n")
+    data = payload(f"cd {scratch} && {receiver} {shlex.quote(str(body))}")
+    call = next(c for c in adapter.prepare(data) if "/worktree_cwd_guard.py" in " ".join(c[0]))
+    asyncio.run(adapter.run_guard(*call))
+    if receiver == "cat":
+        # The read workflow must pass the whole adapter, not only this guard.
+        asyncio.run(adapter.evaluate(data))

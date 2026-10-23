@@ -18,6 +18,15 @@ The command is unchanged. Native 0.163.0 omitted an explicit
 shell workdir from its hook input, so the adapter supplies the proven anchor as
 the guards' cwd instead. Reads require this prefix too.
 
+The prefix makes the call a compound command. The unchanged parser deliberately
+does not exempt data-heredoc bodies in compound openers, so inline prose can be
+refused when it mentions a guarded operation. Keep message/data bodies in a file
+created with `apply_patch` under a permitted scratch root, then use its absolute
+filename in the anchored read or authorized filer call. The scanned filer still
+checks public content. This workflow avoids the inline limitation; it does not
+restore arbitrary heredoc parity or authorize raw publishing commands. Guards
+still receive the complete unchanged command, including the anchor.
+
 Patches use their native cwd for relative paths; they are never rebased into a
 different scratch directory. Every source and move destination must pass the
 existing patch policy under `~/tmp/validator/`, `~/.genesis/output/prv-*/` or
