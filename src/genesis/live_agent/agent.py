@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import shutil
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -112,6 +113,32 @@ PARENT_SESSION_VARS = (
 _MUST_BE_ABSENT = (*PARENT_SESSION_VARS, "GENESIS_ROSTER_MODEL")
 
 
+# A bare reply that answers a waiting approval (normalised: lower case, outer
+# punctuation and commas dropped). Anything else is NOT an answer.
+# Not "ok"/"okay" (filler, and what speech-to-text hears as acknowledgement) and
+# not "y"/"n" (one keystroke from a typo); "/y ID" covers terse use.
+_YES = frozenset({"yes", "yeah", "yep", "approve", "approved", "allow"})
+_NO = frozenset({"no", "nope", "deny", "denied", "reject"})
+# A bare reply to an ask that appeared less than this long ago is refused: it
+# was more likely typed or said about whatever was on screen just before.
+MIN_ASK_VISIBLE_S = 1.5
+
+
+class ApprovalPending(RuntimeError):
+    """A turn was held because a permission ask is waiting for the owner."""
+
+
+def approval_reply(text: str) -> bool | None:
+    """True / False when ``text`` is a bare yes / no, else None."""
+    # A trailing "?" is a question, not an answer: it is NOT stripped.
+    words = " ".join(text.lower().replace(",", " ").split()).strip(" .!")
+    if words in _YES:
+        return True
+    if words in _NO:
+        return False
+    return None
+
+
 def owner_environ(env: dict[str, str]) -> dict[str, str]:
     """Return ``env`` as the owner's own: parent identity dropped, route pins undone."""
     clean = {k: v for k, v in env.items() if k not in PARENT_SESSION_VARS}
@@ -145,6 +172,7 @@ class _Approval:
     tool_input: dict[str, Any]
     reason: str
     future: asyncio.Future[bool]
+    shown_at: float = field(default_factory=time.monotonic)
 
 
 async def record_cost_on_session_row(
@@ -214,6 +242,9 @@ class LiveAgent:
         self._events: asyncio.Queue[Event] = asyncio.Queue()
         self._summary = ProgressSummarizer()
         self._pending: dict[str, _Approval] = {}
+        # When an ask last left the queue unanswered (withdrawn or expired):
+        # after that, a bare reply cannot be tied to the ask the owner read.
+        self._ask_churn_at = float("-inf")
         self._session_id: str | None = None
         self._api_key_source: str | None = None
         self._rate_limited_until: int | None = None
@@ -282,10 +313,19 @@ class LiveAgent:
 
     # -- driving -----------------------------------------------------------
 
-    async def turn(self, text: str, initiator: str = "owner_cli") -> TaskHandle:
+    async def turn(
+        self, text: str, initiator: str = "owner_cli", *, cancel_pending: bool = False
+    ) -> TaskHandle:
         """Send a turn; returns at once. Busy: steer the running work instead.
 
-        The outcome arrives as ``finished`` events, not on the handle.
+        The outcome arrives as ``finished`` events, not on the handle. While a
+        permission ask is waiting the turn is HELD (``ApprovalPending``): the
+        CLI withdraws a waiting ask when any message arrives, which denies the
+        action (measured), so a reply meant as "yes" would deny it. Only an
+        explicit ``cancel_pending=True`` sends anyway. One window remains that no
+        host can close: an ask the CLI has written but the SDK has not yet
+        delivered is invisible here, so a turn sent then still withdraws it
+        (denied, and reported as withdrawn).
         """
         if initiator not in ACCEPTED_INITIATORS:
             raise PermissionError(
@@ -293,6 +333,12 @@ class LiveAgent:
                 "may drive the live agent until the approval gate is wired"
             )
         client = self._require_client()
+        if self._pending and not cancel_pending:
+            waiting = ", ".join(sorted(self._pending))
+            raise ApprovalPending(
+                f"approval {waiting} is waiting; answer it first, or steer explicitly "
+                "to cancel it (that denies the action)"
+            )
         busy = self._state != _IDLE
         handle = TaskHandle(uuid.uuid4().hex[:8], busy)
         body = f"{OWNER_CLI_MARKER}\n\n{text}"
@@ -304,6 +350,11 @@ class LiveAgent:
                 raise CLIConnectionError(
                     "the interrupt never settled; the steer was not sent"
                 ) from None
+            if self._pending and not cancel_pending:
+                waiting = ", ".join(sorted(self._pending))
+                raise ApprovalPending(
+                    f"approval {waiting} arrived while the steer waited; not sent"
+                )
             if not self._stream_open or self._client is not client:
                 raise CLIConnectionError("the session ended while waiting; the steer was not sent")
             body = f"{OWNER_CLI_MARKER}\n\nI interrupted you to steer the request above: {text}"
@@ -326,6 +377,34 @@ class LiveAgent:
 
     async def interrupt(self) -> None:
         await self._require_client().interrupt()
+
+    def answer_reply(self, allow: bool, *, last_input_at: float) -> tuple[bool, str]:
+        """Apply a bare yes / no only when the owner can only have meant one ask.
+
+        ``last_input_at`` is the ``time.monotonic()`` of the owner's previous
+        input. Refused (with what to do instead) when several asks wait, when
+        an ask left the queue unanswered since that input (the screen changed
+        under the owner), or when the waiting ask appeared under
+        ``MIN_ASK_VISIBLE_S`` ago. Returns ``(answered, message)``. Known
+        limit: the anchor is when the host READ the previous line, so a reply
+        typed while the host was blocked (an interrupt-mode wait) can still be
+        read against an ask that appeared during that block.
+        """
+        waiting = sorted(self._pending.values(), key=lambda a: a.shown_at)
+        if len(waiting) != 1:
+            ids = ", ".join(a.id for a in waiting) or "none"
+            return False, f"approvals waiting: {ids}; answer one with /y ID or /n ID"
+        approval = waiting[0]
+        confirm = f"confirm with /y {approval.id} or /n {approval.id}"
+        if self._ask_churn_at > last_input_at:
+            return (
+                False,
+                f"the waiting approval changed (now {approval.id}: {approval.tool_name}); {confirm}",
+            )
+        if time.monotonic() - approval.shown_at < MIN_ASK_VISIBLE_S:
+            return False, f"approval {approval.id} just appeared; {confirm}"
+        self.answer(approval.id, allow)
+        return True, f"{'approved' if allow else 'denied'} {approval.id}"
 
     def answer(self, approval_id: str, allow: bool) -> bool:
         approval = self._pending.get(approval_id)
@@ -383,11 +462,13 @@ class LiveAgent:
             allowed = await asyncio.wait_for(approval.future, self._approval_timeout_s)
         except TimeoutError:
             allowed = False
+            self._ask_churn_at = time.monotonic()
             self._emit(
                 "approval", f"[{approval.id}] expired unanswered; denied", {"id": approval.id}
             )
         except asyncio.CancelledError:
             # The CLI withdrew the ask (a steer arrived, or the turn ended).
+            self._ask_churn_at = time.monotonic()
             self._emit("approval", f"[{approval.id}] withdrawn by the session", {"id": approval.id})
             raise
         finally:

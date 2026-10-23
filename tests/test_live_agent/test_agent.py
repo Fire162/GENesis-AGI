@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,13 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
-from genesis.live_agent.agent import OWNER_CLI_MARKER, LiveAgent, owner_environ
+from genesis.live_agent.agent import (
+    OWNER_CLI_MARKER,
+    ApprovalPending,
+    LiveAgent,
+    approval_reply,
+    owner_environ,
+)
 
 
 def state(name: str) -> SystemMessage:
@@ -453,3 +461,207 @@ async def test_a_withdrawn_ask_is_reported(tmp_path):
     assert any("withdrawn by the session" in t for t in texts)
     assert h.agent.status()["pending_approvals"] == []
     await h.agent.close()
+
+
+async def test_a_turn_is_held_while_an_approval_waits(tmp_path):
+    # Measured: any message arriving while an ask waits makes the CLI withdraw
+    # it, denying the action. So nothing is sent unless the caller says so.
+    h = Harness(tmp_path)
+    await h.agent.start()
+    ask = asyncio.create_task(
+        h.agent._permission("Write", {"file_path": "x"}, ToolPermissionContext(tool_use_id="t"))
+    )
+    await asyncio.sleep(0.01)
+    with pytest.raises(ApprovalPending, match="waiting"):
+        await h.agent.turn("yes")
+    assert h.client.sent == []
+    assert not ask.done()  # the ask is untouched
+    await h.agent.turn("change of plan", cancel_pending=True)
+    assert h.client.sent[-1].endswith("change of plan")
+    ask.cancel()
+    await h.agent.close()
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("yes", True),
+        ("Yes.", True),
+        ("approve", True),
+        ("YES!", True),
+        ("no", False),
+        ("Nope", False),
+        ("deny", False),
+        ("ok", None),
+        ("Okay.", None),
+        ("y", None),
+        ("n", None),
+        ("yes?", None),
+        ("no?", None),
+        ("yes, but first check the tests", None),
+        ("go", None),
+        ("", None),
+        ("delete it", None),
+        ("no idea, what do you think?", None),
+    ],
+)
+def test_only_a_bare_yes_or_no_counts_as_an_answer(text, expected):
+    assert approval_reply(text) is expected
+
+
+async def _ask(h: Harness, tool: str = "Write") -> asyncio.Task:
+    task = asyncio.create_task(
+        h.agent._permission(tool, {"file_path": "x"}, ToolPermissionContext(tool_use_id="t"))
+    )
+    await asyncio.sleep(0.01)
+    return task
+
+
+async def test_a_bare_reply_answers_only_the_ask_the_owner_saw(tmp_path, monkeypatch):
+    monkeypatch.setattr("genesis.live_agent.agent.MIN_ASK_VISIBLE_S", 0.05)
+    h = Harness(tmp_path)
+    await h.agent.start()
+    before = time.monotonic()
+    first = await _ask(h, "Read")
+    first.cancel()  # the session withdraws it ...
+    with contextlib.suppress(asyncio.CancelledError):
+        await first
+    second = await _ask(h, "Bash")  # ... and raises a different one
+    await asyncio.sleep(0.1)
+    answered, message = h.agent.answer_reply(True, last_input_at=before)
+    assert answered is False and "changed" in message and "/y" in message
+    assert not second.done()
+
+    after = time.monotonic()  # the owner has now seen the screen as it is
+    answered, message = h.agent.answer_reply(True, last_input_at=after)
+    assert answered is True
+    assert isinstance(await second, PermissionResultAllow)
+    await h.agent.close()
+
+
+async def test_a_bare_reply_to_an_ask_that_just_appeared_is_refused(tmp_path):
+    h = Harness(tmp_path)
+    await h.agent.start()
+    task = await _ask(h)
+    answered, message = h.agent.answer_reply(True, last_input_at=float("-inf"))
+    assert answered is False and "just appeared" in message
+    assert not task.done()
+    task.cancel()
+    await h.agent.close()
+
+
+async def test_a_bare_reply_with_several_asks_waiting_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr("genesis.live_agent.agent.MIN_ASK_VISIBLE_S", 0.0)
+    h = Harness(tmp_path)
+    await h.agent.start()
+    one, two = await _ask(h), await _ask(h)
+    answered, message = h.agent.answer_reply(True, last_input_at=float("-inf"))
+    assert answered is False and "approvals waiting" in message
+    assert not one.done() and not two.done()
+    one.cancel()
+    two.cancel()
+    await h.agent.close()
+
+
+async def test_an_interrupt_mode_steer_is_held_if_an_ask_arrives_while_it_waits(tmp_path):
+    h = Harness(tmp_path, steer="interrupt")
+    await h.agent.start()
+    await h.agent.turn("long job")
+    await h.feed(state("running"))
+    asks: list = []
+
+    async def interrupt_then_ask() -> None:
+        h.client.interrupts += 1
+        await h.client.inbox.put(result(terminal_reason="aborted_streaming"))
+        asks.append(await _ask(h))  # an injected turn asks during the wait
+        await h.client.inbox.put(state("idle"))
+
+    h.client.interrupt = interrupt_then_ask
+    with pytest.raises(ApprovalPending, match="arrived while the steer waited"):
+        await asyncio.wait_for(h.agent.turn("redirect"), 1)
+    assert len(h.client.sent) == 1
+    asks[0].cancel()
+    await h.agent.close()
+
+
+def test_the_host_routes_replies_through_the_bound_answer_and_holds_the_rest(capsys):
+    from pathlib import Path as _P
+
+    from tests.conftest import private_module
+
+    cli = private_module(
+        "live_agent_cli_under_test",
+        _P(__file__).resolve().parents[2] / "scripts" / "live_agent_cli.py",
+    )
+
+    class Agent:
+        calls: list = []
+
+        def answer_reply(self, allow, *, last_input_at):
+            self.calls.append((allow, last_input_at))
+            return True, "approved a1"
+
+    agent = Agent()
+    cli._answer_or_hold(agent, "yes", ["a1"], 12.5)
+    cli._answer_or_hold(agent, "also run the linter", ["a1"], 13.0)
+    cli._answer_or_hold(agent, "okay", ["a1"], 14.0)
+    assert agent.calls == [(True, 12.5)]  # only the bare yes reached the agent
+    out = capsys.readouterr().out
+    assert "approved a1" in out
+    assert out.count("held, not sent") == 2 and "/steer" in out
+
+
+def _load_cli():
+    from pathlib import Path as _P
+
+    from tests.conftest import private_module
+
+    return private_module(
+        "live_agent_cli_loop_under_test",
+        _P(__file__).resolve().parents[2] / "scripts" / "live_agent_cli.py",
+    )
+
+
+class _LoopAgent:
+    """Just enough agent for the host loop: one ask waiting, replies recorded."""
+
+    def __init__(self) -> None:
+        self.anchors: list[float] = []
+
+    def status(self) -> dict:
+        return {"pending_approvals": [{"id": "b2"}]}
+
+    def answer_reply(self, allow, *, last_input_at):
+        self.anchors.append(last_input_at)
+        return False, "refused"
+
+
+async def test_a_blank_line_does_not_move_the_seen_the_screen_anchor():
+    cli = _load_cli()
+    lines = iter(["\n", "yes\n", ""])
+
+    async def readline() -> str:
+        return next(lines)
+
+    agent = _LoopAgent()
+    printer = asyncio.create_task(asyncio.sleep(3600))
+    await cli._input_loop(agent, readline, printer, 5.0)
+    printer.cancel()
+    # The bare "yes" is judged against the time before the blank Enter (the
+    # start anchor), not against the blank line.
+    assert agent.anchors == [5.0]
+
+
+async def test_the_host_stops_when_its_event_printer_is_gone(capsys):
+    cli = _load_cli()
+    lines = iter(["yes\n", "yes\n"])
+
+    async def readline() -> str:
+        return next(lines)
+
+    agent = _LoopAgent()
+    printer = asyncio.create_task(asyncio.sleep(0))
+    await printer  # already finished
+    await cli._input_loop(agent, readline, printer, 0.0)
+    assert agent.anchors == []  # no reply was applied to an unseen ask
+    assert "event printer stopped" in capsys.readouterr().out

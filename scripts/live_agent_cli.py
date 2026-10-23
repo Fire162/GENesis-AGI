@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Drive the Genesis live agent from a terminal (Phase 0 host).
 
-Type a line to send a turn; while a turn runs, a new line steers it.
-Commands: /i interrupt · /y ID allow · /n ID deny · /s status · /q quit.
+Type a line to send a turn; while a turn runs, a new line steers it. While an
+approval is waiting nothing is sent: a bare "yes" or "no" answers it, and any
+other line is held. Commands: /i interrupt · /y ID allow · /n ID deny ·
+/steer TEXT send anyway, cancelling (denying) a waiting approval · /s status ·
+/q quit.
 
     ~/genesis/.venv/bin/python scripts/live_agent_cli.py [--steer priority|interrupt]
 
@@ -17,13 +20,16 @@ import asyncio
 import json
 import os
 import sys
+import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from genesis.env import genesis_home, repo_root  # noqa: E402
 from genesis.live_agent import LiveAgent  # noqa: E402
-from genesis.live_agent.agent import owner_environ  # noqa: E402
+from genesis.live_agent.agent import approval_reply, owner_environ  # noqa: E402
+from genesis.util.tasks import tracked_task  # noqa: E402
 
 _PREFIX = {
     "progress": "  ·",
@@ -40,22 +46,46 @@ async def _print_events(agent: LiveAgent) -> None:
         print(f"{_PREFIX.get(event.kind, '  ')} {event.text}", flush=True)
 
 
-async def _command(agent: LiveAgent, line: str) -> bool:
+async def _command(agent: LiveAgent, line: str, last_input_at: float) -> bool:
     """Run one input line; False means quit."""
     cmd, _, arg = line.partition(" ")
+    waiting = [a["id"] for a in agent.status()["pending_approvals"]]
     if cmd == "/q":
         return False
     if cmd == "/i":
+        if waiting:
+            print(f"  interrupting cancels approval {', '.join(waiting)} (denied)")
         await agent.interrupt()
     elif cmd in ("/y", "/n"):
         if not agent.answer(arg.strip(), allow=cmd == "/y"):
             print(f"  no pending approval {arg.strip()!r}")
     elif cmd == "/s":
         print(json.dumps(agent.status(), indent=2))
+    elif cmd == "/steer":
+        if not arg.strip():
+            print("  /steer needs text")
+            return True
+        handle = await agent.turn(arg, cancel_pending=True)
+        print(f"  → {'steered' if handle.steered else 'sent'} ({handle.id})")
+    elif waiting:
+        _answer_or_hold(agent, line, waiting, last_input_at)
     else:
         handle = await agent.turn(line)
         print(f"  → {'steered' if handle.steered else 'sent'} ({handle.id})")
     return True
+
+
+def _answer_or_hold(agent: LiveAgent, line: str, waiting: list[str], last_input_at: float) -> None:
+    """A line typed while an approval waits: answer it, or hold the line."""
+    reply = approval_reply(line)
+    if reply is not None:
+        _, message = agent.answer_reply(reply, last_input_at=last_input_at)
+        print(f"  {message}")
+    else:
+        print(
+            f"  held, not sent: approval {', '.join(waiting)} is waiting. Answer yes or no, "
+            "or /steer TEXT to cancel it (denying the action) and redirect"
+        )
 
 
 async def main() -> int:
@@ -74,25 +104,52 @@ async def main() -> int:
         state_path=genesis_home() / "live_agent" / "state.json",
         steer=args.steer,
     )
+    # Taken before start: an ask withdrawn while the session starts counts as a
+    # change the owner has not seen yet.
+    started_at = time.monotonic()
     await agent.start()
-    printer = asyncio.create_task(_print_events(agent))
+    printer = tracked_task(_print_events(agent), name="live_agent_cli.print")
     loop = asyncio.get_running_loop()
+
+    async def readline() -> str:
+        return await loop.run_in_executor(None, sys.stdin.readline)
+
     try:
-        while True:
-            line = await loop.run_in_executor(None, sys.stdin.readline)
-            if not line:
-                break
-            if not line.strip():
-                continue
-            try:
-                if not await _command(agent, line.strip()):
-                    break
-            except Exception as exc:  # report and keep the host up (refusals, timeouts)
-                print(f"  ! {type(exc).__name__}: {exc}", flush=True)
+        await _input_loop(agent, readline, printer, started_at)
     finally:
         printer.cancel()
         await agent.close()
     return 0
+
+
+async def _input_loop(
+    agent: LiveAgent,
+    readline: Callable[[], Awaitable[str]],
+    printer: asyncio.Task[None],
+    last_input_at: float,
+) -> None:
+    """Read and run lines until EOF or /q.
+
+    ``last_input_at`` anchors "the owner has seen the screen" for a bare yes /
+    no. Only a line the host acts on moves it: a blank Enter does not, or it
+    would let a reply meant for a withdrawn ask approve its replacement.
+    """
+    while True:
+        line = await readline()
+        if not line:
+            return
+        if printer.done():
+            # Asks are no longer shown, so no reply can be tied to one.
+            print("  ! the event printer stopped; exiting", flush=True)
+            return
+        if not line.strip():
+            continue
+        previous, last_input_at = last_input_at, time.monotonic()
+        try:
+            if not await _command(agent, line.strip(), previous):
+                return
+        except Exception as exc:  # report and keep the host up (refusals, timeouts)
+            print(f"  ! {type(exc).__name__}: {exc}", flush=True)
 
 
 if __name__ == "__main__":

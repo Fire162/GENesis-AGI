@@ -6,7 +6,14 @@ fully loaded Claude Code session, steers or interrupts it mid-turn, answers its
 permission asks, and reads a short progress stream back. See ``agent.py``.
 """
 
-from genesis.live_agent.agent import Event, LiveAgent, TaskHandle
+from genesis.live_agent.agent import ApprovalPending, Event, LiveAgent, TaskHandle, approval_reply
 from genesis.live_agent.progress import ProgressSummarizer
 
-__all__ = ["Event", "LiveAgent", "ProgressSummarizer", "TaskHandle"]
+__all__ = [
+    "ApprovalPending",
+    "Event",
+    "LiveAgent",
+    "ProgressSummarizer",
+    "TaskHandle",
+    "approval_reply",
+]
