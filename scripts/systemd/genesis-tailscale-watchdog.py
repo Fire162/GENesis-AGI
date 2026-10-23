@@ -173,7 +173,7 @@ SETTINGS = {
     "NETWD_TS_MAX_PROBES": (3, 0, 20),
     "NETWD_TS_SCAN_BUDGET_SEC": (60, 0, 600),
     # A DERP region id to keep this node homed on; 0 leaves the home alone.
-    "NETWD_TS_PREFER_DERP": (0, 0, 9999),
+    "NETWD_TS_PREFER_DERP": (0, 0, (1 << 53) - 1),
 }
 
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
@@ -639,9 +639,12 @@ def _prefer(ctx: Ctx, region: int) -> int | None:
     return ctx.run(argv, DERP_CALL_TIMEOUT_SEC)[0]
 
 
-def _clear_derp_pin(ctx: Ctx, prior: dict):
+def _clear_derp_pin(ctx: Ctx, prior: dict, started):
     if type(prior.get("wanted")) is not int or prior["wanted"] <= 0:
         return None
+    owned_start = prior.get("applied_for")
+    if started is not None and _number(owned_start) and 0 < owned_start < started:
+        return None  # a known replacement already lost the old daemon's pin
     pin = {**prior, "action": "clear-pending", "at": int(ctx.wall())}
     if ctx.mode != "live":
         return pin
@@ -672,7 +675,7 @@ def reconcile_derp(ctx: Ctx, status_text: str, started, prior: dict, lapses: int
     live mode, but recorded ``unknown``."""
     wanted = ctx.settings["NETWD_TS_PREFER_DERP"]
     if not wanted:
-        return _clear_derp_pin(ctx, prior), lapses
+        return _clear_derp_pin(ctx, prior, started), lapses
     relay = code = None
     with contextlib.suppress(ValueError, AttributeError):
         relay = json.loads(status_text).get("Self", {}).get("Relay")
@@ -1059,6 +1062,18 @@ def run_once(ctx: Ctx) -> int:
     cleared: list = []
     unconfirmed: list = []
     if outcome == "healed":
+        if not ctx.settings["NETWD_TS_PREFER_DERP"]:
+            derp_pin = None  # the verified restart cleared any pending old pin
+        elif derp_pin is not None and derp_pin["code"]:
+            # Restore the runtime prerequisite before judging tunnel recovery.
+            before = daemon_identity(ctx, DERP_CALL_TIMEOUT_SEC)
+            pin_rc = _prefer(ctx, derp_pin["wanted"])
+            new = daemon_identity(ctx, DERP_CALL_TIMEOUT_SEC)
+            applied_for = new[2] if pin_rc == 0 and before and same_daemon(before, new) else None
+            action = "failed" if pin_rc != 0 else "unknown" if applied_for is None else "applied"
+            derp_pin.update(action=action, applied_for=applied_for)
+            derp_pin["after_heal"] = True
+            log(f"home-DERP pin after the restart: {derp_pin['action']} (rc={pin_rc})")
         deadline = ctx.mono() + ctx.settings["NETWD_TS_VERIFY_SEC"]
         answers = _check_tunnels(ctx, targets, deadline)
         cleared = [ip for ip in targets if answers[ip] is True]
@@ -1068,22 +1083,9 @@ def run_once(ctx: Ctx) -> int:
         if any(answers[ip] is False for ip in targets):
             outcome = "restart-no-effect"
         elif unconfirmed:
-            # Restarted and back, but no check could be judged: neither a heal
-            # nor a restart that failed to help (that would count toward the
-            # limit and could stop healing this peer for the boot).
+            # Restarted and back, but no check could be judged: distinguish
+            # this uncertainty from a verified no-effect result.
             outcome = "restart-unconfirmed"
-        if not ctx.settings["NETWD_TS_PREFER_DERP"]:
-            derp_pin = None  # the verified restart cleared any pending old pin
-        elif derp_pin is not None and derp_pin["code"]:
-            # The restart cleared the pin; re-apply it to the new daemon now.
-            before = daemon_identity(ctx, DERP_CALL_TIMEOUT_SEC)
-            pin_rc = _prefer(ctx, derp_pin["wanted"])
-            new = daemon_identity(ctx, DERP_CALL_TIMEOUT_SEC)
-            applied_for = new[2] if pin_rc == 0 and before and same_daemon(before, new) else None
-            action = "failed" if pin_rc != 0 else "unknown" if applied_for is None else "applied"
-            derp_pin.update(action=action, applied_for=applied_for)
-            derp_pin["after_heal"] = True
-            log(f"home-DERP pin after the restart: {derp_pin['action']} (rc={pin_rc})")
     messages = {
         "healed": "tailscaled restarted and every stuck tunnel answers again",
         "restart-no-effect": f"tailscaled restarted, but {len(targets) - len(cleared) - len(unconfirmed)} tunnel(s) still get no reply; not retrying for {rate}s",

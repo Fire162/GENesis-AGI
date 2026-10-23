@@ -235,13 +235,13 @@ Opt-in, off by default (`0`). A peer whose client resets can keep sending to
 the DERP region this node was homed on at that moment; when this node's home
 later moves, the tunnel goes one-way until tailscaled restarts
 (tailscale/tailscale#21686). Set `NETWD_TS_PREFER_DERP=<region id>`
-(`1`..`9999`, from `tailscale debug derp-map`) in the same drop-in, and each
+(`1`..`9007199254740991`, from `tailscale debug derp-map`) in the same drop-in, and each
 live run keeps this node homed there with `tailscale debug force-prefer-derp
 <id>`. That pin is runtime-only and every tailscaled restart clears it, and
 `status` cannot show whether it is set, so a run re-applies it when
 `Self.Relay` is off the region's code, or when it has not yet been applied to
 the running daemon (tailscaled started since, a new boot, or this run's own
-restart heal, after which it is re-applied at once). Remembering which daemon
+restart heal, after which it is re-applied before tunnel verification). Remembering which daemon
 got it, rather than calling the setter every run, keeps tailscaled's log quiet.
 The command's exit code decides `applied` or `failed`; after a heal, unreadable
 or changed daemon identity around the setter records `unknown`. The next run
@@ -249,7 +249,8 @@ judges whether it took (it takes effect at the next netcheck). Removing the
 setting or setting it to `0` clears a previously managed pin. Failed clears
 remain `clear-failed` and retry; observe mode records `clear-pending` without
 clearing. Incomplete runs retain ownership as `unknown` so later removal can
-still clear it. The run records
+still clear it. A positively known newer daemon retires the old ownership
+without a clear call, including in observe mode. The run records
 `derp_pin` (`ok`, `applied`, `failed`, `drift-persists`, `unknown` for a
 missing relay, a region not in the DERP map or an unreadable tailscaled start
 time, or `drift` in observe mode, which runs nothing and marks `would_apply`

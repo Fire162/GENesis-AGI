@@ -1500,6 +1500,23 @@ def pin_world(relay: str | None = "xyz", **peers) -> World:
     return world
 
 
+@pytest.mark.parametrize("region", [10000, (1 << 53) - 1])
+def test_valid_large_region_ids_can_replace_an_existing_pin(tmp_path, region):
+    world = pin_world("xyz")
+    tick(world, ctx(world, tmp_path, **PIN))
+    world.derp_map["Regions"][str(region)] = {"RegionID": region, "RegionCode": "big"}
+    world.relay("big")
+    c = ctx(world, tmp_path, NETWD_TS_PREFER_DERP=str(region))
+    assert c.settings["NETWD_TS_PREFER_DERP"] == region
+    s = tick(world, c)
+    assert (s["derp_pin"]["wanted"], s["derp_pin"]["action"]) == (region, "applied")
+    assert [call[-1] for call in world.pins()] == ["900", str(region)]
+    assert tick(world, c)["derp_pin"]["action"] == "ok"
+    assert len(world.pins()) == 2
+    invalid = ctx(world, tmp_path, NETWD_TS_PREFER_DERP=str(1 << 53))
+    assert invalid.settings["NETWD_TS_PREFER_DERP"] == 0
+
+
 def test_the_pin_is_off_by_default_and_never_runs_a_debug_command(tmp_path):
     world = pin_world("abc", a=peer(A))
     world.stuck(A)
@@ -1648,6 +1665,49 @@ def test_the_pin_is_reapplied_after_the_watchdogs_own_heal(tmp_path):
     assert len(world.pins()) == 2
 
 
+@pytest.mark.parametrize("pin_rc", [0, 1, None])
+@pytest.mark.parametrize("reply", [True, False, None])
+def test_pin_dependent_tunnels_are_verified_after_restoring_the_pin(tmp_path, pin_rc, reply):
+    world = pin_world("xyz", a=peer(A))
+    world.stuck(A)
+    world.prefer_rc = pin_rc
+    runtime = {"pin": 0, "restarted": False}
+    verification_pins = []
+    real = world.run
+
+    def with_runtime_pin(argv, timeout, **kw):
+        result = real(argv, timeout, **kw)
+        if argv[1] == "try-restart":
+            runtime.update(pin=0, restarted=True)
+        elif argv[1:3] == ["debug", "force-prefer-derp"] and result[0] == 0:
+            runtime["pin"] = int(argv[-1])
+        elif argv[1] == "ping" and "--tsmp" in argv and runtime["restarted"]:
+            verification_pins.append(runtime["pin"])
+            if reply is None:
+                return None, ""
+            return (0, "pong") if reply and runtime["pin"] == 900 else (1, "timed out\nno reply")
+        return result
+
+    c = ctx(world, tmp_path, **PIN)
+    c.run = with_runtime_pin
+    s = tick(world, c)
+    restart_at = world.calls.index(["systemctl", "try-restart", "tailscaled"])
+    after = world.calls[restart_at + 1 :]
+    setter_at = next(
+        i for i, argv in enumerate(after) if argv[1:3] == ["debug", "force-prefer-derp"]
+    )
+    probe_at = next(i for i, argv in enumerate(after) if argv[1] == "ping" and "--tsmp" in argv)
+    assert setter_at < probe_at
+    assert verification_pins[0] == (900 if pin_rc == 0 else 0)
+    healed = pin_rc == 0 and reply is True
+    expected = (
+        "healed" if healed else "restart-unconfirmed" if reply is None else "restart-no-effect"
+    )
+    assert s["last_action"] == expected
+    assert s["events"][-1]["cleared"] == ([A] if healed else [])
+    assert s["unhelped_restarts"] == ({} if healed else {A: 1})
+
+
 def test_no_pin_after_a_restart_that_left_tailscaled_down(tmp_path):
     world = pin_world("xyz", a=peer(A))
     world.stuck(A)
@@ -1765,6 +1825,30 @@ def test_observe_mode_disabling_reports_a_pending_clear_without_running_it(tmp_p
     s = tick(world, ctx(world, tmp_path, NETWD_TS_MODE="observe"))
     assert s["derp_pin"]["action"] == "clear-pending"
     assert len(world.pins()) == 1
+
+
+@pytest.mark.parametrize("mode", ["live", "observe"])
+@pytest.mark.parametrize("failed_clear", [False, True])
+def test_disabled_ownership_is_retired_after_a_known_daemon_replacement(
+    tmp_path, mode, failed_clear
+):
+    world = pin_world("xyz")
+    tick(world, ctx(world, tmp_path, **PIN))
+    if failed_clear:
+        world.prefer_rc = 1
+        assert tick(world, ctx(world, tmp_path))["derp_pin"]["action"] == "clear-failed"
+        world.prefer_rc = 0
+    calls = list(world.pins())
+    observe = ctx(world, tmp_path, NETWD_TS_MODE="observe")
+    # Missing identity proves nothing; a known same daemon still owns its pin.
+    world.unit["ActiveEnterTimestampMonotonic"] = "0"
+    assert tick(world, observe)["derp_pin"]["action"] == "clear-pending"
+    world.unit["ActiveEnterTimestampMonotonic"] = "1000000"
+    assert tick(world, observe)["derp_pin"]["action"] == "clear-pending"
+    assert world.pins() == calls
+    world.unit.update(InvocationID="inv-new", ActiveEnterTimestampMonotonic="2000000")
+    assert tick(world, ctx(world, tmp_path, NETWD_TS_MODE=mode))["derp_pin"] is None
+    assert world.pins() == calls
 
 
 def test_a_heal_while_disabling_does_not_reapply_the_old_pin(tmp_path):
