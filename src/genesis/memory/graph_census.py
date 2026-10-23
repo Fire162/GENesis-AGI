@@ -139,16 +139,17 @@ def _readlink_or_none(path: Path) -> str | None:
 def _interpreter_dir(argv0: str, env: dict[str, str]) -> str | None:
     """The real directory of the interpreter ``argv0`` named, resolved the way
     exec did: as given when absolute, else through that process's own PATH (an
-    activated venv puts its bin first). ``""`` for a relative path with a slash:
-    exec resolved it against the cwd AT EXEC, which the process may have left,
-    so it cannot be resolved now."""
+    activated venv puts its bin first). ``""`` when exec resolved it against the
+    cwd AT EXEC, which the process may have left: a relative path with a slash,
+    or a relative or empty PATH entry reached before an absolute match."""
     if os.path.isabs(argv0):
         return os.path.realpath(os.path.dirname(argv0))
     if "/" in argv0:
         return ""
     for d in env.get("PATH", "").split(os.pathsep):
-        candidate = os.path.join(d, argv0)
-        if d and os.path.isabs(d) and os.access(candidate, os.X_OK):
+        if not d or not os.path.isabs(d):
+            return ""  # exec searched the cwd at exec here first
+        if os.access(os.path.join(d, argv0), os.X_OK):
             return os.path.realpath(d)
     return None
 
@@ -264,6 +265,9 @@ def scan_mcp_servers(
                 },
                 "exe": _realpath_or_none(base / "exe"),
                 "mnt_ns": _readlink_or_none(base / "ns" / "mnt"),
+                # Resolved here, with the full env (the kept subset has no PATH).
+                "interpreter_unresolved": bool(argv)
+                and _interpreter_dir(argv[0], env) == "",
             }
         )
     return found, complete
@@ -534,10 +538,13 @@ def _window_held(reader, reflog: str, since: float, head: str, cutoff: int) -> l
     moves = reader._moves(reflog)
     if moves and moves[-1][1] != head:
         raise reader._Unknown("the reflog does not end at HEAD")
-    first = next((i for i, m in enumerate(moves) if m[2] > since), None)
+    # Reflog times are whole seconds, so a move in the second the window starts
+    # in may be after `since`: count it rather than miss a detour there.
+    edge = int(since)
+    first = next((i for i, m in enumerate(moves) if m[2] >= edge), None)
     if first is None:
         return [head]
-    if any(when <= since for _, _, when in moves[first:]):
+    if any(when < edge for _, _, when in moves[first:]):
         raise reader._Unknown("reflog times go backwards inside the window")
     for i in range(first + 1, len(moves)):
         if moves[i][0] != moves[i - 1][1]:
@@ -573,8 +580,7 @@ def _producer_row(
     )
     if own_ns is None or proc["mnt_ns"] != own_ns:
         foreign = False  # its paths may name other files in its namespace
-    argv0 = proc["argv"][0] if proc["argv"] else ""
-    if not os.path.isabs(argv0) and "/" in argv0:
+    if proc.get("interpreter_unresolved"):
         # exec resolved it against a cwd that may be gone: maybe main's venv.
         telemetry_ok, unknown, foreign = None, "interpreter_unresolved", False
     elif proof.options_unmodelled(proc["argv"]):

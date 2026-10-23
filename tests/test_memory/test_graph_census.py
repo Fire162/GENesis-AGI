@@ -1063,3 +1063,25 @@ def test_a_sandboxed_process_with_its_own_home_does_not_reset_the_clock(
           exe=str(tmp_path / "sys" / "bin" / "python3.12"), ns="mnt:[2]")
     [p] = census.build_census(r, proc_root=proc_root, live_db=tmp_path / "live.db")["procs"]
     assert p["unknown"] != "other_genesis_home"
+
+
+def test_a_relative_path_entry_before_the_match_is_unresolved(proc_root, repo, tmp_path, main_venv):
+    """`PATH=.venv/bin:/usr/bin python job.py`: exec searched the cwd at exec
+    first, which may have been main's checkout, so the process is counted."""
+    m = _roles_census(
+        proc_root, repo, tmp_path,
+        [(113, ["python", "job.py"], {"PATH": ".venv/bin:/usr/bin"}, None)],
+    )
+    [p] = m["procs"]
+    assert (p["role"], p["unknown"]) == ("venv-generic", "interpreter_unresolved")
+
+
+def test_a_detour_in_the_windows_boundary_second_is_counted(repo):
+    """Reflog times are whole seconds: two moves at second 100 may both be after
+    a window that starts at 100.4."""
+    from genesis.memory import graph_census as gc
+
+    reader = gc._load_serving_commit()
+    a, b = "a" * 40, "b" * 40
+    detour = _reflog_line(a, b, 100) + _reflog_line(b, a, 100)
+    assert b in gc._window_held(reader, detour, 100.4, a, 0)
