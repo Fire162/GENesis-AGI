@@ -84,6 +84,7 @@ def test_only_encrypted_matching_details_leave_process(history, recipient, patte
     plain = decrypt(blob, recipient)
     assert plain.returncode == 0
     report = json.loads(plain.stdout)
+    assert report["raw_patterns"] == patterns
     assert report["matching_lines"] == count == len(report["matches"])
     assert report["base"] == history[1] and report["head"] == history[2]
     spec = importlib.util.spec_from_file_location("diagnostic_added_lines", ROOT / "scripts/ci/leak_scan_added_lines.py")
@@ -119,7 +120,7 @@ def test_failure_never_prints_private_pattern_or_subprocess_buffers(history, rec
 
 
 def test_existing_workflow_constraints_are_unchanged():
-    original = yaml.safe_load(run("git", "show", "HEAD:.github/workflows/branch-leak-scan.yml", cwd=ROOT).stdout)
+    original = yaml.safe_load(run("git", "show", "e4ccfd158:.github/workflows/branch-leak-scan.yml", cwd=ROOT).stdout)
     current = yaml.safe_load((ROOT / ".github/workflows/branch-leak-scan.yml").read_text())
     steps = current["jobs"]["branch-leak-scan"]["steps"]
     diagnostic = steps.pop()

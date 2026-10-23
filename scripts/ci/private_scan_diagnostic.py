@@ -16,7 +16,8 @@ import private_pattern_scan as scanner
 
 
 def report(base: str, head: str) -> dict:
-    patterns = scanner.load_patterns(os.environ.get("PRIV", ""))
+    raw_patterns = os.environ.get("PRIV", "")
+    patterns = scanner.load_patterns(raw_patterns)
     spec = ("range", base + ".." + head)
     stream = added.added_lines(spec) + "\n" + added.commit_messages(spec)
     # Exact branch-push Bash command-substitution + printf framing.
@@ -29,7 +30,7 @@ def report(base: str, head: str) -> dict:
             matches.append({"stream_line": number,
                             "line_sha256": hashlib.sha256(line.encode()).hexdigest(),
                             "patterns": matching})
-    return {"version": 1, "base": base, "head": head,
+    return {"version": 1, "base": base, "head": head, "raw_patterns": raw_patterns,
             "haystack_sha256": hashlib.sha256(stream.encode()).hexdigest(),
             "matching_lines": len(matches), "matches": matches}
 
